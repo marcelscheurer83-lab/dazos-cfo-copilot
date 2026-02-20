@@ -50,3 +50,7 @@ a:hover {
 button {
   color: var(--text);
 }
+
+.arr-filter-menu button:hover {
+  background: var(--surface-hover);
+}

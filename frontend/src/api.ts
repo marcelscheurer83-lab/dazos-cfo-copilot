@@ -193,7 +193,7 @@ export async function getARRByAccount(): Promise<ARRByAccountResponse> {
 /** ARR by account with product columns (open renewals). ARR = MRR × 12. */
 export type ARRByAccountProductResponse = {
   products: string[]
-  rows: { account_id: string | null; account_name: string; segment?: string | null; by_product: Record<string, number>; total_arr: number }[]
+  rows: { account_id: string | null; account_name: string; segment?: string | null; subscription_end_date?: string | null; by_product: Record<string, number>; total_arr: number }[]
   total_by_product: Record<string, number>
   grand_total: number
 }

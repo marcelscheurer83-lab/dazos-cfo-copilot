@@ -6,8 +6,9 @@ All scheduled times (hourly sync, EOD snapshot) use America/New_York (EST/EDT).
 import asyncio
 import json
 import os
+import re
 from contextlib import asynccontextmanager
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 from typing import Optional
@@ -226,49 +227,105 @@ async def get_budget_vs_actual(
 
 @app.post("/api/copilot", response_model=CopilotResponse)
 async def copilot(body: CopilotRequest, db: AsyncSession = Depends(get_db)):
-    """Answer natural-language questions using latest KPI and rule-based logic. Plug in OpenAI later via COPILOT_API_KEY."""
-    q = body.question.lower().strip()
-    # Fetch latest KPI for context
-    r = await db.execute(select(KPI).order_by(KPI.as_of_date.desc()).limit(1))
-    kpi = r.scalar_one_or_none()
-    runway = _runway_months(kpi.cash_balance, kpi.monthly_burn) if kpi else None
-    growth = _growth_pct(kpi.revenue_ytd, kpi.revenue_prior_ytd) if kpi else None
+    """Answer ARR-related questions using live data or past EOD snapshots."""
+    q = body.question.strip()
+    q_lower = q.lower()
+    today_est = datetime.now(EST).date()
 
-    if "runway" in q or "how long" in q and "cash" in q:
-        if runway is not None:
-            return CopilotResponse(answer=f"Based on the latest data (as of {kpi.as_of_date}), cash balance is ${kpi.cash_balance:,.0f} with a monthly burn of ${kpi.monthly_burn:,.0f}. **Runway is approximately {runway} months.**", sources=["KPI snapshot"])
-        return CopilotResponse(answer="Runway cannot be computed without cash balance and monthly burn. Please ensure KPI data is loaded.", sources=[])
-    if "revenue" in q and ("growth" in q or "yoy" in q or "compare" in q):
-        if growth is not None and kpi:
-            return CopilotResponse(answer=f"YTD revenue as of {kpi.as_of_date} is ${kpi.revenue_ytd:,.0f}, compared to prior year YTD ${kpi.revenue_prior_ytd:,.0f}. **Revenue growth is {growth}%.**", sources=["KPI snapshot"])
-        return CopilotResponse(answer="Revenue comparison data is not available for the requested period.", sources=[])
-    if "cash" in q and ("balance" in q or "position" in q):
-        if kpi:
-            return CopilotResponse(answer=f"As of {kpi.as_of_date}, **cash balance is ${kpi.cash_balance:,.0f}.** Monthly burn is ${kpi.monthly_burn:,.0f}.", sources=["KPI snapshot"])
-        return CopilotResponse(answer="No cash balance data available.", sources=[])
-    if "burn" in q or "burn rate" in q:
-        if kpi:
-            return CopilotResponse(answer=f"Monthly burn as of {kpi.as_of_date} is **${kpi.monthly_burn:,.0f}.**", sources=["KPI snapshot"])
-        return CopilotResponse(answer="Burn rate data is not available.", sources=[])
-    if "margin" in q or "gross" in q:
-        if kpi:
-            return CopilotResponse(answer=f"Gross margin as of {kpi.as_of_date} is **{kpi.gross_margin_pct}%.**", sources=["KPI snapshot"])
-        return CopilotResponse(answer="Gross margin data is not available.", sources=[])
-    if "ebitda" in q:
-        if kpi:
-            return CopilotResponse(answer=f"YTD EBITDA as of {kpi.as_of_date} is **${kpi.ebitda_ytd:,.0f}.**", sources=["KPI snapshot"])
-        return CopilotResponse(answer="EBITDA data is not available.", sources=[])
-    if "ar " in q or "receivable" in q or "ar days" in q:
-        if kpi:
-            return CopilotResponse(answer=f"AR days as of {kpi.as_of_date} is **{kpi.ar_days} days.**", sources=["KPI snapshot"])
-        return CopilotResponse(answer="AR days data is not available.", sources=[])
-    if "ap " in q or "payable" in q or "ap days" in q:
-        if kpi:
-            return CopilotResponse(answer=f"AP days as of {kpi.as_of_date} is **{kpi.ap_days} days.**", sources=["KPI snapshot"])
-        return CopilotResponse(answer="AP days data is not available.", sources=[])
+    # How did ARR change (today / vs last snapshot)
+    if "arr" in q_lower and ("change" in q_lower or "diff" in q_lower or "compared" in q_lower or "vs " in q_lower):
+        data_now, _ = await _get_arr_data_for_date(db, None)
+        current_arr = data_now.get("grand_total") or 0
+        r = await db.execute(
+            select(SalesforceEODSnapshot)
+            .where(SalesforceEODSnapshot.snapshot_date < today_est)
+            .order_by(SalesforceEODSnapshot.snapshot_date.desc())
+            .limit(1)
+        )
+        snap = r.scalar_one_or_none()
+        if snap and snap.data_json:
+            payload = json.loads(snap.data_json)
+            data_prev = _arr_from_snapshot_payload(payload)
+            prev_arr = data_prev.get("grand_total") or 0
+            delta = round(current_arr - prev_arr, 2)
+            pct = round((delta / prev_arr * 100), 1) if prev_arr else None
+            if delta > 0:
+                change = f"up **${delta:,.0f}**" + (f" ({pct:+.1f}%)" if pct is not None else "")
+            elif delta < 0:
+                change = f"down **${abs(delta):,.0f}**" + (f" ({pct:.1f}%)" if pct is not None else "")
+            else:
+                change = "unchanged"
+            return CopilotResponse(
+                answer=f"**Total ARR** is **${current_arr:,.0f}** now (was **${prev_arr:,.0f}** in the EOD snapshot for {snap.snapshot_date.isoformat()}). ARR has **{change}** since then.",
+                sources=["Customer overview (open renewals)", f"EOD snapshot ({snap.snapshot_date.isoformat()})"],
+            )
+        return CopilotResponse(
+            answer=f"**Total ARR** today is **${current_arr:,.0f}**. There’s no earlier EOD snapshot to compare; run the app so it can save daily snapshots (23:59 EST).",
+            sources=["Customer overview (open renewals)"],
+        )
+
+    as_of_date = _parse_date_from_question(q)
+    data, source_label = await _get_arr_data_for_date(db, as_of_date)
+    rows = data.get("rows") or []
+    grand_total = data.get("grand_total") or 0
+    date_note = f" (as of {as_of_date})" if as_of_date else ""
+
+    # Total ARR / how much ARR
+    if any(phrase in q_lower for phrase in ("total arr", "how much arr", "what's our arr", "what is our arr", "total recurring", "arr as of", "arr on ")):
+        return CopilotResponse(
+            answer=f"**Total ARR**{date_note} is **${grand_total:,.0f}** across **{len(rows)}** account(s).",
+            sources=[source_label],
+        )
+
+    # Largest / biggest / top customer by ARR
+    if any(phrase in q_lower for phrase in ("largest customer", "biggest customer", "top customer", "who is our largest", "largest account", "biggest account")):
+        if rows:
+            top = rows[0]
+            name = top.get("account_name") or "—"
+            arr = top.get("total_arr") or 0
+            return CopilotResponse(
+                answer=f"Your **largest customer** by ARR{date_note} is **{name}** with **${arr:,.0f} ARR.**",
+                sources=[source_label],
+            )
+        return CopilotResponse(
+            answer="No customer ARR data available for that period. Sync from Salesforce and ensure EOD snapshots exist for past dates.",
+            sources=[],
+        )
+
+    # ARR up for renewal in a given month
+    if ("renewal" in q_lower or "arr" in q_lower) and _parse_renewal_month_from_question(q):
+        ym = _parse_renewal_month_from_question(q)
+        if ym:
+            year, month = ym
+            in_month = []
+            for row in rows:
+                end_str = row.get("subscription_end_date")
+                if not end_str:
+                    continue
+                try:
+                    d = datetime.fromisoformat(end_str.replace("Z", "+00:00")).date()
+                    if d.year == year and d.month == month:
+                        in_month.append(row)
+                except (ValueError, TypeError):
+                    continue
+            total_arr = round(sum(r.get("total_arr") or 0 for r in in_month), 2)
+            month_name = next((k for k, v in _MONTH_NAMES.items() if v == month and len(k) > 3), str(month))
+            month_label = month_name.capitalize() if month_name.isalpha() else f"{month_name} {year}"
+            if total_arr > 0:
+                accounts_list = ", ".join((r.get("account_name") or "—") for r in in_month[:10])
+                if len(in_month) > 10:
+                    accounts_list += f" and {len(in_month) - 10} more"
+                return CopilotResponse(
+                    answer=f"**${total_arr:,.0f} ARR** is up for renewal in **{month_label} {year}** ({len(in_month)} account(s)). Accounts include: {accounts_list}.",
+                    sources=[source_label],
+                )
+            return CopilotResponse(
+                answer=f"No ARR is currently up for renewal in **{month_label} {year}**. Subscription end dates are from open renewal opportunities.",
+                sources=[source_label],
+            )
 
     return CopilotResponse(
-        answer="I can answer questions about runway, cash balance, burn rate, revenue growth, gross margin, EBITDA, AR days, and AP days. Try: 'What is our runway?' or 'How did revenue compare to last year?'",
+        answer="I only answer **ARR-related** questions. You can ask about current data or past dates (e.g. 'Total ARR as of March 2025' or 'Largest customer last month') when EOD snapshots exist. Try: 'What's our total ARR?' or 'How did ARR change today?' or 'What ARR is up for renewal in March '26?'",
         sources=[],
     )
 
@@ -342,20 +399,29 @@ ARR_PRODUCT_EXCLUDE = frozenset({"iverify monthly credits", "verify monthly cred
 
 # Canonical ARR product columns: order = display order (Account, Segment, then these, then Other).
 # One-time products (Implementation, Data Migration, Kipu API Set Up, etc.) are not in ARR.
+# Display names: "CRM Platform" = Legacy + Includes 5 Seats; "CRM Billing Platform" = Billing Company CRM...
 ARR_PRODUCT_COLUMNS = [
-    "Dazos CRM Platform (Legacy)",
-    "Dazos CRM Platform (Includes 5 Seats)",
-    "Billing Company CRM Platform (Includes 5 Seats)",
-    "Additional CRM Seats",
-    "Marketing Reports Platform Fee (Includes 1 EIN)",
-    "IQ Platform Fee (Includes 1 EIN)",
-    "Additional IQ/MR EINs",
+    "CRM Platform",
+    "CRM Billing Platform",
+    "Add. CRM Seats",
+    "MR Platform",
+    "IQ Platform",
+    "Add. MR/ IQ Locations",
     "iCampaign Platform",
     "Premium Support",
 ]
 _ARR_PRODUCT_NORMALIZED = {p.strip().lower(): p for p in ARR_PRODUCT_COLUMNS}
-# Price book alias: "Additional IQMR EINs" (no slash) -> same column
-_ARR_PRODUCT_NORMALIZED["additional iqmr eins"] = "Additional IQ/MR EINs"
+# Map raw Salesforce product names to canonical display names (view-only; calculation unchanged)
+_ARR_SF_TO_CANONICAL = {
+    "dazos crm platform (legacy)": "CRM Platform",
+    "dazos crm platform (includes 5 seats)": "CRM Platform",
+    "billing company crm platform (includes 5 seats)": "CRM Billing Platform",
+    "additional crm seats": "Add. CRM Seats",
+    "marketing reports platform fee (includes 1 ein)": "MR Platform",
+    "iq platform fee (includes 1 ein)": "IQ Platform",
+    "additional iq/mr eins": "Add. MR/ IQ Locations",
+    "additional iqmr eins": "Add. MR/ IQ Locations",
+}
 
 
 def _normalized_product_name(product_name: str | None) -> str:
@@ -381,11 +447,17 @@ def _is_arr_excluded_product(product_name: str | None) -> bool:
 
 
 def _match_arr_product(sf_product_name: str | None) -> str | None:
-    """Map Salesforce product name to canonical ARR column, or None -> 'Other'. Uses exact then contains match."""
+    """Map Salesforce product name to canonical ARR column, or None -> 'Other'. Uses SF-to-canonical map, then exact then contains match."""
     if not sf_product_name or not sf_product_name.strip():
         return None
     raw = sf_product_name.strip()
     key = raw.lower()
+    # Check display-name overrides first (e.g. "Dazos CRM Platform (Legacy)" -> "CRM Platform")
+    if key in _ARR_SF_TO_CANONICAL:
+        return _ARR_SF_TO_CANONICAL[key]
+    for sf_key, canonical in _ARR_SF_TO_CANONICAL.items():
+        if sf_key in key or key in sf_key:
+            return canonical
     if key in _ARR_PRODUCT_NORMALIZED:
         return _ARR_PRODUCT_NORMALIZED[key]
     for norm, canonical in _ARR_PRODUCT_NORMALIZED.items():
@@ -406,6 +478,69 @@ DEFAULT_ACCOUNT_SOQL = (
     "BillingCountry, BillingCity, BillingState, Phone, Website, Segment__c, CreatedDate "
     "FROM Account ORDER BY Name"
 )
+
+
+# Month name -> number for Copilot "renewal in March '26" parsing
+_MONTH_NAMES = {
+    "january": 1, "jan": 1, "february": 2, "feb": 2, "march": 3, "mar": 3,
+    "april": 4, "apr": 4, "may": 5, "june": 6, "jun": 6, "july": 7, "jul": 7,
+    "august": 8, "aug": 8, "september": 9, "sep": 9, "sept": 9, "october": 10, "oct": 10,
+    "november": 11, "nov": 11, "december": 12, "dec": 12,
+}
+
+
+def _parse_renewal_month_from_question(q: str) -> tuple[int, int] | None:
+    """If question mentions a month/year (e.g. 'March 2026', 'March \\'26', 'Mar 26'), return (year, month)."""
+    q_lower = q.lower()
+    for name, month in _MONTH_NAMES.items():
+        if name not in q_lower:
+            continue
+        # Look for 4-digit year (2026) or 2-digit (26 or '26)
+        for m in re.finditer(re.escape(name), q_lower, re.IGNORECASE):
+            start, end = m.start(), m.end()
+            rest = q_lower[end:end + 15].strip()
+            # 2026, 2025, ...
+            four = re.match(r"[\s'\-]*(\d{4})\b", rest)
+            if four:
+                y = int(four.group(1))
+                if 2020 <= y <= 2040:
+                    return (y, month)
+            # '26, 26
+            two = re.match(r"[\s'\-]*'?(\d{2})\b", rest)
+            if two:
+                yy = int(two.group(1))
+                y = 2000 + yy if yy < 50 else 1900 + yy
+                if 2020 <= y <= 2040:
+                    return (y, month)
+    return None
+
+
+def _parse_date_from_question(q: str, today: date | None = None) -> date | None:
+    """If question asks about a specific date (e.g. 'as of March 2025', 'last month'), return that date for snapshot lookup."""
+    if today is None:
+        today = datetime.now(EST).date()
+    q_lower = q.lower()
+    # "last month" -> last day of previous month
+    if "last month" in q_lower:
+        first_this = today.replace(day=1)
+        from calendar import monthrange
+        last_prev = first_this - timedelta(days=1)
+        return last_prev
+    # ISO-style YYYY-MM-DD
+    iso = re.search(r"\b(202[0-9])-(\d{1,2})-(\d{1,2})\b", q)
+    if iso:
+        try:
+            return date(int(iso.group(1)), int(iso.group(2)), int(iso.group(3)))
+        except ValueError:
+            pass
+    # "as of March 2025" / "in March 2025" / "on March 2025"
+    ym = _parse_renewal_month_from_question(q)
+    if ym and ("as of" in q_lower or "on " in q_lower or " in " in q_lower or re.search(r"\b(as of|on|in)\s+", q_lower)):
+        year, month = ym
+        from calendar import monthrange
+        _, last_day = monthrange(year, month)
+        return date(year, month, last_day)
+    return None
 
 
 def _parse_date(s: Optional[str]) -> Optional[date]:
@@ -836,6 +971,13 @@ async def _get_arr_by_account_product_data(db: AsyncSession) -> dict:
         canonical = _match_arr_product(raw) if raw else None
         canonical = canonical or "Other"
         by_account_product[acc][canonical] = by_account_product[acc].get(canonical, 0) + (li.total_price or 0)
+    # Per-account subscription end date = latest close_date among renewal opps for that account
+    account_end_date: dict[tuple[str | None, str | None], date | None] = {}
+    for o in renewal_opps:
+        key = (o.account_id, o.account_name or None)
+        if key not in account_end_date or (o.close_date and (not account_end_date[key] or o.close_date > account_end_date[key])):
+            account_end_date[key] = o.close_date
+
     # Load segment per account for rows
     account_ids = {aid for (aid, _) in by_account_product.keys() if aid}
     account_segment: dict[str, str | None] = {}
@@ -856,10 +998,12 @@ async def _get_arr_by_account_product_data(db: AsyncSession) -> dict:
         grand_total += total_arr
         seg = account_segment.get(aid) if aid else None
         seg = (seg or "").strip() or DEFAULT_SEGMENT
+        end_d = account_end_date.get((aid, aname))
         rows.append({
             "account_id": aid,
             "account_name": aname or "—",
             "segment": seg,
+            "subscription_end_date": end_d.isoformat() if end_d else None,
             "by_product": {p: by_product_arr.get(p, 0) for p in products},
             "total_arr": total_arr,
         })
@@ -871,6 +1015,100 @@ async def _get_arr_by_account_product_data(db: AsyncSession) -> dict:
         "total_by_product": total_by_product,
         "grand_total": round(grand_total, 2),
     }
+
+
+def _arr_from_snapshot_payload(payload: dict) -> dict:
+    """Compute ARR by account/product from EOD snapshot JSON (same shape as _get_arr_by_account_product_data)."""
+    opportunities = payload.get("opportunities") or []
+    line_items = payload.get("opportunity_line_items") or []
+    accounts_list = payload.get("accounts") or []
+    open_opps = [o for o in opportunities if (o.get("stage_name") or "") not in CLOSED_STAGES]
+    renewal_opps = [o for o in open_opps if (o.get("record_type_name") or "").strip().lower() == "renewal"]
+    renewal_sf_ids = {o["sf_id"] for o in renewal_opps}
+    opp_to_account = {o["sf_id"]: (o.get("account_id"), o.get("account_name") or None) for o in renewal_opps}
+
+    if not renewal_sf_ids:
+        products = list(ARR_PRODUCT_COLUMNS) + ["Other"]
+        return {"products": products, "rows": [], "total_by_product": {}, "grand_total": 0.0}
+
+    account_segment = {a["sf_id"]: (a.get("segment") or "").strip() or DEFAULT_SEGMENT for a in accounts_list}
+    products = list(ARR_PRODUCT_COLUMNS) + ["Other"]
+    by_account_product: dict[tuple[str | None, str | None], dict[str, float]] = {}
+    for li in line_items:
+        if li.get("opportunity_sf_id") not in renewal_sf_ids:
+            continue
+        acc = opp_to_account.get(li["opportunity_sf_id"])
+        if not acc:
+            continue
+        raw = _normalized_product_name(li.get("product_name"))
+        if _is_arr_excluded_product(raw) or _is_arr_excluded_product(li.get("product_name")):
+            continue
+        if not raw:
+            continue
+        if acc not in by_account_product:
+            by_account_product[acc] = {p: 0.0 for p in products}
+        canonical = _match_arr_product(raw) if raw else None
+        canonical = canonical or "Other"
+        by_account_product[acc][canonical] = by_account_product[acc].get(canonical, 0) + (li.get("total_price") or 0)
+
+    account_end_date: dict[tuple[str | None, str | None], date | None] = {}
+    for o in renewal_opps:
+        key = (o.get("account_id"), o.get("account_name") or None)
+        close_str = o.get("close_date")
+        try:
+            end_d = datetime.fromisoformat(close_str.replace("Z", "+00:00")).date() if close_str else None
+        except (ValueError, TypeError):
+            end_d = None
+        if key not in account_end_date or (end_d and (not account_end_date[key] or end_d > account_end_date[key])):
+            account_end_date[key] = end_d
+
+    total_by_product = {p: 0.0 for p in products}
+    rows = []
+    grand_total = 0.0
+    for (aid, aname), by_product in by_account_product.items():
+        by_product_arr = {p: round((mrr * ARR_MULTIPLIER), 2) for p, mrr in by_product.items()}
+        for p in products:
+            total_by_product[p] = total_by_product.get(p, 0) + by_product_arr.get(p, 0)
+        total_arr = round(sum(by_product_arr.values()), 2)
+        grand_total += total_arr
+        seg = account_segment.get(aid) if aid else DEFAULT_SEGMENT
+        end_d = account_end_date.get((aid, aname))
+        rows.append({
+            "account_id": aid,
+            "account_name": aname or "—",
+            "segment": seg,
+            "subscription_end_date": end_d.isoformat() if end_d else None,
+            "by_product": {p: by_product_arr.get(p, 0) for p in products},
+            "total_arr": total_arr,
+        })
+    rows.sort(key=lambda x: -x["total_arr"])
+    total_by_product = {p: round(total_by_product[p], 2) for p in products}
+    return {
+        "products": products,
+        "rows": rows,
+        "total_by_product": total_by_product,
+        "grand_total": round(grand_total, 2),
+    }
+
+
+async def _get_arr_data_for_date(db: AsyncSession, as_of_date: date | None) -> tuple[dict, str]:
+    """Get ARR data: live if as_of_date is None, else from latest EOD snapshot on or before that date. Returns (data, source_label)."""
+    if as_of_date is None:
+        data = await _get_arr_by_account_product_data(db)
+        return data, "Customer overview (open renewals)"
+    r = await db.execute(
+        select(SalesforceEODSnapshot)
+        .where(SalesforceEODSnapshot.snapshot_date <= as_of_date)
+        .order_by(SalesforceEODSnapshot.snapshot_date.desc())
+        .limit(1)
+    )
+    snap = r.scalar_one_or_none()
+    if not snap or not snap.data_json:
+        data = await _get_arr_by_account_product_data(db)
+        return data, "Customer overview (no snapshot for that date; showing current)"
+    payload = json.loads(snap.data_json)
+    data = _arr_from_snapshot_payload(payload)
+    return data, f"EOD snapshot ({snap.snapshot_date.isoformat()})"
 
 
 @app.get("/api/arr-by-account-product")

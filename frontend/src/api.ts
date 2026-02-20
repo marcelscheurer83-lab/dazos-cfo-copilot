@@ -159,7 +159,10 @@ export type ARRExamplesResponse = {
 
 export async function getDashboardKPI(): Promise<DashboardKPI> {
   const r = await apiFetch('/dashboard-kpi')
-  if (!r.ok) throw new Error('Failed to fetch dashboard KPI')
+  if (!r.ok) {
+    const msg = r.status === 401 ? 'Unauthorized — sign in again.' : `Dashboard error ${r.status}. Check backend is up.`
+    throw new Error(msg)
+  }
   return r.json()
 }
 

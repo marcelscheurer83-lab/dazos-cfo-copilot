@@ -11,7 +11,7 @@ from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
-from typing import Optional
+from typing import List, Optional
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, Depends, Query
@@ -48,7 +48,7 @@ EST = ZoneInfo("America/New_York")
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await seed()
-    # Background task: hourly Salesforce sync at :59:59 EST, EOD snapshot at 23:59:59 EST
+    # Background task: hourly Salesforce sync at :59 EST (ARR + pipeline); daily EOD snapshot at 23:59 EST (for historical ARR + pipeline)
     task = asyncio.create_task(_scheduled_salesforce_jobs())
     yield
     task.cancel()
@@ -381,10 +381,12 @@ async def sync_google_sheets(
 
 # ----- Salesforce sync (Phase 1b) -----
 
-# Default SOQL for opportunities (ARR / pipeline). RecordType.Name for ARR (renewals only).
+# Default SOQL for opportunities (ARR / pipeline). RecordType.Name for ARR (renewals only). MRR from Finance Details.
+# If your MRR field has a different API name, set SALESFORCE_MRR_FIELD in .env (e.g. MRR__c).
+_SALESFORCE_MRR_FIELD = os.getenv("SALESFORCE_MRR_FIELD", "MRR__c").strip() or "MRR__c"
 DEFAULT_OPPORTUNITY_SOQL = (
     "SELECT Id, Name, Amount, CloseDate, StageName, Type, RecordType.Name, "
-    "Account.Id, Account.Name, CreatedDate "
+    "Account.Id, Account.Name, CreatedDate, " + _SALESFORCE_MRR_FIELD + " "
     "FROM Opportunity ORDER BY CloseDate DESC NULLS LAST"
 )
 # Opportunity products: TotalPrice = MRR; ARR = MRR * 12. Product2.Name (or Name) for product columns.
@@ -392,6 +394,9 @@ DEFAULT_OPPORTUNITY_LINE_ITEM_SOQL = (
     "SELECT Id, OpportunityId, Name, Product2.Name, Quantity, UnitPrice, TotalPrice FROM OpportunityLineItem"
 )
 ARR_MULTIPLIER = 12  # MRR -> ARR
+# If set (1/true/yes), TotalPrice is treated as already annual: ARR = sum(TotalPrice). Otherwise ARR = sum(TotalPrice) * 12.
+_ARR_TOTAL_PRICE_IS_ANNUAL = os.getenv("ARR_TOTAL_PRICE_IS_ANNUAL", "").strip().lower() in ("1", "true", "yes")
+PIPELINE_ARR_MULTIPLIER = 1 if _ARR_TOTAL_PRICE_IS_ANNUAL else ARR_MULTIPLIER
 
 # Products excluded from ARR (not counted in totals or shown as columns). Case-insensitive match.
 # Price book: "Verify Monthly Credits", "Kipu API" — excluded; 6 one-time ProServ products are out of scope for ARR.
@@ -561,6 +566,15 @@ def _parse_datetime(s: Optional[str]) -> Optional[datetime]:
         return None
 
 
+def _float_or_none(x) -> Optional[float]:
+    if x is None:
+        return None
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return None
+
+
 async def _run_salesforce_sync(db: AsyncSession) -> dict:
     """Run full Salesforce sync (accounts, opportunities, opportunity line items). Caller must commit. Uses EST for any timestamps."""
     from connectors.salesforce import SalesforceConnector
@@ -627,6 +641,7 @@ async def _run_salesforce_sync(db: AsyncSession) -> dict:
             record_type_name=record_type_name,
             account_id=rec.get("Account_Id"),
             account_name=rec.get("Account_Name"),
+            mrr=_float_or_none(rec.get(_SALESFORCE_MRR_FIELD)),
             created_date=_parse_datetime(rec.get("CreatedDate")),
         )
         db.add(opp)
@@ -706,7 +721,7 @@ async def _take_salesforce_eod_snapshot(db: AsyncSession) -> None:
     r_acc = await db.execute(select(Account))
     accounts = [{"sf_id": a.sf_id, "name": a.name, "type": a.type, "status": a.status, "segment": (a.segment or "").strip() or DEFAULT_SEGMENT, "industry": a.industry, "annual_revenue": a.annual_revenue, "number_of_employees": a.number_of_employees, "billing_country": a.billing_country, "billing_city": a.billing_city, "billing_state": a.billing_state, "phone": a.phone, "website": a.website, "created_date": a.created_date.isoformat() if a.created_date else None, "synced_at": a.synced_at.isoformat() if a.synced_at else None} for a in r_acc.scalars().all()]
     r_opp = await db.execute(select(Opportunity))
-    opportunities = [{"sf_id": o.sf_id, "name": o.name, "amount": o.amount, "close_date": o.close_date.isoformat() if o.close_date else None, "stage_name": o.stage_name, "type": o.type, "record_type_name": o.record_type_name, "account_id": o.account_id, "account_name": o.account_name, "created_date": o.created_date.isoformat() if o.created_date else None, "synced_at": o.synced_at.isoformat() if o.synced_at else None} for o in r_opp.scalars().all()]
+    opportunities = [{"sf_id": o.sf_id, "name": o.name, "amount": o.amount, "close_date": o.close_date.isoformat() if o.close_date else None, "stage_name": o.stage_name, "type": o.type, "record_type_name": o.record_type_name, "account_id": o.account_id, "account_name": o.account_name, "mrr": o.mrr, "created_date": o.created_date.isoformat() if o.created_date else None, "synced_at": o.synced_at.isoformat() if o.synced_at else None} for o in r_opp.scalars().all()]
     r_li = await db.execute(select(OpportunityLineItem))
     line_items = [{"opportunity_sf_id": li.opportunity_sf_id, "product_name": li.product_name, "quantity": li.quantity, "unit_price": li.unit_price, "total_price": li.total_price, "synced_at": li.synced_at.isoformat() if li.synced_at else None} for li in r_li.scalars().all()]
 
@@ -721,7 +736,7 @@ async def _take_salesforce_eod_snapshot(db: AsyncSession) -> None:
 
 
 async def _scheduled_salesforce_jobs() -> None:
-    """Run hourly sync at :59:59 EST and EOD snapshot at 23:59:59 EST."""
+    """Run hourly Salesforce sync at :59:59 EST (updates ARR and pipeline); EOD snapshot at 23:59:59 EST (for historical ARR and pipeline)."""
     last_sync_hour: Optional[tuple[date, int]] = None  # (date_est, hour_est)
     last_eod_date: Optional[date] = None
 
@@ -1278,6 +1293,334 @@ async def get_opportunities(
         }
         for o in rows
     ]
+
+
+# Pipeline and Closed data: only these record types (case-insensitive).
+PIPELINE_RECORD_TYPES = frozenset({"new business", "expansion"})
+
+
+def _is_pipeline_record_type(record_type_name: Optional[str]) -> bool:
+    return (record_type_name or "").strip().lower() in PIPELINE_RECORD_TYPES
+
+
+def _pipeline_from_snapshot_payload(
+    payload: dict,
+    filter_segment_list: Optional[List[str]] = None,
+    filter_stage_list: Optional[List[str]] = None,
+    filter_record_type_list: Optional[List[str]] = None,
+) -> dict:
+    """Build pipeline-overview response from EOD snapshot payload (accounts, opportunities, opportunity_line_items)."""
+    accounts = payload.get("accounts") or []
+    opportunities = payload.get("opportunities") or []
+    line_items = payload.get("opportunity_line_items") or []
+    account_segment = {a["sf_id"]: (a.get("segment") or "").strip() or DEFAULT_SEGMENT for a in accounts if a.get("sf_id")}
+    open_opps_all = [
+        o for o in opportunities
+        if (o.get("stage_name") or "").strip() not in CLOSED_STAGES
+        and _is_pipeline_record_type(o.get("record_type_name"))
+    ]
+    segments_set = set()
+    stages_set = set()
+    record_types_set = set()
+    for o in open_opps_all:
+        seg = account_segment.get(o.get("account_id")) if o.get("account_id") else DEFAULT_SEGMENT
+        segments_set.add(seg)
+        stages_set.add(o.get("stage_name") or "—")
+        record_types_set.add(o.get("record_type_name") or "—")
+    def _norm(s: str) -> str:
+        return (s or "").strip().lower()
+    filter_segments = {_norm(s) for s in (filter_segment_list or [])}
+    filter_stages = {_norm(s) for s in (filter_stage_list or [])}
+    filter_record_types = {_norm(s) for s in (filter_record_type_list or [])}
+
+    def _keep(o: dict) -> bool:
+        seg = account_segment.get(o.get("account_id")) if o.get("account_id") else DEFAULT_SEGMENT
+        if filter_segments and _norm(seg) not in filter_segments:
+            return False
+        if filter_stages and _norm(o.get("stage_name") or "") not in filter_stages:
+            return False
+        if filter_record_types and _norm(o.get("record_type_name") or "") not in filter_record_types:
+            return False
+        return True
+
+    open_opps = [o for o in open_opps_all if _keep(o)]
+    pipeline_sf_ids = {o["sf_id"] for o in open_opps}
+    opp_to_arr_from_lines: dict[str, float] = {}
+    for li in line_items:
+        opp_sf_id = li.get("opportunity_sf_id")
+        if opp_sf_id not in pipeline_sf_ids:
+            continue
+        raw = _normalized_product_name(li.get("product_name"))
+        if _is_arr_excluded_product(raw) or _is_arr_excluded_product(li.get("product_name")):
+            continue
+        mrr = float(li.get("total_price") or 0)
+        opp_to_arr_from_lines[opp_sf_id] = opp_to_arr_from_lines.get(opp_sf_id, 0) + mrr * PIPELINE_ARR_MULTIPLIER
+    opp_to_arr_from_lines = {k: round(v, 2) for k, v in opp_to_arr_from_lines.items()}
+    rows = []
+    grand_total = 0.0
+    for o in open_opps:
+        mrr_val = o.get("mrr")
+        if mrr_val is not None and mrr_val != 0:
+            arr = round(float(mrr_val) * PIPELINE_ARR_MULTIPLIER, 2)
+        else:
+            arr = opp_to_arr_from_lines.get(o["sf_id"], 0)
+        grand_total += arr
+        seg = account_segment.get(o.get("account_id")) if o.get("account_id") else DEFAULT_SEGMENT
+        rows.append({
+            "account_id": o.get("account_id"),
+            "account_name": o.get("name") or "—",
+            "segment": seg,
+            "opportunity_sf_id": o["sf_id"],
+            "opportunity_name": o.get("name") or "—",
+            "stage_name": o.get("stage_name") or "—",
+            "record_type_name": o.get("record_type_name") or "—",
+            "close_date": o.get("close_date"),
+            "arr": arr,
+        })
+    rows.sort(key=lambda x: -x["arr"])
+    return {
+        "rows": rows,
+        "grand_total": round(grand_total, 2),
+        "segments": sorted(segments_set),
+        "stages": sorted(stages_set),
+        "record_types": sorted(record_types_set),
+    }
+
+
+@app.get("/api/pipeline-overview")
+async def get_pipeline_overview(
+    db: AsyncSession = Depends(get_db),
+    segment: Optional[List[str]] = Query(None, description="Filter by segment (e.g. Enterprise)"),
+    stage: Optional[List[str]] = Query(None, description="Filter by stage name"),
+    record_type: Optional[List[str]] = Query(None, description="Filter by record type (e.g. Expansion)"),
+    as_of: Optional[date] = Query(None, description="Pipeline as of date (uses latest EOD snapshot on or before this date)"),
+):
+    """
+    Open opportunities (pipeline): not Closed Won / Closed Lost; record type = New Business or Expansion only.
+    ARR = Opportunity.MRR (Finance Details) × 12 per opportunity.
+    Same data source as ARR: hourly Salesforce sync at :59 EST, daily EOD snapshot at 23:59 EST (use as_of for historical pipeline).
+    Optional filters: segment, stage, record_type. Optional as_of for pipeline from EOD snapshot.
+    """
+    if as_of is not None:
+        r_snap = await db.execute(
+            select(SalesforceEODSnapshot)
+            .where(SalesforceEODSnapshot.snapshot_date <= as_of)
+            .order_by(SalesforceEODSnapshot.snapshot_date.desc())
+            .limit(1)
+        )
+        snap = r_snap.scalar_one_or_none()
+        if snap and snap.data_json:
+            payload = json.loads(snap.data_json)
+            out = _pipeline_from_snapshot_payload(payload, segment, stage, record_type)
+            out["snapshot_date"] = snap.snapshot_date.isoformat()
+            base = os.getenv("SALESFORCE_BASE_URL", "").strip().rstrip("/")
+            if base and ("salesforce.com" in base or "lightning.force.com" in base):
+                out["salesforce_base_url"] = base
+            return out
+        out = {
+            "rows": [],
+            "grand_total": 0,
+            "segments": [],
+            "stages": [],
+            "record_types": [],
+            "snapshot_date": None,
+            "message": "No EOD snapshot for that date. Pipeline and ARR are snapshotted daily at 23:59 EST.",
+        }
+        base = os.getenv("SALESFORCE_BASE_URL", "").strip().rstrip("/")
+        if base and ("salesforce.com" in base or "lightning.force.com" in base):
+            out["salesforce_base_url"] = base
+        return out
+
+    q_open = select(Opportunity).where(
+        Opportunity.stage_name.isnot(None),
+        ~Opportunity.stage_name.in_(CLOSED_STAGES),
+    )
+    r = await db.execute(q_open)
+    open_opps_all = [o for o in r.scalars().all() if _is_pipeline_record_type(o.record_type_name)]
+    account_ids = {o.account_id for o in open_opps_all if o.account_id}
+    account_segment: dict[str, str] = {}
+    if account_ids:
+        q_acc = select(Account.sf_id, Account.segment).where(Account.sf_id.in_(account_ids))
+        r_acc = await db.execute(q_acc)
+        for (sf_id, seg) in r_acc.all():
+            account_segment[sf_id] = (seg or "").strip() or DEFAULT_SEGMENT
+    # Distinct values for filter dropdowns (from New Business + Expansion open opps)
+    segments_set: set[str] = set()
+    stages_set: set[str] = set()
+    record_types_set: set[str] = set()
+    for o in open_opps_all:
+        seg = account_segment.get(o.account_id) if o.account_id else DEFAULT_SEGMENT
+        segments_set.add(seg)
+        stages_set.add(o.stage_name or "—")
+        record_types_set.add(o.record_type_name or "—")
+    # Apply filters (case-insensitive match)
+    def _norm(s: str) -> str:
+        return (s or "").strip().lower()
+
+    filter_segments = {_norm(s) for s in (segment or [])}
+    filter_stages = {_norm(s) for s in (stage or [])}
+    filter_record_types = {_norm(s) for s in (record_type or [])}
+
+    def _keep(o) -> bool:
+        seg = account_segment.get(o.account_id) if o.account_id else DEFAULT_SEGMENT
+        if filter_segments and _norm(seg) not in filter_segments:
+            return False
+        if filter_stages and _norm(o.stage_name or "") not in filter_stages:
+            return False
+        if filter_record_types and _norm(o.record_type_name or "") not in filter_record_types:
+            return False
+        return True
+
+    open_opps = [o for o in open_opps_all if _keep(o)]
+    pipeline_sf_ids = {o.sf_id for o in open_opps}
+    # Fallback: when Opportunity.MRR is null/zero, use sum(OpportunityLineItem.TotalPrice)×12
+    opp_to_arr_from_lines: dict[str, float] = {}
+    if pipeline_sf_ids:
+        q_lines = select(OpportunityLineItem).where(
+            OpportunityLineItem.opportunity_sf_id.in_(pipeline_sf_ids)
+        )
+        r_lines = await db.execute(q_lines)
+        for li in r_lines.scalars().all():
+            raw = _normalized_product_name(li.product_name)
+            if _is_arr_excluded_product(raw) or _is_arr_excluded_product(li.product_name):
+                continue
+            opp_sf_id = li.opportunity_sf_id
+            mrr = float(li.total_price or 0)
+            opp_to_arr_from_lines[opp_sf_id] = opp_to_arr_from_lines.get(opp_sf_id, 0) + mrr * PIPELINE_ARR_MULTIPLIER
+        opp_to_arr_from_lines = {k: round(v, 2) for k, v in opp_to_arr_from_lines.items()}
+    rows = []
+    grand_total = 0.0
+    for o in open_opps:
+        if o.mrr is not None and o.mrr != 0:
+            arr = round(float(o.mrr) * PIPELINE_ARR_MULTIPLIER, 2)
+        else:
+            arr = opp_to_arr_from_lines.get(o.sf_id, 0)
+        grand_total += arr
+        seg = account_segment.get(o.account_id) if o.account_id else DEFAULT_SEGMENT
+        rows.append({
+            "account_id": o.account_id,
+            "account_name": o.account_name or "—",
+            "segment": seg,
+            "opportunity_sf_id": o.sf_id,
+            "opportunity_name": o.name or "—",
+            "stage_name": o.stage_name or "—",
+            "record_type_name": o.record_type_name or "—",
+            "close_date": o.close_date.isoformat() if o.close_date else None,
+            "arr": arr,
+        })
+    rows.sort(key=lambda x: -x["arr"])
+    out = {
+        "rows": rows,
+        "grand_total": round(grand_total, 2),
+        "segments": sorted(segments_set),
+        "stages": sorted(stages_set),
+        "record_types": sorted(record_types_set),
+    }
+    base = os.getenv("SALESFORCE_BASE_URL", "").strip().rstrip("/")
+    if base and ("salesforce.com" in base or "lightning.force.com" in base):
+        out["salesforce_base_url"] = base
+    return out
+
+
+@app.get("/api/closed-overview")
+async def get_closed_overview(
+    db: AsyncSession = Depends(get_db),
+    months: Optional[List[str]] = Query(None, description="Filter by close-date month(s), e.g. 2026-02, 2026-03"),
+):
+    """
+    Closed opportunities (Closed Won + Closed Lost); record type = New Business or Expansion only.
+    Optionally filter by one or more months (YYYY-MM). ARR = Opportunity.MRR (Finance Details) × 12 per opportunity.
+    """
+    q_closed = select(Opportunity).where(
+        Opportunity.stage_name.in_(CLOSED_STAGES),
+        Opportunity.close_date.isnot(None),
+    ).order_by(Opportunity.close_date.desc())
+    r = await db.execute(q_closed)
+    closed_opps_all = [o for o in r.scalars().all() if _is_pipeline_record_type(o.record_type_name)]
+    # Distinct months (YYYY-MM) from close_date
+    available_months_set: set[str] = set()
+    for o in closed_opps_all:
+        if o.close_date:
+            available_months_set.add(o.close_date.strftime("%Y-%m"))
+    # Parse selected months and build date ranges
+    if months:
+        month_ranges: list[tuple[date, date]] = []
+        for yyyy_mm in months:
+            parts = (yyyy_mm or "").strip().split("-")
+            if len(parts) != 2:
+                continue
+            try:
+                y, m = int(parts[0]), int(parts[1])
+                if 1 <= m <= 12:
+                    first = date(y, m, 1)
+                    if m == 12:
+                        last = date(y, 12, 31)
+                    else:
+                        last = date(y, m + 1, 1) - timedelta(days=1)
+                    month_ranges.append((first, last))
+            except (ValueError, TypeError):
+                continue
+        if month_ranges:
+            def _in_selected(d: date) -> bool:
+                return any(first <= d <= last for first, last in month_ranges)
+            closed_opps = [o for o in closed_opps_all if o.close_date and _in_selected(o.close_date)]
+        else:
+            closed_opps = closed_opps_all
+    else:
+        closed_opps = closed_opps_all
+    closed_sf_ids = {o.sf_id for o in closed_opps}
+    account_ids = {o.account_id for o in closed_opps if o.account_id}
+    account_segment: dict[str, str] = {}
+    if account_ids:
+        q_acc = select(Account.sf_id, Account.segment).where(Account.sf_id.in_(account_ids))
+        r_acc = await db.execute(q_acc)
+        for (sf_id, seg) in r_acc.all():
+            account_segment[sf_id] = (seg or "").strip() or DEFAULT_SEGMENT
+    # Fallback: when Opportunity.MRR is null/zero, use sum(OpportunityLineItem.TotalPrice)×12
+    opp_to_arr_from_lines: dict[str, float] = {}
+    if closed_sf_ids:
+        q_lines = select(OpportunityLineItem).where(
+            OpportunityLineItem.opportunity_sf_id.in_(closed_sf_ids)
+        )
+        r_lines = await db.execute(q_lines)
+        for li in r_lines.scalars().all():
+            raw = _normalized_product_name(li.product_name)
+            if _is_arr_excluded_product(raw) or _is_arr_excluded_product(li.product_name):
+                continue
+            opp_sf_id = li.opportunity_sf_id
+            mrr = float(li.total_price or 0)
+            opp_to_arr_from_lines[opp_sf_id] = opp_to_arr_from_lines.get(opp_sf_id, 0) + mrr * PIPELINE_ARR_MULTIPLIER
+        opp_to_arr_from_lines = {k: round(v, 2) for k, v in opp_to_arr_from_lines.items()}
+    rows = []
+    grand_total = 0.0
+    for o in closed_opps:
+        if o.mrr is not None and o.mrr != 0:
+            arr = round(float(o.mrr) * PIPELINE_ARR_MULTIPLIER, 2)
+        else:
+            arr = opp_to_arr_from_lines.get(o.sf_id, 0)
+        grand_total += arr
+        seg = account_segment.get(o.account_id) if o.account_id else DEFAULT_SEGMENT
+        rows.append({
+            "account_id": o.account_id,
+            "account_name": o.account_name or "—",
+            "segment": seg,
+            "opportunity_sf_id": o.sf_id,
+            "opportunity_name": o.name or "—",
+            "stage_name": o.stage_name or "—",
+            "record_type_name": o.record_type_name or "—",
+            "close_date": o.close_date.isoformat() if o.close_date else None,
+            "arr": arr,
+        })
+    rows.sort(key=lambda x: (-(date.fromisoformat(x["close_date"]) if x["close_date"] else date.min).toordinal(), -x["arr"]))
+    out = {
+        "rows": rows,
+        "grand_total": round(grand_total, 2),
+        "available_months": sorted(available_months_set, reverse=True),
+    }
+    base = os.getenv("SALESFORCE_BASE_URL", "").strip().rstrip("/")
+    if base and ("salesforce.com" in base or "lightning.force.com" in base):
+        out["salesforce_base_url"] = base
+    return out
 
 
 # ----- QuickBooks sync (Phase 1c) -----

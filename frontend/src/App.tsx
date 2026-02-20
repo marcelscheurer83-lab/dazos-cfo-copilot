@@ -4,6 +4,8 @@ import Layout from './Layout'
 import Login from './Login'
 import Dashboard from './views/Dashboard'
 import ARR from './views/ARR'
+import Pipeline from './views/Pipeline'
+import Closed from './views/Closed'
 import Copilot from './views/Copilot'
 
 class ErrorBoundary extends Component<{ children: ReactNode }, { error: Error | null; key: number }> {
@@ -57,6 +59,9 @@ export default function App() {
         <Route path="dashboard" element={<Dashboard />} />
         <Route path="customer-overview" element={<ARR />} />
         <Route path="arr" element={<Navigate to="/customer-overview" replace />} />
+        <Route path="pipeline-overview" element={<Pipeline />} />
+        <Route path="bookings" element={<Closed />} />
+        <Route path="closed-data" element={<Navigate to="/bookings" replace />} />
         <Route path="copilot" element={<Copilot />} />
       </Route>
       <Route path="*" element={<Navigate to="/dashboard" replace />} />

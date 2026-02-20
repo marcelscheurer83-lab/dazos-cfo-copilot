@@ -214,6 +214,64 @@ export async function exportARRToGoogleSheet(): Promise<{ ok: boolean; error?: s
   return data
 }
 
+/** Pipeline overview: open opportunities (not Closed Won/Lost). One row per opportunity. */
+export type PipelineOverviewRow = {
+  account_id: string | null
+  account_name: string
+  segment: string
+  opportunity_sf_id: string
+  opportunity_name: string
+  stage_name: string
+  record_type_name: string
+  close_date: string | null
+  arr: number
+}
+
+export type PipelineOverviewResponse = {
+  rows: PipelineOverviewRow[]
+  grand_total: number
+  segments: string[]
+  stages: string[]
+  record_types: string[]
+  salesforce_base_url?: string
+}
+
+export type PipelineOverviewFilters = {
+  segment?: string[]
+  stage?: string[]
+  record_type?: string[]
+}
+
+export async function getPipelineOverview(filters?: PipelineOverviewFilters): Promise<PipelineOverviewResponse> {
+  const params = new URLSearchParams()
+  if (filters?.segment?.length) filters.segment.forEach((s) => params.append('segment', s))
+  if (filters?.stage?.length) filters.stage.forEach((s) => params.append('stage', s))
+  if (filters?.record_type?.length) filters.record_type.forEach((r) => params.append('record_type', r))
+  const qs = params.toString()
+  const r = await apiFetch(`/pipeline-overview${qs ? `?${qs}` : ''}`)
+  if (!r.ok) throw new Error('Failed to fetch pipeline overview')
+  return r.json()
+}
+
+/** Closed overview: Closed Won + Closed Lost. Same row shape as pipeline. */
+export type ClosedOverviewRow = PipelineOverviewRow
+
+export type ClosedOverviewResponse = {
+  rows: ClosedOverviewRow[]
+  grand_total: number
+  available_months: string[]
+  salesforce_base_url?: string
+}
+
+export async function getClosedOverview(months?: string[]): Promise<ClosedOverviewResponse> {
+  const params = new URLSearchParams()
+  if (months?.length) months.forEach((m) => params.append('months', m))
+  const qs = params.toString()
+  const r = await apiFetch(`/closed-overview${qs ? `?${qs}` : ''}`)
+  if (!r.ok) throw new Error('Failed to fetch closed overview')
+  return r.json()
+}
+
 export async function syncSalesforce(): Promise<{
   ok: boolean
   error?: string

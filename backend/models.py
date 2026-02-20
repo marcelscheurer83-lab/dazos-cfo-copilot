@@ -106,6 +106,7 @@ class Opportunity(Base):
     record_type_name = Column(String(128), nullable=True)  # RecordType.Name, e.g. 'Renewal'
     account_id = Column(String(18), nullable=True)
     account_name = Column(String(255), nullable=True)
+    mrr = Column(Float, nullable=True)  # MRR from Opportunity Finance Details (e.g. MRR__c); ARR = mrr * 12
     created_date = Column(DateTime, nullable=True)
     synced_at = Column(DateTime, server_default=func.now())
 

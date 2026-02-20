@@ -83,6 +83,9 @@ class RequireAppPasswordMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         if not request.url.path.startswith("/api/"):
             return await call_next(request)
+        # Let OPTIONS (CORS preflight) through so the browser gets 200 and can send the real request with the password header
+        if request.method == "OPTIONS":
+            return await call_next(request)
         password = os.getenv("APP_PASSWORD")
         if not password:
             return await call_next(request)

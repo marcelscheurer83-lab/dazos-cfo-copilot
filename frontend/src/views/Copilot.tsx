@@ -33,7 +33,7 @@ export default function Copilot() {
     <>
       <h1 style={{ margin: '0 0 1.5rem', fontSize: '1.5rem', fontWeight: 600 }}>Copilot</h1>
       <p style={{ color: 'var(--text-muted)', marginBottom: '1.5rem', maxWidth: 560 }}>
-        I only answer <strong>ARR-related questions</strong>. You can ask about current data or past dates (e.g. &ldquo;Total ARR as of March 2025&rdquo; or &ldquo;Largest customer last month&rdquo;) when EOD snapshots exist.
+        I only answer <strong>CARR-related questions</strong> (contracted ARR). You can ask about current data or past dates (e.g. &ldquo;Total CARR as of March 2025&rdquo; or &ldquo;Largest customer last month&rdquo;) when EOD snapshots exist.
       </p>
       <div
         style={{
@@ -49,7 +49,7 @@ export default function Copilot() {
         <div style={{ flex: 1, overflow: 'auto', padding: '1rem' }}>
           {messages.length === 0 && (
             <div style={{ color: 'var(--text-muted)', fontSize: '0.9rem' }}>
-              Try: &ldquo;What&rsquo;s our total ARR?&rdquo; or &ldquo;What&rsquo;s our largest customer?&rdquo; or &ldquo;What ARR is up for renewal in March &rsquo;26?&rdquo;
+              Try: &ldquo;What&rsquo;s our total CARR?&rdquo; or &ldquo;What&rsquo;s our largest customer?&rdquo; or &ldquo;What CARR is up for renewal in March &rsquo;26?&rdquo;
             </div>
           )}
           {messages.map((msg, i) => (

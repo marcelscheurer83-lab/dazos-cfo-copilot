@@ -232,8 +232,8 @@ async def copilot(body: CopilotRequest, db: AsyncSession = Depends(get_db)):
     q_lower = q.lower()
     today_est = datetime.now(EST).date()
 
-    # How did ARR change (today / vs last snapshot)
-    if "arr" in q_lower and ("change" in q_lower or "diff" in q_lower or "compared" in q_lower or "vs " in q_lower):
+    # How did CARR/ARR change (today / vs last snapshot)
+    if ("arr" in q_lower or "carr" in q_lower) and ("change" in q_lower or "diff" in q_lower or "compared" in q_lower or "vs " in q_lower):
         data_now, _ = await _get_arr_data_for_date(db, None)
         current_arr = data_now.get("grand_total") or 0
         r = await db.execute(
@@ -256,11 +256,11 @@ async def copilot(body: CopilotRequest, db: AsyncSession = Depends(get_db)):
             else:
                 change = "unchanged"
             return CopilotResponse(
-                answer=f"**Total ARR** is **${current_arr:,.0f}** now (was **${prev_arr:,.0f}** in the EOD snapshot for {snap.snapshot_date.isoformat()}). ARR has **{change}** since then.",
+                answer=f"**Total CARR** is **${current_arr:,.0f}** now (was **${prev_arr:,.0f}** in the EOD snapshot for {snap.snapshot_date.isoformat()}). CARR has **{change}** since then.",
                 sources=["Customer overview (open renewals)", f"EOD snapshot ({snap.snapshot_date.isoformat()})"],
             )
         return CopilotResponse(
-            answer=f"**Total ARR** today is **${current_arr:,.0f}**. There’s no earlier EOD snapshot to compare; run the app so it can save daily snapshots (23:59 EST).",
+            answer=f"**Total CARR** today is **${current_arr:,.0f}**. There’s no earlier EOD snapshot to compare; run the app so it can save daily snapshots (23:59 EST).",
             sources=["Customer overview (open renewals)"],
         )
 
@@ -270,10 +270,10 @@ async def copilot(body: CopilotRequest, db: AsyncSession = Depends(get_db)):
     grand_total = data.get("grand_total") or 0
     date_note = f" (as of {as_of_date})" if as_of_date else ""
 
-    # Total ARR / how much ARR
-    if any(phrase in q_lower for phrase in ("total arr", "how much arr", "what's our arr", "what is our arr", "total recurring", "arr as of", "arr on ")):
+    # Total CARR / how much CARR
+    if any(phrase in q_lower for phrase in ("total arr", "total carr", "how much arr", "how much carr", "what's our arr", "what's our carr", "what is our arr", "what is our carr", "total recurring", "arr as of", "carr as of", "arr on ", "carr on ")):
         return CopilotResponse(
-            answer=f"**Total ARR**{date_note} is **${grand_total:,.0f}** across **{len(rows)}** account(s).",
+            answer=f"**Total CARR**{date_note} is **${grand_total:,.0f}** across **{len(rows)}** account(s).",
             sources=[source_label],
         )
 
@@ -284,7 +284,7 @@ async def copilot(body: CopilotRequest, db: AsyncSession = Depends(get_db)):
             name = top.get("account_name") or "—"
             arr = top.get("total_arr") or 0
             return CopilotResponse(
-                answer=f"Your **largest customer** by ARR{date_note} is **{name}** with **${arr:,.0f} ARR.**",
+                answer=f"Your **largest customer** by CARR{date_note} is **{name}** with **${arr:,.0f} CARR.**",
                 sources=[source_label],
             )
         return CopilotResponse(
@@ -292,8 +292,8 @@ async def copilot(body: CopilotRequest, db: AsyncSession = Depends(get_db)):
             sources=[],
         )
 
-    # ARR up for renewal in a given month
-    if ("renewal" in q_lower or "arr" in q_lower) and _parse_renewal_month_from_question(q):
+    # CARR/ARR up for renewal in a given month
+    if ("renewal" in q_lower or "arr" in q_lower or "carr" in q_lower) and _parse_renewal_month_from_question(q):
         ym = _parse_renewal_month_from_question(q)
         if ym:
             year, month = ym
@@ -316,16 +316,16 @@ async def copilot(body: CopilotRequest, db: AsyncSession = Depends(get_db)):
                 if len(in_month) > 10:
                     accounts_list += f" and {len(in_month) - 10} more"
                 return CopilotResponse(
-                    answer=f"**${total_arr:,.0f} ARR** is up for renewal in **{month_label} {year}** ({len(in_month)} account(s)). Accounts include: {accounts_list}.",
+                    answer=f"**${total_arr:,.0f} CARR** is up for renewal in **{month_label} {year}** ({len(in_month)} account(s)). Accounts include: {accounts_list}.",
                     sources=[source_label],
                 )
             return CopilotResponse(
-                answer=f"No ARR is currently up for renewal in **{month_label} {year}**. Subscription end dates are from open renewal opportunities.",
+                answer=f"No CARR is currently up for renewal in **{month_label} {year}**. Subscription end dates are from open renewal opportunities.",
                 sources=[source_label],
             )
 
     return CopilotResponse(
-        answer="I only answer **ARR-related** questions. You can ask about current data or past dates (e.g. 'Total ARR as of March 2025' or 'Largest customer last month') when EOD snapshots exist. Try: 'What's our total ARR?' or 'How did ARR change today?' or 'What ARR is up for renewal in March '26?'",
+        answer="I only answer **CARR-related** questions (contracted ARR). You can ask about current data or past dates (e.g. 'Total CARR as of March 2025' or 'Largest customer last month') when EOD snapshots exist. Try: 'What's our total CARR?' or 'How did CARR change today?' or 'What CARR is up for renewal in March '26?'",
         sources=[],
     )
 
@@ -1116,8 +1116,13 @@ async def get_arr_by_account_product(db: AsyncSession = Depends(get_db)):
     """
     ARR by account with product columns (open renewals only). total_price from SF = MRR; ARR = MRR * 12.
     Returns: products (column order), rows (account_name, by_product, total_arr), total_by_product, grand_total.
+    Optional salesforce_base_url when SALESFORCE_BASE_URL is set (for account links).
     """
-    return await _get_arr_by_account_product_data(db)
+    data = await _get_arr_by_account_product_data(db)
+    base = os.getenv("SALESFORCE_BASE_URL", "").strip().rstrip("/")
+    if base and ("salesforce.com" in base or "lightning.force.com" in base):
+        data["salesforce_base_url"] = base
+    return data
 
 
 @app.post("/api/export/arr-to-google-sheet")
@@ -1134,8 +1139,8 @@ async def export_arr_to_google_sheet(db: AsyncSession = Depends(get_db)):
     total_by_product = data["total_by_product"]
     grand_total = data["grand_total"]
 
-    # Build sheet rows: header (Account, Segment, products..., Total ARR), data rows, total row
-    header = ["Account", "Segment"] + products + ["Total ARR"]
+    # Build sheet rows: header (Account, Segment, products..., Total CARR), data rows, total row
+    header = ["Account", "Segment"] + products + ["Total CARR"]
     values = [header]
     for r in rows_data:
         values.append(

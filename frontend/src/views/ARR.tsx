@@ -51,7 +51,7 @@ export default function ARR() {
         if (res.ok) {
           setSyncStatus('ok')
           setSyncMessage(
-            `Synced ${res.synced_opportunities ?? 0} opportunities, ${res.synced_line_items ?? 0} product lines. ${res.renewal_opportunities_count ?? 0} open renewal(s) for ARR.`
+            `Synced ${res.synced_opportunities ?? 0} opportunities, ${res.synced_line_items ?? 0} product lines. ${res.renewal_opportunities_count ?? 0} open renewal(s) for CARR.`
           )
           loadData()
         } else {
@@ -70,6 +70,11 @@ export default function ARR() {
   const rows = Array.isArray(data?.rows) ? data.rows : []
   const total_by_product = data?.total_by_product ?? {}
   const grand_total = data?.grand_total ?? 0
+  const salesforce_base_url =
+    data?.salesforce_base_url &&
+    (data.salesforce_base_url.includes("salesforce.com") || data.salesforce_base_url.includes("lightning.force.com"))
+      ? data.salesforce_base_url
+      : undefined
   const productLabels = products.map((p) => (p === '—' ? 'Product' : String(p)))
 
   const handleSort = (key: SortKey) => {
@@ -269,7 +274,7 @@ export default function ARR() {
     <>
       <h1 style={{ margin: '0 0 1.5rem', fontSize: '1.5rem', fontWeight: 600, color: 'var(--text)' }}>Customer overview</h1>
       <p style={{ fontSize: '0.9rem', color: 'var(--text-muted)', marginBottom: '1rem' }}>
-        Rows = accounts. Columns = ARR by product (Dazos product list; open renewals only). Last column = total ARR per account. ARR = MRR × 12. iVerify Monthly Credits and Kipu API excluded from ARR.
+        Rows = accounts. Columns = contracted ARR (CARR) by product; includes customers with future start date. Last column = total CARR per account. iVerify Monthly Credits and Kipu API excluded.
       </p>
       <p style={{ marginBottom: '1rem', display: 'flex', alignItems: 'center', gap: '0.75rem', flexWrap: 'wrap' }}>
         <button
@@ -364,7 +369,7 @@ export default function ARR() {
                   </button>
                 </th>
               ))}
-              {thSortable('total_arr', 'Total ARR', 'right', { fontWeight: 600, position: 'sticky', right: 0, background: 'var(--surface)', zIndex: 1 }, true)}
+              {thSortable('total_arr', 'Total CARR', 'right', { fontWeight: 600, position: 'sticky', right: 0, background: 'var(--surface)', zIndex: 1 }, true)}
             </tr>
           </thead>
           <tbody>
@@ -381,7 +386,23 @@ export default function ARR() {
             </tr>
             {displayRows.map((row) => (
               <tr key={row.account_id ?? row.account_name} style={{ borderBottom: '1px solid var(--border)' }}>
-                <td style={{ padding: '0.5rem 0.75rem', color: 'var(--text)', position: 'sticky', left: 0, background: 'var(--bg)', zIndex: 0 }}>{row.account_name}</td>
+                <td style={{ padding: '0.5rem 0.75rem', color: 'var(--text)', position: 'sticky', left: 0, background: 'var(--bg)', zIndex: 0 }}>
+                  {row.account_id && salesforce_base_url ? (
+                    <a
+                      href={salesforce_base_url.includes('lightning.force.com')
+                        ? `${salesforce_base_url}/lightning/r/Account/${row.account_id}/view`
+                        : `${salesforce_base_url}/${row.account_id}`}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      style={{ color: 'var(--accent)', textDecoration: 'none' }}
+                      title="Open in Salesforce"
+                    >
+                      {row.account_name}
+                    </a>
+                  ) : (
+                    row.account_name
+                  )}
+                </td>
                 <td style={{ padding: '0.5rem 0.75rem', color: 'var(--text-muted)', whiteSpace: 'nowrap' }}>{row.segment?.trim() ? row.segment : 'SMB/ MM'}</td>
                 <td style={{ padding: '0.5rem 0.75rem', color: 'var(--text)', whiteSpace: 'nowrap' }}>{row.subscription_end_date ?? '—'}</td>
                 {products.map((p) => (

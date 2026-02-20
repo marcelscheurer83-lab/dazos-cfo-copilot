@@ -19,7 +19,7 @@ export default function Dashboard() {
   if (!kpi) return <p style={{ color: 'var(--text-muted)' }}>Loading…</p>
 
   const cards = [
-    { label: 'ARR', value: fmtMoney(kpi.arr), sub: 'Open renewals (product lines)' },
+    { label: 'CARR', value: fmtMoney(kpi.arr), sub: 'Contracted ARR' },
     { label: 'Pipeline', value: fmtMoney(kpi.pipeline), sub: 'Open opportunities' },
   ]
 

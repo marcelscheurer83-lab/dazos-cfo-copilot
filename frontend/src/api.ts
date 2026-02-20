@@ -190,12 +190,14 @@ export async function getARRByAccount(): Promise<ARRByAccountResponse> {
   return r.json()
 }
 
-/** ARR by account with product columns (open renewals). ARR = MRR × 12. */
+/** CARR by account with product columns (open renewals; contracted ARR). */
 export type ARRByAccountProductResponse = {
   products: string[]
   rows: { account_id: string | null; account_name: string; segment?: string | null; subscription_end_date?: string | null; by_product: Record<string, number>; total_arr: number }[]
   total_by_product: Record<string, number>
   grand_total: number
+  /** When set, account names in Customer overview link to Salesforce (url + "/" + account_id). */
+  salesforce_base_url?: string
 }
 
 export async function getARRByAccountProduct(): Promise<ARRByAccountProductResponse> {

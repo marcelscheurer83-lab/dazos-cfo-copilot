@@ -1,18 +1,31 @@
 import { useEffect, useState } from 'react'
-import { getDashboardKPI, type DashboardKPI } from '../api'
+import { getDashboardKPI, syncSalesforce, type DashboardKPI } from '../api'
 
 function fmtMoney(n: number) {
   return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 }).format(n)
 }
+
+/** Sync from Salesforce at most once per app session (when Dashboard first loads). */
+const hasAutoSyncedThisSession = { current: false }
 
 export default function Dashboard() {
   const [kpi, setKpi] = useState<DashboardKPI | null>(null)
   const [err, setErr] = useState<string | null>(null)
 
   useEffect(() => {
-    getDashboardKPI()
-      .then(setKpi)
-      .catch((e) => setErr(e.message))
+    const fetchKpi = () => getDashboardKPI().then(setKpi).catch((e) => setErr(e.message))
+
+    if (!hasAutoSyncedThisSession.current) {
+      hasAutoSyncedThisSession.current = true
+      syncSalesforce()
+        .then((res) => {
+          if (res.ok) fetchKpi()
+          else fetchKpi()
+        })
+        .catch(() => fetchKpi())
+    } else {
+      fetchKpi()
+    }
   }, [])
 
   if (err) return <p style={{ color: 'var(--negative)' }}>{err}</p>

@@ -1,0 +1,16 @@
+fastapi==0.109.2
+uvicorn[standard]==0.27.1
+sqlalchemy==2.0.25
+pydantic==2.6.1
+pydantic-settings==2.1.0
+python-dotenv==1.0.1
+aiosqlite==0.19.0
+# Phase 1a: Google Sheets connector
+google-auth>=2.23.0
+google-api-python-client>=2.100.0
+# Phase 1b: Salesforce connector
+simple-salesforce>=1.12.0
+# Phase 1c: QuickBooks connector (HTTP for OAuth + Reports API)
+requests>=2.28.0
+# Timezone data for zoneinfo on Windows (America/New_York for scheduled jobs)
+tzdata>=2024.1

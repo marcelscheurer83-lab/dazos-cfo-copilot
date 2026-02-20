@@ -1,0 +1,200 @@
+{
+  "source": "Dazos Products price book (Salesforce)",
+  "description": "Full product and list price list for analysis. 11 recurring (monthly) + 6 one-time (ProServ); one-time are out of scope for ARR.",
+  "products": [
+    {
+      "product_id": "01fVq00000UHKWIAV",
+      "product_name": "Dazos CRM Platform (Legacy)",
+      "subscription_frequency": "Monthly",
+      "product_family": "Dazos",
+      "recurring": true,
+      "list_price": 1300.00,
+      "active": true,
+      "description": "Access to Dazos CRM Platform. Includes 5 CRM Seats",
+      "internal_notes": "Leverage this SKU to bundle multiple products - especially for an initial sale"
+    },
+    {
+      "product_id": "01fVq00000UHKcXAV",
+      "product_name": "Additional CRM Seats",
+      "subscription_frequency": "Monthly",
+      "product_family": "Dazos",
+      "recurring": true,
+      "list_price": 200.00,
+      "active": true,
+      "description": "Additional CRM Seats to Dazos CRM Platform",
+      "internal_notes": null
+    },
+    {
+      "product_id": "01fVq00000UHKcYAV",
+      "product_name": "IQ Platform Fee (Includes 1 EIN)",
+      "subscription_frequency": "Monthly",
+      "product_family": "Dazos",
+      "recurring": true,
+      "list_price": 1000.00,
+      "active": true,
+      "description": "Access to Dazos IQ. Includes 1 EIN/Location",
+      "internal_notes": "Lighter version of IQ"
+    },
+    {
+      "product_id": "01fVq00000UHKzVAV",
+      "product_name": "Marketing Reports Platform Fee (Includes 1 EIN)",
+      "subscription_frequency": "Monthly",
+      "product_family": "Dazos",
+      "recurring": true,
+      "list_price": 500.00,
+      "active": true,
+      "description": "Access to Dazos Marketing Reports. Includes 1 EIN/Location",
+      "internal_notes": null
+    },
+    {
+      "product_id": "01fVq00000UHKcaAF",
+      "product_name": "Verify Monthly Credits",
+      "subscription_frequency": "Monthly",
+      "product_family": "Dazos",
+      "recurring": true,
+      "list_price": 1.00,
+      "active": true,
+      "description": null,
+      "internal_notes": "$250 for 250 credits. Custom pricing upon request. The quantity should equal the number of credits and the price can be discounted to the negotiated rate."
+    },
+    {
+      "product_id": "01fVq00000UHKcbAF",
+      "product_name": "Kipu API",
+      "subscription_frequency": "Monthly",
+      "product_family": "Dazos",
+      "recurring": true,
+      "list_price": 150.00,
+      "active": true,
+      "description": null,
+      "internal_notes": null
+    },
+    {
+      "product_id": "01fVq00000cMiqiAG",
+      "product_name": "Additional IQ/MR EINs",
+      "subscription_frequency": "Monthly",
+      "product_family": "Dazos",
+      "recurring": true,
+      "list_price": 250.00,
+      "active": true,
+      "description": "Additional EINs for either IQ or Marketing Reports",
+      "internal_notes": null
+    },
+    {
+      "product_id": "01fVq00000cgT2YIAU",
+      "product_name": "Dazos CRM Platform (Includes 5 Seats)",
+      "subscription_frequency": "Monthly",
+      "product_family": "Dazos",
+      "recurring": true,
+      "list_price": 1300.00,
+      "active": true,
+      "description": "Access to Dazos CRM Platform. Includes 5 CRM Seats",
+      "internal_notes": "Leverage this SKU to bundle multiple products - especially for an initial sale"
+    },
+    {
+      "product_id": "01fVq00000d9MWfAM",
+      "product_name": "Billing Company CRM Platform (Includes 5 Seats)",
+      "subscription_frequency": "Monthly",
+      "product_family": "Dazos",
+      "recurring": true,
+      "list_price": 1300.00,
+      "active": true,
+      "description": "Access to Billing Company CRM Platform. Includes 5 CRM Seats",
+      "internal_notes": null
+    },
+    {
+      "product_id": "01fVq00000eRmZNlAD",
+      "product_name": "iCampaign Platform",
+      "subscription_frequency": "Monthly",
+      "product_family": "Dazos",
+      "recurring": true,
+      "list_price": 700.00,
+      "active": true,
+      "description": "Access to the iCampaign platform",
+      "internal_notes": null
+    },
+    {
+      "product_id": "01fVq00000f175pAAA",
+      "product_name": "Premium Support",
+      "subscription_frequency": "Monthly",
+      "product_family": "Dazos",
+      "recurring": true,
+      "list_price": 850.00,
+      "active": true,
+      "description": null,
+      "internal_notes": null
+    },
+    {
+      "product_id": "01fVq00000UKcIaAF",
+      "product_name": "CRM Implementation Services",
+      "subscription_frequency": "One-Time",
+      "product_family": "ProServ",
+      "recurring": false,
+      "list_price": 5000.00,
+      "active": true,
+      "description": null,
+      "internal_notes": null
+    },
+    {
+      "product_id": "01fVq00000UKcJaAF",
+      "product_name": "IQ Implementation Services",
+      "subscription_frequency": "One-Time",
+      "product_family": "ProServ",
+      "recurring": false,
+      "list_price": 3000.00,
+      "active": true,
+      "description": null,
+      "internal_notes": null
+    },
+    {
+      "product_id": "01fVq00000UKcKaAF",
+      "product_name": "iCampaign Implementation Services",
+      "subscription_frequency": "One-Time",
+      "product_family": "ProServ",
+      "recurring": false,
+      "list_price": 3000.00,
+      "active": true,
+      "description": null,
+      "internal_notes": null
+    },
+    {
+      "product_id": "01fVq00000UKcLaAF",
+      "product_name": "Data Migration Services",
+      "subscription_frequency": "One-Time",
+      "product_family": "ProServ",
+      "recurring": false,
+      "list_price": 0.01,
+      "active": true,
+      "description": null,
+      "internal_notes": null
+    },
+    {
+      "product_id": "01fVq00000UKcPaAF",
+      "product_name": "Kipu API Set Up",
+      "subscription_frequency": "One-Time",
+      "product_family": "ProServ",
+      "recurring": false,
+      "list_price": 1000.00,
+      "active": true,
+      "description": null,
+      "internal_notes": null
+    },
+    {
+      "product_id": "01fVq00000UKcQaAF",
+      "product_name": "Customer Integration Development",
+      "subscription_frequency": "One-Time",
+      "product_family": "ProServ",
+      "recurring": false,
+      "list_price": 0.01,
+      "active": true,
+      "description": null,
+      "internal_notes": null
+    }
+  ],
+  "summary": {
+    "total_products": 17,
+    "recurring_count": 11,
+    "one_time_count": 6,
+    "arr_relevant_count": 9,
+    "arr_relevant_note": "11 recurring minus Verify Monthly Credits and Kipu API (excluded from ARR)"
+  }
+}

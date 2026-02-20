@@ -68,6 +68,15 @@ app.add_middleware(
 )
 
 
+def _cors_headers_for_request(request: Request) -> dict:
+    """Return CORS headers so browser doesn't hide error responses (e.g. 401)."""
+    origin = request.headers.get("origin")
+    allowed = [o.strip() for o in _cors_origins if o.strip()]
+    if origin and origin in allowed:
+        return {"Access-Control-Allow-Origin": origin, "Access-Control-Allow-Credentials": "true"}
+    return {}
+
+
 class RequireAppPasswordMiddleware(BaseHTTPMiddleware):
     """When APP_PASSWORD is set, require X-App-Password header on all /api/ requests."""
 
@@ -79,10 +88,13 @@ class RequireAppPasswordMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
         supplied = request.headers.get("X-App-Password")
         if supplied != password:
-            return JSONResponse(
+            resp = JSONResponse(
                 status_code=401,
                 content={"detail": "Missing or invalid app password"},
             )
+            for k, v in _cors_headers_for_request(request).items():
+                resp.headers[k] = v
+            return resp
         return await call_next(request)
 
 

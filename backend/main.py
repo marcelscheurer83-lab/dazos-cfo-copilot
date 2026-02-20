@@ -15,6 +15,9 @@ from typing import Optional
 from dotenv import load_dotenv
 from fastapi import FastAPI, Depends, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
 from sqlalchemy import select, delete, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -63,6 +66,27 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+class RequireAppPasswordMiddleware(BaseHTTPMiddleware):
+    """When APP_PASSWORD is set, require X-App-Password header on all /api/ requests."""
+
+    async def dispatch(self, request: Request, call_next):
+        if not request.url.path.startswith("/api/"):
+            return await call_next(request)
+        password = os.getenv("APP_PASSWORD")
+        if not password:
+            return await call_next(request)
+        supplied = request.headers.get("X-App-Password")
+        if supplied != password:
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "Missing or invalid app password"},
+            )
+        return await call_next(request)
+
+
+app.add_middleware(RequireAppPasswordMiddleware)
 
 
 def _runway_months(cash: float, burn: float) -> Optional[float]:

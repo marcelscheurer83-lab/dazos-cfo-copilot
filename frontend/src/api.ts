@@ -1,6 +1,37 @@
 /** API base URL: use VITE_API_URL when building for production (e.g. https://api.example.com) so the app can be published and accessed online. */
 const API = import.meta.env.VITE_API_URL ?? '/api'
 
+const AUTH_HEADER = 'X-App-Password'
+
+function getStoredPassword(): string | null {
+  return sessionStorage.getItem('app_password')
+}
+
+/** Fetch with app password header. On 401, clears storage and reloads (except when checking login with passwordOverride). */
+export async function apiFetch(
+  path: string,
+  options?: RequestInit,
+  passwordOverride?: string | null
+): Promise<Response> {
+  const url = path.startsWith('/') ? `${API}${path}` : `${API}/${path}`
+  const password = passwordOverride ?? getStoredPassword()
+  const headers: Record<string, string> = { ...(options?.headers as Record<string, string>) }
+  if (password) headers[AUTH_HEADER] = password
+  const r = await fetch(url, { ...options, headers })
+  if (r.status === 401 && passwordOverride === undefined) {
+    sessionStorage.removeItem('app_password')
+    window.location.reload()
+    throw new Error('Unauthorized')
+  }
+  return r
+}
+
+/** Call from login screen: verify password and return true if valid. */
+export async function checkAppPassword(password: string): Promise<boolean> {
+  const r = await apiFetch('/dashboard-kpi', {}, password)
+  return r.ok
+}
+
 /** Dashboard KPI from Salesforce (Phase 2): ARR and Pipeline only. */
 export type DashboardKPI = {
   arr: number
@@ -92,20 +123,20 @@ export const MODEL_SHEET_RANGES: string[] = [
 export type SyncSheetResult = { ok: boolean; range_name: string; rows?: number; error?: string }
 
 export async function syncGoogleSheet(rangeName: string): Promise<SyncSheetResult> {
-  const r = await fetch(`${API}/sync/google-sheets?range_name=${encodeURIComponent(rangeName)}`, { method: 'POST' })
+  const r = await apiFetch(`/sync/google-sheets?range_name=${encodeURIComponent(rangeName)}`, { method: 'POST' })
   const data = await r.json()
   if (!r.ok) return { ok: false, range_name: rangeName, error: data.detail?.toString() || data.error || 'Sync failed' }
   return { ok: data.ok === true, range_name: rangeName, rows: data.rows, error: data.error }
 }
 
 export async function getSheetSnapshot(rangeName: string): Promise<SheetSnapshotResponse> {
-  const r = await fetch(`${API}/sheet-snapshots/latest?range_name=${encodeURIComponent(rangeName)}`)
+  const r = await apiFetch(`/sheet-snapshots/latest?range_name=${encodeURIComponent(rangeName)}`)
   if (!r.ok) throw new Error('Failed to fetch sheet snapshot')
   return r.json()
 }
 
 export async function getCompany(): Promise<{ name: string; fiscal_year_end_month: number }> {
-  const r = await fetch(`${API}/company`)
+  const r = await apiFetch('/company')
   if (!r.ok) throw new Error('Failed to fetch company')
   return r.json()
 }
@@ -127,13 +158,13 @@ export type ARRExamplesResponse = {
 }
 
 export async function getDashboardKPI(): Promise<DashboardKPI> {
-  const r = await fetch(`${API}/dashboard-kpi`)
+  const r = await apiFetch('/dashboard-kpi')
   if (!r.ok) throw new Error('Failed to fetch dashboard KPI')
   return r.json()
 }
 
 export async function getARRExamples(limit = 10): Promise<ARRExamplesResponse> {
-  const r = await fetch(`${API}/dashboard-kpi/arr-examples?limit=${limit}`)
+  const r = await apiFetch(`/dashboard-kpi/arr-examples?limit=${limit}`)
   if (!r.ok) throw new Error('Failed to fetch ARR examples')
   return r.json()
 }
@@ -151,7 +182,7 @@ export type ARRByAccountResponse = {
 }
 
 export async function getARRByAccount(): Promise<ARRByAccountResponse> {
-  const r = await fetch(`${API}/dashboard-kpi/arr-by-account`)
+  const r = await apiFetch('/dashboard-kpi/arr-by-account')
   if (!r.ok) throw new Error('Failed to fetch ARR by account')
   return r.json()
 }
@@ -165,14 +196,14 @@ export type ARRByAccountProductResponse = {
 }
 
 export async function getARRByAccountProduct(): Promise<ARRByAccountProductResponse> {
-  const r = await fetch(`${API}/arr-by-account-product`)
+  const r = await apiFetch('/arr-by-account-product')
   if (!r.ok) throw new Error('Failed to fetch ARR by account and product')
   return r.json()
 }
 
 /** Export the current ARR-by-account-product table to a new Google Sheet (created each time). */
 export async function exportARRToGoogleSheet(): Promise<{ ok: boolean; error?: string; spreadsheet_url?: string; rows_written?: number }> {
-  const r = await fetch(`${API}/export/arr-to-google-sheet`, { method: 'POST' })
+  const r = await apiFetch('/export/arr-to-google-sheet', { method: 'POST' })
   const data = await r.json()
   if (!r.ok) return { ok: false, error: data.error || data.detail?.toString() || 'Export failed' }
   return data
@@ -185,44 +216,44 @@ export async function syncSalesforce(): Promise<{
   synced_line_items?: number
   renewal_opportunities_count?: number
 }> {
-  const r = await fetch(`${API}/sync/salesforce`, { method: 'POST' })
+  const r = await apiFetch('/sync/salesforce', { method: 'POST' })
   const data = await r.json()
   if (!r.ok) return { ok: false, error: data.error || data.detail?.toString() || 'Sync failed' }
   return data
 }
 
 export async function getKPI(asOf?: string): Promise<KPISummary> {
-  const url = asOf ? `${API}/kpi?as_of=${asOf}` : `${API}/kpi`
-  const r = await fetch(url)
+  const path = asOf ? `/kpi?as_of=${asOf}` : '/kpi'
+  const r = await apiFetch(path)
   if (!r.ok) throw new Error('Failed to fetch KPI')
   return r.json()
 }
 
 export async function getPnL(periodEnd?: string, months = 3): Promise<PnLLine[]> {
-  let url = `${API}/pnl?months=${months}`
-  if (periodEnd) url += `&period_end=${periodEnd}`
-  const r = await fetch(url)
+  let path = `/pnl?months=${months}`
+  if (periodEnd) path += `&period_end=${periodEnd}`
+  const r = await apiFetch(path)
   if (!r.ok) throw new Error('Failed to fetch P&L')
   return r.json()
 }
 
 export async function getCashFlow(periodEnd?: string, months = 3): Promise<CashFlowLine[]> {
-  let url = `${API}/cashflow?months=${months}`
-  if (periodEnd) url += `&period_end=${periodEnd}`
-  const r = await fetch(url)
+  let path = `/cashflow?months=${months}`
+  if (periodEnd) path += `&period_end=${periodEnd}`
+  const r = await apiFetch(path)
   if (!r.ok) throw new Error('Failed to fetch cash flow')
   return r.json()
 }
 
 export async function getBudgetVsActual(periodEnd?: string): Promise<BudgetVsActual[]> {
-  const url = periodEnd ? `${API}/budget-vs-actual?period_end=${periodEnd}` : `${API}/budget-vs-actual`
-  const r = await fetch(url)
+  const path = periodEnd ? `/budget-vs-actual?period_end=${periodEnd}` : '/budget-vs-actual'
+  const r = await apiFetch(path)
   if (!r.ok) throw new Error('Failed to fetch budget vs actual')
   return r.json()
 }
 
 export async function askCopilot(question: string): Promise<CopilotResponse> {
-  const r = await fetch(`${API}/copilot`, {
+  const r = await apiFetch('/copilot', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ question }),

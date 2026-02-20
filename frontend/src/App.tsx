@@ -1,10 +1,20 @@
+import { useState } from 'react'
 import { Routes, Route, Navigate } from 'react-router-dom'
 import Layout from './Layout'
+import Login from './Login'
 import Dashboard from './views/Dashboard'
 import ARR from './views/ARR'
 import Copilot from './views/Copilot'
 
 export default function App() {
+  const [authenticated, setAuthenticated] = useState(
+    () => sessionStorage.getItem('app_password') !== null
+  )
+
+  if (!authenticated) {
+    return <Login onSuccess={() => setAuthenticated(true)} />
+  }
+
   return (
     <Routes>
       <Route path="/" element={<Layout />}>

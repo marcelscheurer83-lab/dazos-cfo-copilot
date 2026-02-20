@@ -92,14 +92,13 @@ You don’t sign up for anything. In Part 1 we’ll add a **Railway volume** and
 3. Under **“Build”** or **“Source”**, set **Root Directory** to: `backend`.
 4. Set **Start Command** to: `uvicorn main:app --host 0.0.0.0 --port $PORT`  
    (If Railway picks this up from the Procfile, you can leave Start Command empty.)
-5. Under **“Deploy”** or **“Networking”**, ensure the service gets a **public URL** (e.g. “Generate domain”). Note the URL (e.g. `https://something.up.railway.app`). You’ll need it for the frontend and CORS.
+5. Under **“Deploy”** or **“Networking”**, ensure the service gets a **public URL** (e.g. “Generate domain”). When asked for the port, use **8080** (Railway often sets `PORT=8080`; the app listens on `$PORT`). Note the URL (e.g. `https://something.up.railway.app`). You’ll need it for the frontend and CORS.
 
-### 1.3 Add a volume (so SQLite data is kept)
+### 1.3 Add a volume (so SQLite data is kept) — optional
 
-1. In the same service, go to **Settings** (or the **Volumes** tab if you see it).
-2. Click **“Add Volume”** (or **“New Volume”**).
-3. Mount path: `/data`.
-4. Save. This keeps everything under `/data` (including the SQLite file) across restarts.
+1. In the same service, go to **Settings** and look for **Volumes** or **Persistent Storage** in the sidebar (or use “Filter Settings…” and search for *volume*). If you don’t see it, Railway may not offer volumes on your plan or it may be in another part of the UI; you can skip to 1.4 and use the non-persistent database below.
+2. If Volumes is available: click **“Add Volume”** (or **“New Volume”**), set mount path to **`/data`**, and save.
+3. **With a volume:** use `DATABASE_URL=sqlite+aiosqlite:////data/cfo.db` in 1.4 so data persists across restarts. **Without a volume:** use `DATABASE_URL=sqlite+aiosqlite:///./cfo.db`; the app will run but the database is not persistent (data can be lost on redeploy).
 
 ### 1.4 Set environment variables
 
@@ -120,7 +119,9 @@ You don’t sign up for anything. In Part 1 we’ll add a **Railway volume** and
    - `CORS_ORIGINS` = `https://your-app.vercel.app`  
      (replace with your real Vercel URL in the next part; you can add `http://localhost:5173` too for local dev.)
 
-4. Save. Railway will redeploy when you change variables.
+4. **Optional — protect the app:** set `APP_PASSWORD` to a strong secret (e.g. a long random string). Users will see a login screen and must enter this password to access the app and API. If you don’t set it, anyone with the URL can access the app.
+
+5. Save. Railway will redeploy when you change variables.
 
 ### 1.5 Deploy and get the backend URL
 
@@ -178,9 +179,29 @@ You don’t sign up for anything. In Part 1 we’ll add a **Railway volume** and
 | What            | Where                         |
 |-----------------|-------------------------------|
 | Backend 24/7    | Railway (root: `backend`)     |
+| Backend URL     | `https://dazos-cfo-copilot-production.up.railway.app` (use this for `VITE_API_URL` + `/api` and for health checks) |
 | Database        | SQLite on Railway volume `/data` → `DATABASE_URL=sqlite+aiosqlite:////data/cfo.db` |
-| Frontend        | Vercel (root: `frontend`, `VITE_API_URL` = backend URL) |
-| CORS            | Railway env: `CORS_ORIGINS` = your Vercel URL |
+| Frontend        | Vercel (root: `frontend`, `VITE_API_URL` = `https://dazos-cfo-copilot-production.up.railway.app/api`) |
+| CORS            | Railway env: `CORS_ORIGINS` = your Vercel URL (e.g. `https://dazos-cfo-copilot.vercel.app`) |
 | Sync / snapshot | Run automatically by the backend (EST)      |
 
-If something doesn’t work, check: Railway logs (backend errors), Vercel function/build logs (frontend build), and that `VITE_API_URL` and `CORS_ORIGINS` match your real URLs (no trailing slash).
+---
+
+## If the Railway build fails
+
+1. **Check Root Directory**  
+   In the Railway service → **Settings** → **Source** (or **Build**): **Root Directory** must be `backend`. If it’s empty or wrong, the build runs from the repo root and won’t find `requirements.txt` or `main.py`.
+
+2. **Check the build logs**  
+   In Railway, open the failed deployment and click **View logs** (or **Build logs**). The last lines usually show the error (e.g. “No such file requirements.txt”, “module not found”, or a Python version issue).  
+   If you see **“Failed building wheel for pydantic-core”** with Python 3.13, Railway used the default Python and our stack needs 3.11. Ensure `backend/runtime.txt` contains exactly `3.11` (no `python-` prefix) and that `backend/.python-version` exists with `3.11`, then commit, push, and redeploy.
+
+3. **Start command**  
+   In **Settings** → **Deploy** (or **Build**), set **Start Command** to:  
+   `uvicorn main:app --host 0.0.0.0 --port $PORT`  
+   (Or leave it empty if the Procfile is used.)
+
+4. **Redeploy**  
+   After changing Root Directory or Start Command, trigger a new deploy (e.g. **Redeploy** or push a small commit).
+
+If something else doesn’t work, check: Railway logs (backend errors), Vercel function/build logs (frontend build), and that `VITE_API_URL` and `CORS_ORIGINS` match your real URLs (no trailing slash).

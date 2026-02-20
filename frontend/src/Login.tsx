@@ -1,5 +1,5 @@
 import { useState, FormEvent } from 'react'
-import { checkAppPassword } from '../api'
+import { checkAppPassword } from './api'
 
 type Props = { onSuccess: () => void }
 

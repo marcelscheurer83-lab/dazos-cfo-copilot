@@ -79,6 +79,49 @@ export default function Pipeline() {
 
   const rows = Array.isArray(data?.rows) ? data.rows : []
   const grand_total = data?.grand_total ?? 0
+
+  // Aggregate by close month and segment (current month onwards only): ARR and count
+  const chartData = useMemo(() => {
+    const now = new Date()
+    const currentMonth = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`
+    const arrMap = new Map<string, Map<string, number>>()
+    const countMap = new Map<string, Map<string, number>>()
+    for (const r of rows) {
+      const month = r.close_date ? r.close_date.slice(0, 7) : null
+      if (!month || month < currentMonth) continue
+      if (!arrMap.has(month)) {
+        arrMap.set(month, new Map())
+        countMap.set(month, new Map())
+      }
+      const seg = r.segment || '—'
+      const arrSeg = arrMap.get(month)!
+      const countSeg = countMap.get(month)!
+      arrSeg.set(seg, (arrSeg.get(seg) ?? 0) + r.arr)
+      countSeg.set(seg, (countSeg.get(seg) ?? 0) + 1)
+    }
+    const months = Array.from(arrMap.keys()).sort()
+    const segmentsSet = new Set<string>()
+    arrMap.forEach((segMap) => segMap.forEach((_, seg) => segmentsSet.add(seg)))
+    const segments = Array.from(segmentsSet).sort()
+    const segmentColors: Record<string, string> = {}
+    const palette = ['#3b82f6', '#10b981', '#f59e0b', '#8b5cf6', '#ec4899', '#06b6d4']
+    segments.forEach((s, i) => { segmentColors[s] = palette[i % palette.length] })
+    const maxArr = Math.max(1, ...months.map((m) => Array.from(arrMap.get(m)!.values()).reduce((a, b) => a + b, 0)))
+    const maxCount = Math.max(1, ...months.map((m) => Array.from(countMap.get(m)!.values()).reduce((a, b) => a + b, 0)))
+    return { months, segments, arrMap, countMap, segmentColors, maxArr, maxCount }
+  }, [rows])
+
+  const formatMonthLabel = (month: string) => {
+    const [y, m] = month.split('-')
+    const d = new Date(parseInt(y, 10), parseInt(m, 10) - 1, 1)
+    return d.toLocaleDateString('en-US', { month: 'short', year: '2-digit' })
+  }
+
+  const PLOT_HEIGHT = 180
+  const ARR_Y_TICKS = [0, 1, 2, 3] // 0 = $0, 1 = $1M, 2 = $2M, 3 = $3M
+  const formatArrTick = (tick: number) => (tick === 0 ? '$0' : `$${tick}M`)
+  const COUNT_Y_TICKS = [0, 30, 60, 90, 120]
+
   const salesforce_base_url =
     data?.salesforce_base_url &&
     (data.salesforce_base_url.includes('salesforce.com') || data.salesforce_base_url.includes('lightning.force.com'))
@@ -247,6 +290,201 @@ export default function Pipeline() {
       <p style={{ fontSize: '0.9rem', color: 'var(--text-muted)', marginBottom: '1rem' }}>
         Open opportunities: New Business and Expansion only (not Closed Won / Closed Lost). One row per opportunity. ARR = MRR × 12 from Opportunity Finance Details.
       </p>
+      {chartData.months.length > 0 && (
+        <div style={{ marginBottom: '1.5rem', maxWidth: '100%', display: 'flex', gap: '2rem', flexWrap: 'wrap' }}>
+          {/* ARR chart: Y-axis $0, $1M, $2M, $3M; bars sit on 0 line; month labels below x-axis; legend below */}
+          <div style={{ flex: '1 1 320px', minWidth: 0 }}>
+            <div style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text)', marginBottom: '0.5rem' }}>Open pipeline by close month and segment (ARR)</div>
+            <div style={{ background: 'var(--bg)', padding: '0.75rem 1rem', borderRadius: 6 }}>
+              <div style={{ display: 'flex', gap: 0, fontSize: '0.75rem' }}>
+                <div style={{ width: 36, flexShrink: 0, height: PLOT_HEIGHT, position: 'relative', color: 'var(--text-muted)', fontSize: '0.7rem', paddingRight: 8 }}>
+                  {ARR_Y_TICKS.slice().reverse().map((tick, i) => {
+                    const topPx = (i / (ARR_Y_TICKS.length - 1)) * PLOT_HEIGHT
+                    return (
+                      <span
+                        key={tick}
+                        style={{
+                          position: 'absolute',
+                          right: 8,
+                          top: topPx,
+                          transform: 'translateY(-50%)',
+                          lineHeight: 1,
+                          textAlign: 'right',
+                        }}
+                      >
+                        {formatArrTick(tick)}
+                      </span>
+                    )
+                  })}
+                </div>
+                <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', paddingLeft: 4 }}>
+                  {/* Bar area: fixed height so 0 grid line = bottom of bars; month labels go below */}
+                  <div style={{ height: PLOT_HEIGHT, position: 'relative', flexShrink: 0 }}>
+                    <div style={{ position: 'absolute', left: 0, right: 0, top: 0, bottom: 0, pointerEvents: 'none' }}>
+                      {ARR_Y_TICKS.map((_, i) => (
+                        <div key={i} style={{ position: 'absolute', left: 0, right: 0, bottom: (i / (ARR_Y_TICKS.length - 1)) * PLOT_HEIGHT, height: 1, background: 'var(--border)', opacity: 0.7 }} />
+                      ))}
+                    </div>
+                    <div style={{ height: '100%', display: 'flex', alignItems: 'flex-end', gap: '0.25rem', position: 'relative', zIndex: 1 }}>
+                      {chartData.months.map((month) => {
+                        const segMap = chartData.arrMap.get(month)!
+                        const total = Array.from(segMap.values()).reduce((a, b) => a + b, 0)
+                        const arrMax = 3e6
+                        const barHeightPct = total > 0 ? Math.min(100, (total / arrMax) * 100) : 0
+                        const barHeight = (barHeightPct / 100) * PLOT_HEIGHT
+                        return (
+                          <div key={month} style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', minWidth: 0, justifyContent: 'flex-end', height: '100%' }}>
+                            <div style={{ flex: 1, minHeight: 0 }} />
+                            <div style={{ marginBottom: '0.2rem', fontWeight: 700, fontSize: '0.8rem', color: 'var(--text)', minHeight: '1.1em' }}>
+                              {total > 0 ? `$${(total / 1e6).toFixed(1)}M` : '$0'}
+                            </div>
+                            <div style={{ width: '100%', maxWidth: 36, height: total > 0 ? barHeight : 0, minHeight: 0, display: 'flex', flexDirection: 'column-reverse', overflow: 'hidden', borderRadius: '2px 2px 0 0' }}>
+                              {chartData.segments.map((seg) => {
+                                const arr = segMap.get(seg) ?? 0
+                                if (arr <= 0) return null
+                                const segPct = total > 0 ? (arr / total) * 100 : 0
+                                const millions = arr / 1e6
+                                return (
+                                  <div
+                                    key={seg}
+                                    style={{
+                                      height: `${segPct}%`,
+                                      minHeight: millions >= 0.05 ? 20 : 0,
+                                      background: chartData.segmentColors[seg],
+                                      display: 'flex',
+                                      alignItems: 'center',
+                                      justifyContent: 'center',
+                                      color: '#fff',
+                                      fontWeight: 600,
+                                      fontSize: '0.7rem',
+                                      textShadow: '0 0 1px rgba(0,0,0,0.5)',
+                                    }}
+                                    title={`${seg}: ${fmtMoney(arr)}`}
+                                  >
+                                    {millions >= 0.05 ? `$${millions.toFixed(1)}M` : ''}
+                                  </div>
+                                )
+                              })}
+                            </div>
+                          </div>
+                        )
+                      })}
+                    </div>
+                  </div>
+                  {/* X-axis: month labels below the 0 grid line */}
+                  <div style={{ display: 'flex', gap: '0.25rem', marginTop: '0.35rem', paddingLeft: 0 }}>
+                    {chartData.months.map((month) => (
+                      <div key={month} style={{ flex: 1, color: 'var(--text-muted)', fontSize: '0.7rem', textAlign: 'center' }}>{formatMonthLabel(month)}</div>
+                    ))}
+                  </div>
+                </div>
+              </div>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.5rem 1rem', marginTop: '0.75rem', fontSize: '0.7rem', color: 'var(--text-muted)' }}>
+                {chartData.segments.map((seg) => (
+                  <span key={seg} style={{ display: 'inline-flex', alignItems: 'center', gap: '0.35rem' }}>
+                    <span style={{ width: 8, height: 8, borderRadius: 2, background: chartData.segmentColors[seg] }} />
+                    {seg}
+                  </span>
+                ))}
+              </div>
+            </div>
+          </div>
+          {/* Opportunities chart: same layout — Y aligned with grid, 0 at baseline, months below, legend below */}
+          <div style={{ flex: '1 1 320px', minWidth: 0 }}>
+            <div style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text)', marginBottom: '0.5rem' }}>Open pipeline by close month and segment (# opportunities)</div>
+            <div style={{ background: 'var(--bg)', padding: '0.75rem 1rem', borderRadius: 6 }}>
+              <div style={{ display: 'flex', gap: 0, fontSize: '0.75rem' }}>
+                <div style={{ width: 36, flexShrink: 0, height: PLOT_HEIGHT, position: 'relative', color: 'var(--text-muted)', fontSize: '0.7rem', paddingRight: 8 }}>
+                  {COUNT_Y_TICKS.slice().reverse().map((tick, i) => {
+                    const topPx = (i / (COUNT_Y_TICKS.length - 1)) * PLOT_HEIGHT
+                    return (
+                      <span
+                        key={tick}
+                        style={{
+                          position: 'absolute',
+                          right: 8,
+                          top: topPx,
+                          transform: 'translateY(-50%)',
+                          lineHeight: 1,
+                          textAlign: 'right',
+                        }}
+                      >
+                        {tick}
+                      </span>
+                    )
+                  })}
+                </div>
+                <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', paddingLeft: 4 }}>
+                  <div style={{ height: PLOT_HEIGHT, position: 'relative', flexShrink: 0 }}>
+                    <div style={{ position: 'absolute', left: 0, right: 0, top: 0, bottom: 0, pointerEvents: 'none' }}>
+                      {COUNT_Y_TICKS.map((_, i) => (
+                        <div key={i} style={{ position: 'absolute', left: 0, right: 0, bottom: (i / (COUNT_Y_TICKS.length - 1)) * PLOT_HEIGHT, height: 1, background: 'var(--border)', opacity: 0.7 }} />
+                      ))}
+                    </div>
+                    <div style={{ height: '100%', display: 'flex', alignItems: 'flex-end', gap: '0.25rem', position: 'relative', zIndex: 1 }}>
+                      {chartData.months.map((month) => {
+                        const countSegMap = chartData.countMap.get(month)!
+                        const totalCount = Array.from(countSegMap.values()).reduce((a, b) => a + b, 0)
+                        const countMax = 120
+                        const barHeightPct = totalCount > 0 ? Math.min(100, (totalCount / countMax) * 100) : 0
+                        const barHeight = (barHeightPct / 100) * PLOT_HEIGHT
+                        return (
+                          <div key={month} style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', minWidth: 0, justifyContent: 'flex-end', height: '100%' }}>
+                            <div style={{ flex: 1, minHeight: 0 }} />
+                            <div style={{ marginBottom: '0.2rem', fontWeight: 700, fontSize: '0.8rem', color: 'var(--text)', minHeight: '1.1em' }}>
+                              {totalCount}
+                            </div>
+                            <div style={{ width: '100%', maxWidth: 36, height: totalCount > 0 ? barHeight : 0, minHeight: 0, display: 'flex', flexDirection: 'column-reverse', overflow: 'hidden', borderRadius: '2px 2px 0 0' }}>
+                              {chartData.segments.map((seg) => {
+                                const count = countSegMap.get(seg) ?? 0
+                                if (count <= 0) return null
+                                const segPct = totalCount > 0 ? (count / totalCount) * 100 : 0
+                                return (
+                                  <div
+                                    key={seg}
+                                    style={{
+                                      height: `${segPct}%`,
+                                      minHeight: count >= 1 ? 20 : 0,
+                                      background: chartData.segmentColors[seg],
+                                      display: 'flex',
+                                      alignItems: 'center',
+                                      justifyContent: 'center',
+                                      color: '#fff',
+                                      fontWeight: 600,
+                                      fontSize: '0.7rem',
+                                      textShadow: '0 0 1px rgba(0,0,0,0.5)',
+                                    }}
+                                    title={`${seg}: ${count} opps`}
+                                  >
+                                    {count >= 1 ? count : ''}
+                                  </div>
+                                )
+                              })}
+                            </div>
+                          </div>
+                        )
+                      })}
+                    </div>
+                  </div>
+                  <div style={{ display: 'flex', gap: '0.25rem', marginTop: '0.35rem', paddingLeft: 0 }}>
+                    {chartData.months.map((month) => (
+                      <div key={month} style={{ flex: 1, color: 'var(--text-muted)', fontSize: '0.7rem', textAlign: 'center' }}>{formatMonthLabel(month)}</div>
+                    ))}
+                  </div>
+                </div>
+              </div>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.5rem 1rem', marginTop: '0.75rem', fontSize: '0.7rem', color: 'var(--text-muted)' }}>
+                {chartData.segments.map((seg) => (
+                  <span key={seg} style={{ display: 'inline-flex', alignItems: 'center', gap: '0.35rem' }}>
+                    <span style={{ width: 8, height: 8, borderRadius: 2, background: chartData.segmentColors[seg] }} />
+                    {seg}
+                  </span>
+                ))}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
       <p style={{ marginBottom: '1rem', display: 'flex', alignItems: 'center', gap: '0.75rem', flexWrap: 'wrap' }}>
         <button
           type="button"

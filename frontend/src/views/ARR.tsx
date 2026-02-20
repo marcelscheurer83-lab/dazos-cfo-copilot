@@ -17,29 +17,8 @@ export default function ARR() {
       .catch((e) => setErr(e.message))
   }
 
-  // Auto-sync from Salesforce when the page loads so data is fresh without clicking the button
   useEffect(() => {
-    setSyncStatus('loading')
-    setSyncMessage(null)
-    syncSalesforce()
-      .then((res) => {
-        if (res.ok) {
-          setSyncStatus('ok')
-          setSyncMessage(
-            `Synced ${res.synced_opportunities ?? 0} opportunities, ${res.synced_line_items ?? 0} product lines. ${res.renewal_opportunities_count ?? 0} open renewal(s) for ARR.`
-          )
-          loadData()
-        } else {
-          setSyncStatus('error')
-          setSyncMessage(res.error ?? 'Sync failed')
-          loadData() // still load whatever is in the DB
-        }
-      })
-      .catch((e) => {
-        setSyncStatus('error')
-        setSyncMessage(e.message ?? 'Sync failed')
-        loadData() // still load whatever is in the DB
-      })
+    loadData()
   }, [])
 
   const handleSyncSalesforce = () => {
@@ -65,12 +44,7 @@ export default function ARR() {
   }
 
   if (err) return <p style={{ color: 'var(--negative)' }}>{err}</p>
-  if (!data)
-    return (
-      <p style={{ color: 'var(--text-muted)' }}>
-        {syncStatus === 'loading' ? 'Syncing from Salesforce…' : 'Loading…'}
-      </p>
-    )
+  if (!data) return <p style={{ color: 'var(--text-muted)' }}>Loading…</p>
 
   const { products, rows, total_by_product, grand_total } = data
   const productLabels = products.map((p) => (p === '—' ? 'Product' : p))

@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { getARRByAccountProduct, exportARRToGoogleSheet, syncSalesforce, type ARRByAccountProductResponse } from '../api'
+import { getARRByAccountProduct, syncSalesforce, type ARRByAccountProductResponse } from '../api'
 
 function fmtMoney(n: number) {
   return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 }).format(n)
@@ -8,8 +8,6 @@ function fmtMoney(n: number) {
 export default function ARR() {
   const [data, setData] = useState<ARRByAccountProductResponse | null>(null)
   const [err, setErr] = useState<string | null>(null)
-  const [exportStatus, setExportStatus] = useState<'idle' | 'loading' | 'ok' | 'error'>('idle')
-  const [exportMessage, setExportMessage] = useState<string | null>(null)
   const [syncStatus, setSyncStatus] = useState<'idle' | 'loading' | 'ok' | 'error'>('idle')
   const [syncMessage, setSyncMessage] = useState<string | null>(null)
 
@@ -42,30 +40,6 @@ export default function ARR() {
       .catch((e) => {
         setSyncStatus('error')
         setSyncMessage(e.message ?? 'Sync failed')
-      })
-  }
-
-  const handleExportToSheet = () => {
-    setExportStatus('loading')
-    setExportMessage(null)
-    exportARRToGoogleSheet()
-      .then((res) => {
-        if (res.ok) {
-          setExportStatus('ok')
-          setExportMessage(
-            res.spreadsheet_url
-              ? `Created new sheet (${res.rows_written ?? 0} rows). Open: ${res.spreadsheet_url}`
-              : `Exported ${res.rows_written ?? 0} rows.`
-          )
-          if (res.spreadsheet_url) window.open(res.spreadsheet_url, '_blank')
-        } else {
-          setExportStatus('error')
-          setExportMessage(res.error ?? 'Export failed')
-        }
-      })
-      .catch((e) => {
-        setExportStatus('error')
-        setExportMessage(e.message ?? 'Export failed')
       })
   }
 
@@ -104,29 +78,6 @@ export default function ARR() {
         )}
         {syncStatus === 'error' && syncMessage && (
           <span style={{ fontSize: '0.9rem', color: 'var(--negative)' }}>{syncMessage}</span>
-        )}
-        <button
-          type="button"
-          onClick={handleExportToSheet}
-          disabled={exportStatus === 'loading'}
-          style={{
-            padding: '0.5rem 1rem',
-            fontSize: '0.9rem',
-            fontWeight: 600,
-            cursor: exportStatus === 'loading' ? 'wait' : 'pointer',
-            background: 'var(--accent)',
-            color: '#fff',
-            border: 'none',
-            borderRadius: 6,
-          }}
-        >
-          {exportStatus === 'loading' ? 'Exporting…' : 'Export to Google Sheet'}
-        </button>
-        {exportStatus === 'ok' && exportMessage && (
-          <span style={{ fontSize: '0.9rem', color: 'var(--positive)' }}>New sheet created. Opened in a new tab.</span>
-        )}
-        {exportStatus === 'error' && exportMessage && (
-          <span style={{ fontSize: '0.9rem', color: 'var(--negative)' }}>{exportMessage}</span>
         )}
       </p>
       <div style={{ overflowX: 'auto' }}>

@@ -15,13 +15,15 @@ export default function Layout() {
           background: 'var(--surface)',
           borderRight: '1px solid var(--border)',
           padding: '1.5rem 0',
+          display: 'flex',
+          flexDirection: 'column',
         }}
       >
         <div style={{ padding: '0 1.25rem 1.25rem', borderBottom: '1px solid var(--border)', marginBottom: '1rem' }}>
           <div style={{ fontSize: '1.1rem', fontWeight: 700 }}>Dazos</div>
           <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>CFO Copilot</div>
         </div>
-        <nav>
+        <nav style={{ flex: 1 }}>
           {nav.map(({ to, label }) => (
             <NavLink
               key={to}
@@ -39,6 +41,27 @@ export default function Layout() {
             </NavLink>
           ))}
         </nav>
+        <div style={{ marginTop: 'auto', padding: '1rem 1.25rem', borderTop: '1px solid var(--border)' }}>
+          <button
+            type="button"
+            onClick={() => {
+              sessionStorage.removeItem('app_password')
+              window.location.reload()
+            }}
+            style={{
+              width: '100%',
+              padding: '0.5rem 0.75rem',
+              fontSize: '0.875rem',
+              color: 'var(--text-muted)',
+              background: 'transparent',
+              border: '1px solid var(--border)',
+              borderRadius: 6,
+              cursor: 'pointer',
+            }}
+          >
+            Sign out
+          </button>
+        </div>
       </aside>
       <main style={{ flex: 1, padding: '2rem', overflow: 'auto' }}>
         <Outlet />

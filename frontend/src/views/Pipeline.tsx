@@ -21,11 +21,11 @@ export default function Pipeline() {
   const [filterStage, setFilterStage] = useState<string[]>([])
   const [filterRecordType, setFilterRecordType] = useState<string[]>([])
   const [openFilter, setOpenFilter] = useState<FilterColumn | null>(null)
-  const segmentThRef = useRef<HTMLTableCellElement>(null)
+  const segmentThRef = useRef<HTMLTableHeaderCellElement>(null)
   const segmentPopoverRef = useRef<HTMLDivElement>(null)
-  const stageThRef = useRef<HTMLTableCellElement>(null)
+  const stageThRef = useRef<HTMLTableHeaderCellElement>(null)
   const stagePopoverRef = useRef<HTMLDivElement>(null)
-  const recordTypeThRef = useRef<HTMLTableCellElement>(null)
+  const recordTypeThRef = useRef<HTMLTableHeaderCellElement>(null)
   const recordTypePopoverRef = useRef<HTMLDivElement>(null)
 
   const loadData = useCallback(() => {
@@ -151,7 +151,7 @@ export default function Pipeline() {
   const thFilter = (
     col: FilterColumn,
     label: string,
-    thRef: React.RefObject<HTMLTableCellElement | null>,
+    thRef: React.RefObject<HTMLTableHeaderCellElement | null>,
     popoverRef: React.RefObject<HTMLDivElement | null>,
     options: string[],
     selected: string[],
@@ -160,7 +160,7 @@ export default function Pipeline() {
     const isOpen = openFilter === col
     return (
       <th
-        ref={thRef}
+        ref={thRef as React.RefObject<HTMLTableHeaderCellElement>}
         role="button"
         tabIndex={0}
         onClick={(e) => {
@@ -186,7 +186,7 @@ export default function Pipeline() {
         )}
         {isOpen && (
           <div
-            ref={popoverRef}
+            ref={popoverRef as React.RefObject<HTMLDivElement>}
             style={popoverStyle}
             onClick={(e) => e.stopPropagation()}
           >

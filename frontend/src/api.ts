@@ -260,12 +260,25 @@ export type ClosedOverviewResponse = {
   rows: ClosedOverviewRow[]
   grand_total: number
   available_months: string[]
+  segments: string[]
+  stages: string[]
+  record_types: string[]
   salesforce_base_url?: string
 }
 
-export async function getClosedOverview(months?: string[]): Promise<ClosedOverviewResponse> {
+export type ClosedOverviewFilters = {
+  segment?: string[]
+  stage?: string[]
+  record_type?: string[]
+  months?: string[]
+}
+
+export async function getClosedOverview(filters?: ClosedOverviewFilters): Promise<ClosedOverviewResponse> {
   const params = new URLSearchParams()
-  if (months?.length) months.forEach((m) => params.append('months', m))
+  if (filters?.segment?.length) filters.segment.forEach((s) => params.append('segment', s))
+  if (filters?.stage?.length) filters.stage.forEach((s) => params.append('stage', s))
+  if (filters?.record_type?.length) filters.record_type.forEach((r) => params.append('record_type', r))
+  if (filters?.months?.length) filters.months.forEach((m) => params.append('months', m))
   const qs = params.toString()
   const r = await apiFetch(`/closed-overview${qs ? `?${qs}` : ''}`)
   if (!r.ok) throw new Error('Failed to fetch closed overview')

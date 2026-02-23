@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { getPipelineOverview, syncSalesforce, type PipelineOverviewResponse } from '../api'
 
-type FilterColumn = 'segment' | 'stage' | 'record_type'
+type FilterColumn = 'segment' | 'stage' | 'record_type' | 'close_date'
 
 function fmtMoney(n: number) {
   return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 }).format(n)
@@ -20,6 +20,7 @@ export default function Pipeline() {
   const [filterSegment, setFilterSegment] = useState<string[]>([])
   const [filterStage, setFilterStage] = useState<string[]>([])
   const [filterRecordType, setFilterRecordType] = useState<string[]>([])
+  const [filterCloseDate, setFilterCloseDate] = useState<string[]>([])
   const [openFilter, setOpenFilter] = useState<FilterColumn | null>(null)
   const segmentThRef = useRef<HTMLTableHeaderCellElement>(null)
   const segmentPopoverRef = useRef<HTMLDivElement>(null)
@@ -27,6 +28,8 @@ export default function Pipeline() {
   const stagePopoverRef = useRef<HTMLDivElement>(null)
   const recordTypeThRef = useRef<HTMLTableHeaderCellElement>(null)
   const recordTypePopoverRef = useRef<HTMLDivElement>(null)
+  const closeDateThRef = useRef<HTMLTableHeaderCellElement>(null)
+  const closeDatePopoverRef = useRef<HTMLDivElement>(null)
 
   const loadData = useCallback(() => {
     getPipelineOverview({
@@ -44,8 +47,22 @@ export default function Pipeline() {
 
   useEffect(() => {
     if (openFilter === null) return
-    const thRef = openFilter === 'segment' ? segmentThRef : openFilter === 'stage' ? stageThRef : recordTypeThRef
-    const popRef = openFilter === 'segment' ? segmentPopoverRef : openFilter === 'stage' ? stagePopoverRef : recordTypePopoverRef
+    const thRef =
+      openFilter === 'segment'
+        ? segmentThRef
+        : openFilter === 'stage'
+          ? stageThRef
+          : openFilter === 'record_type'
+            ? recordTypeThRef
+            : closeDateThRef
+    const popRef =
+      openFilter === 'segment'
+        ? segmentPopoverRef
+        : openFilter === 'stage'
+          ? stagePopoverRef
+          : openFilter === 'record_type'
+            ? recordTypePopoverRef
+            : closeDatePopoverRef
     const handleClick = (e: MouseEvent) => {
       const t = e.target as Node
       if (thRef.current?.contains(t) || popRef.current?.contains(t)) return
@@ -153,6 +170,19 @@ export default function Pipeline() {
     })
   }, [rows, sortKey, sortDir])
 
+  const closeDateOptions = useMemo(() => {
+    const months = [...new Set(rows.map((r) => r.close_date?.slice(0, 7)).filter(Boolean))] as string[]
+    return months.sort().reverse()
+  }, [rows])
+
+  const displayRows = useMemo(() => {
+    if (filterCloseDate.length === 0) return sortedRows
+    return sortedRows.filter((r) => r.close_date && filterCloseDate.includes(r.close_date.slice(0, 7)))
+  }, [sortedRows, filterCloseDate])
+
+  const grandTotalDisplay =
+    filterCloseDate.length > 0 ? displayRows.reduce((s, r) => s + r.arr, 0) : grand_total
+
   const th = (key: SortKey, label: string, align: 'left' | 'right' = 'left') => {
     const isActive = sortKey === key
     return (
@@ -191,6 +221,13 @@ export default function Pipeline() {
     minWidth: 140,
   }
 
+  const filterColToSortKey: Record<FilterColumn, SortKey> = {
+    segment: 'segment',
+    stage: 'stage_name',
+    record_type: 'record_type_name',
+    close_date: 'close_date',
+  }
+
   const thFilter = (
     col: FilterColumn,
     label: string,
@@ -198,35 +235,59 @@ export default function Pipeline() {
     popoverRef: React.RefObject<HTMLDivElement | null>,
     options: string[],
     selected: string[],
-    setSelected: (v: string[]) => void
+    setSelected: (v: string[]) => void,
+    optionLabel?: (value: string) => string
   ) => {
     const isOpen = openFilter === col
+    const sortKeyForCol = filterColToSortKey[col]
+    const isSortActive = sortKey === sortKeyForCol
+    const hasActiveFilter = selected.length > 0
     return (
       <th
         ref={thRef as React.RefObject<HTMLTableHeaderCellElement>}
-        role="button"
-        tabIndex={0}
-        onClick={(e) => {
-          e.stopPropagation()
-          setOpenFilter((f) => (f === col ? null : col))
-        }}
-        onKeyDown={(e) => (e.key === 'Enter' || e.key === ' ') && setOpenFilter((f) => (f === col ? null : col))}
         style={{
           textAlign: 'left',
           padding: '0.5rem 0.75rem',
           color: 'var(--text-muted)',
           fontWeight: 500,
           whiteSpace: 'nowrap',
-          cursor: 'pointer',
-          userSelect: 'none',
           position: 'relative',
           verticalAlign: 'bottom',
         }}
       >
-        {label}
-        {selected.length > 0 && (
-          <span style={{ marginLeft: 4, color: 'var(--accent)', fontWeight: 600 }}>({selected.length})</span>
-        )}
+        <span
+          role="button"
+          tabIndex={0}
+          onClick={() => handleSort(sortKeyForCol)}
+          onKeyDown={(e) => (e.key === 'Enter' || e.key === ' ') && handleSort(sortKeyForCol)}
+          style={{
+            cursor: 'pointer',
+            userSelect: 'none',
+          }}
+        >
+          {label}
+          {isSortActive && <span style={{ marginLeft: 4 }}>{sortDir === 'asc' ? '↑' : '↓'}</span>}
+        </span>
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation()
+            setOpenFilter((f) => (f === col ? null : col))
+          }}
+          title="Filter"
+          style={{
+            marginLeft: 4,
+            padding: 2,
+            background: hasActiveFilter ? 'var(--accent)' : 'transparent',
+            color: hasActiveFilter ? '#fff' : 'var(--text-muted)',
+            border: '1px solid var(--border)',
+            borderRadius: 4,
+            cursor: 'pointer',
+            lineHeight: 1,
+          }}
+        >
+          ⋮
+        </button>
         {isOpen && (
           <div
             ref={popoverRef as React.RefObject<HTMLDivElement>}
@@ -250,7 +311,7 @@ export default function Pipeline() {
             >
               {options.map((opt) => (
                 <option key={opt} value={opt}>
-                  {opt}
+                  {optionLabel ? optionLabel(opt) : opt}
                 </option>
               ))}
             </select>
@@ -509,13 +570,14 @@ export default function Pipeline() {
         {syncStatus === 'error' && syncMessage && (
           <span style={{ fontSize: '0.9rem', color: 'var(--negative)' }}>{syncMessage}</span>
         )}
-        {(filterSegment.length > 0 || filterStage.length > 0 || filterRecordType.length > 0) && (
+        {(filterSegment.length > 0 || filterStage.length > 0 || filterRecordType.length > 0 || filterCloseDate.length > 0) && (
           <button
             type="button"
             onClick={() => {
               setFilterSegment([])
               setFilterStage([])
               setFilterRecordType([])
+              setFilterCloseDate([])
               setOpenFilter(null)
             }}
             style={{
@@ -541,7 +603,7 @@ export default function Pipeline() {
               {th('opportunity_name', 'Opportunity', 'left')}
               {thFilter('stage', 'Stage', stageThRef, stagePopoverRef, data.stages ?? [], filterStage, setFilterStage)}
               {thFilter('record_type', 'Record type', recordTypeThRef, recordTypePopoverRef, data.record_types ?? [], filterRecordType, setFilterRecordType)}
-              {th('close_date', 'Close date', 'left')}
+              {thFilter('close_date', 'Close date', closeDateThRef, closeDatePopoverRef, closeDateOptions, filterCloseDate, setFilterCloseDate, formatMonthLabel)}
               {th('arr', 'ARR', 'right')}
             </tr>
           </thead>
@@ -549,9 +611,9 @@ export default function Pipeline() {
             <tr style={{ borderBottom: '1px solid var(--border)', fontWeight: 600, background: 'var(--surface)' }}>
               <td style={{ padding: '0.5rem 0.75rem', color: 'var(--text-muted)' }}>Total</td>
               <td style={{ padding: '0.5rem 0.75rem' }} colSpan={5} />
-              <td style={{ textAlign: 'right', padding: '0.5rem 0.75rem', color: 'var(--text)' }}>{fmtMoney(grand_total)}</td>
+              <td style={{ textAlign: 'right', padding: '0.5rem 0.75rem', color: 'var(--text)' }}>{fmtMoney(grandTotalDisplay)}</td>
             </tr>
-            {sortedRows.map((row) => (
+            {displayRows.map((row) => (
               <tr key={row.opportunity_sf_id} style={{ borderBottom: '1px solid var(--border)' }}>
                 <td style={{ padding: '0.5rem 0.75rem', color: 'var(--text)' }}>
                   {row.account_id && salesforce_base_url ? (
@@ -603,7 +665,7 @@ export default function Pipeline() {
             <tr style={{ borderTop: '2px solid var(--border)', fontWeight: 600 }}>
               <td style={{ padding: '0.5rem 0.75rem', color: 'var(--text)' }}>Total</td>
               <td style={{ padding: '0.5rem 0.75rem' }} colSpan={5} />
-              <td style={{ textAlign: 'right', padding: '0.5rem 0.75rem', color: 'var(--text)' }}>{fmtMoney(grand_total)}</td>
+              <td style={{ textAlign: 'right', padding: '0.5rem 0.75rem', color: 'var(--text)' }}>{fmtMoney(grandTotalDisplay)}</td>
             </tr>
           </tfoot>
         </table>

@@ -23,11 +23,13 @@ This roadmap turns the [vision in CONTEXT.md](CONTEXT.md) into a phased build. E
 ## Current status / Where we left off (Feb 2026)
 
 - **Backend & frontend** — Run with `uvicorn main:app --reload --port 8000` (backend) and `npm run dev` (frontend). App at http://localhost:5173, API at http://localhost:8000.
+- **Production** — Backend on **Railway** (24/7), frontend on **Vercel**. DB on Railway volume at `/data/cfo.db` so EOD snapshots and synced data persist. Hourly Salesforce sync at :59 EST; daily EOD snapshot at 23:59 EST. GET `/api/salesforce/eod-snapshots` (public); POST `/api/salesforce/eod-snapshots/take` for manual snapshot test. Optional `APP_PASSWORD`.
 - **Google Sheets (Phase 1a)** — Done. Service account set up; full financial model syncs via “Refresh from sheet” on the dashboard (all tabs in `frontend/src/api.ts` → `MODEL_SHEET_RANGES`). Plan data is stored in the backend (table `sheet_snapshots`) and used in the background for future summaries/analyses; dashboard shows only KPI cards + “Plan data available… Last synced: …” and the Refresh button.
 - **Dashboard** — Shows seed-data KPIs (cash, burn, runway, revenue, etc.). No raw sheet table; plan data is background-only.
-- **Salesforce (Phase 1b)** — Done. Set SALESFORCE_USERNAME, SALESFORCE_PASSWORD, SALESFORCE_SECURITY_TOKEN in `.env`; run `POST /api/sync/salesforce` to sync opportunities; `GET /api/opportunities` to read them.
+- **Salesforce (Phase 1b)** — Done. SALESFORCE_* in `.env`; hourly sync + EOD snapshot on Railway. POST /api/sync/salesforce; GET /api/opportunities; GET /api/salesforce/eod-snapshots; POST /api/salesforce/eod-snapshots/take.
 - **QuickBooks (Phase 1c)** — Done. Set QB_* in `.env` and **QB_SANDBOX=true** (sandbox only for now; production later). POST /api/sync/quickbooks; GET /api/quickbooks/reports/pl (or balance_sheet, cash_flow).
-- **Next step** — **Phase 2: Live exec dashboard** (wire KPIs from Sheets + Salesforce + QuickBooks), then **Phase 3: ARR schedule**.
+- **Copilot** — CARR-only (contracted ARR); uses live data or EOD snapshots (e.g. “How did CARR change today?”). No LLM yet.
+- **Next step** — **Phase 2: Live exec dashboard** (wire KPIs from Sheets + Salesforce + QuickBooks), then **Phase 3: ARR schedule**. Later: encrypt stored data (see Security / hardening).
 
 ---
 
@@ -137,6 +139,16 @@ Goal: add Salesforce (ARR/GTM) and QuickBooks (financials), then live dashboard,
 | **3** | ARR schedule (Salesforce) | ARR schedule maintained from Salesforce; view in app. |
 | **4** | Monthly & quarterly reports | Draft reports generated from app data. |
 | **5** | Full data + analyst Copilot | Justworks etc.; LLM; ad hoc + proactive analyst. |
+
+---
+
+## Security / hardening (later)
+
+- **Encrypt stored data:** To better protect data at rest (EOD snapshots, synced Salesforce/Sheets/QuickBooks data), consider:
+  - **SQLCipher** — Encrypt the whole SQLite DB; app opens it with a key from env (e.g. `DB_ENCRYPTION_KEY`). Strongest option; requires switching to a SQLCipher-compatible driver and wiring the key into DB config.
+  - **Field-level encryption** — Encrypt only sensitive columns before write, decrypt on read; key from env. Less invasive than SQLCipher; decide which fields (e.g. PII, tokens) to protect.
+  - **Backup encryption** — If you back up the DB or volume, encrypt backup files before storing or moving them.
+- **Transit:** HTTPS (Railway) already protects data in transit; no extra step needed.
 
 ---
 

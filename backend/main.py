@@ -1561,11 +1561,14 @@ async def get_pipeline_overview(
 @app.get("/api/closed-overview")
 async def get_closed_overview(
     db: AsyncSession = Depends(get_db),
+    segment: Optional[List[str]] = Query(None, description="Filter by segment"),
+    stage: Optional[List[str]] = Query(None, description="Filter by stage (e.g. Closed Won)"),
+    record_type: Optional[List[str]] = Query(None, description="Filter by record type"),
     months: Optional[List[str]] = Query(None, description="Filter by close-date month(s), e.g. 2026-02, 2026-03"),
 ):
     """
     Closed opportunities (Closed Won + Closed Lost); record type = New Business or Expansion only.
-    Optionally filter by one or more months (YYYY-MM). ARR = Opportunity.MRR (Finance Details) × 12 per opportunity.
+    Optional filters: segment, stage, record_type, months (YYYY-MM). ARR = Opportunity.MRR (Finance Details) × 12 per opportunity.
     """
     q_closed = select(Opportunity).where(
         Opportunity.stage_name.in_(CLOSED_STAGES),
@@ -1573,12 +1576,44 @@ async def get_closed_overview(
     ).order_by(Opportunity.close_date.desc())
     r = await db.execute(q_closed)
     closed_opps_all = [o for o in r.scalars().all() if _is_pipeline_record_type(o.record_type_name)]
-    # Distinct months (YYYY-MM) from close_date
+    account_ids_all = {o.account_id for o in closed_opps_all if o.account_id}
+    account_segment: dict[str, str] = {}
+    if account_ids_all:
+        q_acc = select(Account.sf_id, Account.segment).where(Account.sf_id.in_(account_ids_all))
+        r_acc = await db.execute(q_acc)
+        for (sf_id, seg) in r_acc.all():
+            account_segment[sf_id] = (seg or "").strip() or DEFAULT_SEGMENT
+    # Distinct values for filter dropdowns
+    segments_set: set[str] = set()
+    stages_set: set[str] = set()
+    record_types_set: set[str] = set()
     available_months_set: set[str] = set()
     for o in closed_opps_all:
+        seg = account_segment.get(o.account_id) if o.account_id else DEFAULT_SEGMENT
+        segments_set.add(seg)
+        stages_set.add(o.stage_name or "—")
+        record_types_set.add(o.record_type_name or "—")
         if o.close_date:
             available_months_set.add(o.close_date.strftime("%Y-%m"))
-    # Parse selected months and build date ranges
+    # Apply filters (case-insensitive)
+    def _norm(s: str) -> str:
+        return (s or "").strip().lower()
+
+    filter_segments = {_norm(s) for s in (segment or [])}
+    filter_stages = {_norm(s) for s in (stage or [])}
+    filter_record_types = {_norm(s) for s in (record_type or [])}
+
+    def _keep(o) -> bool:
+        seg = account_segment.get(o.account_id) if o.account_id else DEFAULT_SEGMENT
+        if filter_segments and _norm(seg) not in filter_segments:
+            return False
+        if filter_stages and _norm(o.stage_name or "") not in filter_stages:
+            return False
+        if filter_record_types and _norm(o.record_type_name or "") not in filter_record_types:
+            return False
+        return True
+
+    # Month filter
     if months:
         month_ranges: list[tuple[date, date]] = []
         for yyyy_mm in months:
@@ -1599,19 +1634,12 @@ async def get_closed_overview(
         if month_ranges:
             def _in_selected(d: date) -> bool:
                 return any(first <= d <= last for first, last in month_ranges)
-            closed_opps = [o for o in closed_opps_all if o.close_date and _in_selected(o.close_date)]
+            closed_opps = [o for o in closed_opps_all if _keep(o) and o.close_date and _in_selected(o.close_date)]
         else:
-            closed_opps = closed_opps_all
+            closed_opps = [o for o in closed_opps_all if _keep(o)]
     else:
-        closed_opps = closed_opps_all
+        closed_opps = [o for o in closed_opps_all if _keep(o)]
     closed_sf_ids = {o.sf_id for o in closed_opps}
-    account_ids = {o.account_id for o in closed_opps if o.account_id}
-    account_segment: dict[str, str] = {}
-    if account_ids:
-        q_acc = select(Account.sf_id, Account.segment).where(Account.sf_id.in_(account_ids))
-        r_acc = await db.execute(q_acc)
-        for (sf_id, seg) in r_acc.all():
-            account_segment[sf_id] = (seg or "").strip() or DEFAULT_SEGMENT
     # Fallback: when Opportunity.MRR is null/zero, use sum(OpportunityLineItem.TotalPrice)×12
     opp_to_arr_from_lines: dict[str, float] = {}
     if closed_sf_ids:
@@ -1652,6 +1680,9 @@ async def get_closed_overview(
         "rows": rows,
         "grand_total": round(grand_total, 2),
         "available_months": sorted(available_months_set, reverse=True),
+        "segments": sorted(segments_set),
+        "stages": sorted(stages_set),
+        "record_types": sorted(record_types_set),
     }
     base = os.getenv("SALESFORCE_BASE_URL", "").strip().rstrip("/")
     if base and ("salesforce.com" in base or "lightning.force.com" in base):

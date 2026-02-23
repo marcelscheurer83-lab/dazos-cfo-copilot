@@ -1,28 +1,98 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
-import { getClosedOverview, type ClosedOverviewResponse } from '../api'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { getClosedOverview, syncSalesforce, type ClosedOverviewResponse } from '../api'
 
 function fmtMoney(n: number) {
   return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 }).format(n)
 }
 
+type FilterColumn = 'segment' | 'stage' | 'record_type' | 'close_date'
 type SortKey = 'account_name' | 'segment' | 'opportunity_name' | 'stage_name' | 'record_type_name' | 'close_date' | 'arr'
 type SortDir = 'asc' | 'desc'
 
 export default function Closed() {
   const [data, setData] = useState<ClosedOverviewResponse | null>(null)
   const [err, setErr] = useState<string | null>(null)
+  const [syncStatus, setSyncStatus] = useState<'idle' | 'loading' | 'ok' | 'error'>('idle')
+  const [syncMessage, setSyncMessage] = useState<string | null>(null)
   const [sortKey, setSortKey] = useState<SortKey>('close_date')
   const [sortDir, setSortDir] = useState<SortDir>('desc')
+  const [filterSegment, setFilterSegment] = useState<string[]>([])
+  const [filterStage, setFilterStage] = useState<string[]>([])
+  const [filterRecordType, setFilterRecordType] = useState<string[]>([])
+  const [filterCloseDate, setFilterCloseDate] = useState<string[]>([])
+  const [openFilter, setOpenFilter] = useState<FilterColumn | null>(null)
+  const segmentThRef = useRef<HTMLTableHeaderCellElement>(null)
+  const segmentPopoverRef = useRef<HTMLDivElement>(null)
+  const stageThRef = useRef<HTMLTableHeaderCellElement>(null)
+  const stagePopoverRef = useRef<HTMLDivElement>(null)
+  const recordTypeThRef = useRef<HTMLTableHeaderCellElement>(null)
+  const recordTypePopoverRef = useRef<HTMLDivElement>(null)
+  const closeDateThRef = useRef<HTMLTableHeaderCellElement>(null)
+  const closeDatePopoverRef = useRef<HTMLDivElement>(null)
 
   const loadData = useCallback(() => {
-    getClosedOverview()
+    getClosedOverview({
+      segment: filterSegment.length ? filterSegment : undefined,
+      stage: filterStage.length ? filterStage : undefined,
+      record_type: filterRecordType.length ? filterRecordType : undefined,
+      months: filterCloseDate.length ? filterCloseDate : undefined,
+    })
       .then(setData)
       .catch((e) => setErr(e.message))
-  }, [])
+  }, [filterSegment, filterStage, filterRecordType, filterCloseDate])
 
   useEffect(() => {
     loadData()
   }, [loadData])
+
+  useEffect(() => {
+    if (openFilter === null) return
+    const thRef =
+      openFilter === 'segment'
+        ? segmentThRef
+        : openFilter === 'stage'
+          ? stageThRef
+          : openFilter === 'record_type'
+            ? recordTypeThRef
+            : closeDateThRef
+    const popRef =
+      openFilter === 'segment'
+        ? segmentPopoverRef
+        : openFilter === 'stage'
+          ? stagePopoverRef
+          : openFilter === 'record_type'
+            ? recordTypePopoverRef
+            : closeDatePopoverRef
+    const handleClick = (e: MouseEvent) => {
+      const t = e.target as Node
+      if (thRef.current?.contains(t) || popRef.current?.contains(t)) return
+      setOpenFilter(null)
+    }
+    document.addEventListener('click', handleClick)
+    return () => document.removeEventListener('click', handleClick)
+  }, [openFilter])
+
+  const handleSyncSalesforce = () => {
+    setSyncStatus('loading')
+    setSyncMessage(null)
+    syncSalesforce()
+      .then((res) => {
+        if (res.ok) {
+          setSyncStatus('ok')
+          setSyncMessage(
+            `Synced ${res.synced_opportunities ?? 0} opportunities, ${res.synced_line_items ?? 0} product lines.`
+          )
+          loadData()
+        } else {
+          setSyncStatus('error')
+          setSyncMessage(res.error ?? 'Sync failed')
+        }
+      })
+      .catch((e) => {
+        setSyncStatus('error')
+        setSyncMessage(e.message ?? 'Sync failed')
+      })
+  }
 
   const rows = Array.isArray(data?.rows) ? data.rows : []
   const grand_total = data?.grand_total ?? 0
@@ -31,6 +101,89 @@ export default function Closed() {
     (data.salesforce_base_url.includes('salesforce.com') || data.salesforce_base_url.includes('lightning.force.com'))
       ? data.salesforce_base_url
       : undefined
+
+  // Last 6 months: current + previous 5 (for charts)
+  const chartMonths = useMemo(() => {
+    const now = new Date()
+    const out: string[] = []
+    for (let i = 0; i < 6; i++) {
+      const d = new Date(now.getFullYear(), now.getMonth() - i, 1)
+      out.push(`${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`)
+    }
+    return out
+  }, [])
+
+  const chartData = useMemo(() => {
+    const monthSet = new Set(chartMonths)
+    const arrMap = new Map<string, Map<string, number>>()
+    const countMap = new Map<string, Map<string, number>>()
+    const closedWonOnly = rows.filter((r) => (r.stage_name || '').trim() === 'Closed Won')
+    for (const r of closedWonOnly) {
+      const month = r.close_date ? r.close_date.slice(0, 7) : null
+      if (!month || !monthSet.has(month)) continue
+      if (!arrMap.has(month)) {
+        arrMap.set(month, new Map())
+        countMap.set(month, new Map())
+      }
+      const seg = r.segment || '—'
+      const arrSeg = arrMap.get(month)!
+      const countSeg = countMap.get(month)!
+      arrSeg.set(seg, (arrSeg.get(seg) ?? 0) + r.arr)
+      countSeg.set(seg, (countSeg.get(seg) ?? 0) + 1)
+    }
+    // Oldest left, most recent right
+    const months = chartMonths.filter((m) => arrMap.has(m)).reverse()
+    const segmentsSet = new Set<string>()
+    arrMap.forEach((segMap) => segMap.forEach((_, seg) => segmentsSet.add(seg)))
+    const segments = Array.from(segmentsSet).sort()
+    const segmentColors: Record<string, string> = {}
+    const palette = ['#3b82f6', '#10b981', '#f59e0b', '#8b5cf6', '#ec4899', '#06b6d4']
+    segments.forEach((s, i) => { segmentColors[s] = palette[i % palette.length] })
+    return { months, segments, arrMap, countMap, segmentColors }
+  }, [rows, chartMonths])
+
+  const formatMonthLabel = (month: string) => {
+    const [y, m] = month.split('-')
+    const d = new Date(parseInt(y, 10), parseInt(m, 10) - 1, 1)
+    return d.toLocaleDateString('en-US', { month: 'short', year: '2-digit' })
+  }
+
+  const PLOT_HEIGHT = 180
+  const ARR_Y_TICKS = [0, 150, 300, 450, 600] // $K
+  const ARR_Y_MAX = 600_000 // $600K
+  const formatArrTick = (tick: number) => (tick === 0 ? '$0' : `$${tick}K`)
+  const COUNT_Y_TICKS = [0, 10, 20, 30, 40]
+  const COUNT_Y_MAX = 40
+
+  // By record type (Closed Won) — different palette from segment charts
+  const chartDataByRecordType = useMemo(() => {
+    const monthSet = new Set(chartMonths)
+    const arrMap = new Map<string, Map<string, number>>()
+    const countMap = new Map<string, Map<string, number>>()
+    const closedWonOnly = rows.filter((r) => (r.stage_name || '').trim() === 'Closed Won')
+    for (const r of closedWonOnly) {
+      const month = r.close_date ? r.close_date.slice(0, 7) : null
+      if (!month || !monthSet.has(month)) continue
+      if (!arrMap.has(month)) {
+        arrMap.set(month, new Map())
+        countMap.set(month, new Map())
+      }
+      const rt = (r.record_type_name || '—').trim() || '—'
+      const arrRt = arrMap.get(month)!
+      const countRt = countMap.get(month)!
+      arrRt.set(rt, (arrRt.get(rt) ?? 0) + r.arr)
+      countRt.set(rt, (countRt.get(rt) ?? 0) + 1)
+    }
+    const months = chartMonths.filter((m) => arrMap.has(m)).reverse()
+    const recordTypesSet = new Set<string>()
+    arrMap.forEach((rtMap) => rtMap.forEach((_, rt) => recordTypesSet.add(rt)))
+    const recordTypes = Array.from(recordTypesSet).sort()
+    const recordTypeColors: Record<string, string> = {}
+    // Warm tones: orange and gold/yellow — similar temperature to segment palette
+    const paletteRT = ['#c2410c', '#ca8a04'] // orange, gold
+    recordTypes.forEach((rt, i) => { recordTypeColors[rt] = paletteRT[i % paletteRT.length] })
+    return { months, recordTypes, arrMap, countMap, recordTypeColors }
+  }, [rows, chartMonths])
 
   const handleSort = (key: SortKey) => {
     if (sortKey === key) {
@@ -57,6 +210,8 @@ export default function Closed() {
     })
   }, [rows, sortKey, sortDir])
 
+  const closeDateOptions = data?.available_months ?? []
+
   const th = (key: SortKey, label: string, align: 'left' | 'right' = 'left') => {
     const isActive = sortKey === key
     return (
@@ -81,6 +236,127 @@ export default function Closed() {
     )
   }
 
+  const popoverStyle: React.CSSProperties = {
+    position: 'absolute',
+    left: 0,
+    top: '100%',
+    marginTop: 2,
+    zIndex: 50,
+    background: 'var(--surface)',
+    border: '1px solid var(--border)',
+    borderRadius: 6,
+    padding: '0.5rem',
+    boxShadow: '0 4px 12px rgba(0,0,0,0.15)',
+    minWidth: 140,
+  }
+
+  const filterColToSortKey: Record<FilterColumn, SortKey> = {
+    segment: 'segment',
+    stage: 'stage_name',
+    record_type: 'record_type_name',
+    close_date: 'close_date',
+  }
+
+  const thFilter = (
+    col: FilterColumn,
+    label: string,
+    thRef: React.RefObject<HTMLTableHeaderCellElement | null>,
+    popoverRef: React.RefObject<HTMLDivElement | null>,
+    options: string[],
+    selected: string[],
+    setSelected: (v: string[]) => void,
+    optionLabel?: (value: string) => string
+  ) => {
+    const isOpen = openFilter === col
+    const sortKeyForCol = filterColToSortKey[col]
+    const isSortActive = sortKey === sortKeyForCol
+    const hasActiveFilter = selected.length > 0
+    return (
+      <th
+        ref={thRef as React.RefObject<HTMLTableHeaderCellElement>}
+        style={{
+          textAlign: 'left',
+          padding: '0.5rem 0.75rem',
+          color: 'var(--text-muted)',
+          fontWeight: 500,
+          whiteSpace: 'nowrap',
+          position: 'relative',
+          verticalAlign: 'bottom',
+        }}
+      >
+        <span
+          role="button"
+          tabIndex={0}
+          onClick={() => handleSort(sortKeyForCol)}
+          onKeyDown={(e) => (e.key === 'Enter' || e.key === ' ') && handleSort(sortKeyForCol)}
+          style={{ cursor: 'pointer', userSelect: 'none' }}
+        >
+          {label}
+          {isSortActive && <span style={{ marginLeft: 4 }}>{sortDir === 'asc' ? '↑' : '↓'}</span>}
+        </span>
+        <button
+          type="button"
+          onClick={(e) => { e.stopPropagation(); setOpenFilter((f) => (f === col ? null : col)) }}
+          title="Filter"
+          style={{
+            marginLeft: 4,
+            padding: 2,
+            background: hasActiveFilter ? 'var(--accent)' : 'transparent',
+            color: hasActiveFilter ? '#fff' : 'var(--text-muted)',
+            border: '1px solid var(--border)',
+            borderRadius: 4,
+            cursor: 'pointer',
+            lineHeight: 1,
+          }}
+        >
+          ⋮
+        </button>
+        {isOpen && (
+          <div ref={popoverRef as React.RefObject<HTMLDivElement>} style={popoverStyle} onClick={(e) => e.stopPropagation()}>
+            <select
+              multiple
+              size={Math.min(6, Math.max(2, options.length))}
+              value={selected}
+              onChange={(e) => setSelected(Array.from(e.target.selectedOptions, (o) => o.value))}
+              style={{
+                padding: '0.35rem 0.5rem',
+                fontSize: '0.9rem',
+                width: '100%',
+                border: '1px solid var(--border)',
+                borderRadius: 4,
+                background: 'var(--bg)',
+                color: 'var(--text)',
+              }}
+            >
+              {options.map((opt) => (
+                <option key={opt} value={opt}>{optionLabel ? optionLabel(opt) : opt}</option>
+              ))}
+            </select>
+            <p style={{ fontSize: '0.75rem', color: 'var(--text-muted)', margin: '0.35rem 0 0 0' }}>Ctrl+click to select multiple</p>
+            {selected.length > 0 && (
+              <button
+                type="button"
+                onClick={() => setSelected([])}
+                style={{
+                  marginTop: '0.35rem',
+                  padding: '0.25rem 0.5rem',
+                  fontSize: '0.8rem',
+                  cursor: 'pointer',
+                  background: 'var(--bg)',
+                  color: 'var(--text-muted)',
+                  border: '1px solid var(--border)',
+                  borderRadius: 4,
+                }}
+              >
+                Clear
+              </button>
+            )}
+          </div>
+        )}
+      </th>
+    )
+  }
+
   const linkStyle = { color: 'var(--accent)', textDecoration: 'none' }
 
   if (err) return <p style={{ color: 'var(--negative)' }}>{err}</p>
@@ -92,16 +368,392 @@ export default function Closed() {
       <p style={{ fontSize: '0.9rem', color: 'var(--text-muted)', marginBottom: '1rem' }}>
         Closed Won and Closed Lost: New Business and Expansion only. ARR = MRR × 12 from Opportunity Finance Details.
       </p>
+
+      {chartData.months.length > 0 && (
+        <>
+        <div style={{ marginBottom: '1.5rem', maxWidth: '100%', display: 'flex', gap: '2rem', flexWrap: 'wrap' }}>
+          <div style={{ flex: '1 1 320px', minWidth: 0 }}>
+            <div style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text)', marginBottom: '0.5rem' }}>Closed Won by close month and segment (ARR) — last 6 months</div>
+            <div style={{ background: 'var(--bg)', padding: '0.75rem 1rem', borderRadius: 6 }}>
+              <div style={{ display: 'flex', gap: 0, fontSize: '0.75rem' }}>
+                <div style={{ width: 36, flexShrink: 0, height: PLOT_HEIGHT, position: 'relative', color: 'var(--text-muted)', fontSize: '0.7rem', paddingRight: 8 }}>
+                  {ARR_Y_TICKS.slice().reverse().map((tick, i) => {
+                    const topPx = (i / (ARR_Y_TICKS.length - 1)) * PLOT_HEIGHT
+                    return (
+                      <span key={tick} style={{ position: 'absolute', right: 8, top: topPx, transform: 'translateY(-50%)', lineHeight: 1, textAlign: 'right' }}>
+                        {formatArrTick(tick)}
+                      </span>
+                    )
+                  })}
+                </div>
+                <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', paddingLeft: 4 }}>
+                  <div style={{ height: PLOT_HEIGHT, position: 'relative', flexShrink: 0 }}>
+                    <div style={{ position: 'absolute', left: 0, right: 0, top: 0, bottom: 0, pointerEvents: 'none' }}>
+                      {ARR_Y_TICKS.map((_, i) => (
+                        <div key={i} style={{ position: 'absolute', left: 0, right: 0, bottom: (i / (ARR_Y_TICKS.length - 1)) * PLOT_HEIGHT, height: 1, background: 'var(--border)', opacity: 0.7 }} />
+                      ))}
+                    </div>
+                    <div style={{ height: '100%', display: 'flex', alignItems: 'flex-end', gap: '0.25rem', position: 'relative', zIndex: 1 }}>
+                      {chartData.months.map((month) => {
+                        const segMap = chartData.arrMap.get(month)!
+                        const total = Array.from(segMap.values()).reduce((a, b) => a + b, 0)
+                        const barHeightPct = total > 0 ? Math.min(100, (total / ARR_Y_MAX) * 100) : 0
+                        const barHeight = (barHeightPct / 100) * PLOT_HEIGHT
+                        const totalK = Math.round(total / 1000)
+                        return (
+                          <div key={month} style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', minWidth: 0, justifyContent: 'flex-end', height: '100%' }}>
+                            <div style={{ flex: 1, minHeight: 0 }} />
+                            <div style={{ marginBottom: '0.2rem', fontWeight: 700, fontSize: '0.8rem', color: 'var(--text)', minHeight: '1.1em' }}>
+                              {total > 0 ? `$${totalK}K` : '$0'}
+                            </div>
+                            <div style={{ width: '100%', maxWidth: 36, height: total > 0 ? barHeight : 0, minHeight: 0, display: 'flex', flexDirection: 'column-reverse', overflow: 'hidden', borderRadius: '2px 2px 0 0' }}>
+                              {chartData.segments.map((seg) => {
+                                const arr = segMap.get(seg) ?? 0
+                                if (arr <= 0) return null
+                                const segPct = total > 0 ? (arr / total) * 100 : 0
+                                const arrK = Math.round(arr / 1000)
+                                return (
+                                  <div
+                                    key={seg}
+                                    style={{
+                                      height: `${segPct}%`,
+                                      minHeight: arrK >= 50 ? 20 : 0,
+                                      background: chartData.segmentColors[seg],
+                                      display: 'flex',
+                                      alignItems: 'center',
+                                      justifyContent: 'center',
+                                      color: '#fff',
+                                      fontWeight: 600,
+                                      fontSize: '0.7rem',
+                                      textShadow: '0 0 1px rgba(0,0,0,0.5)',
+                                    }}
+                                    title={`${seg}: ${fmtMoney(arr)}`}
+                                  >
+                                    {arrK >= 50 ? `$${arrK}K` : ''}
+                                  </div>
+                                )
+                              })}
+                            </div>
+                          </div>
+                        )
+                      })}
+                    </div>
+                  </div>
+                  <div style={{ display: 'flex', gap: '0.25rem', marginTop: '0.35rem', paddingLeft: 0 }}>
+                    {chartData.months.map((month) => (
+                      <div key={month} style={{ flex: 1, color: 'var(--text-muted)', fontSize: '0.7rem', textAlign: 'center' }}>{formatMonthLabel(month)}</div>
+                    ))}
+                  </div>
+                </div>
+              </div>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.5rem 1rem', marginTop: '0.75rem', fontSize: '0.7rem', color: 'var(--text-muted)' }}>
+                {chartData.segments.map((seg) => (
+                  <span key={seg} style={{ display: 'inline-flex', alignItems: 'center', gap: '0.35rem' }}>
+                    <span style={{ width: 8, height: 8, borderRadius: 2, background: chartData.segmentColors[seg] }} />
+                    {seg}
+                  </span>
+                ))}
+              </div>
+            </div>
+          </div>
+          <div style={{ flex: '1 1 320px', minWidth: 0 }}>
+            <div style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text)', marginBottom: '0.5rem' }}>Closed Won by close month and segment (# opportunities) — last 6 months</div>
+            <div style={{ background: 'var(--bg)', padding: '0.75rem 1rem', borderRadius: 6 }}>
+              <div style={{ display: 'flex', gap: 0, fontSize: '0.75rem' }}>
+                <div style={{ width: 36, flexShrink: 0, height: PLOT_HEIGHT, position: 'relative', color: 'var(--text-muted)', fontSize: '0.7rem', paddingRight: 8 }}>
+                  {COUNT_Y_TICKS.slice().reverse().map((tick, i) => {
+                    const topPx = (i / (COUNT_Y_TICKS.length - 1)) * PLOT_HEIGHT
+                    return (
+                      <span key={tick} style={{ position: 'absolute', right: 8, top: topPx, transform: 'translateY(-50%)', lineHeight: 1, textAlign: 'right' }}>{tick}</span>
+                    )
+                  })}
+                </div>
+                <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', paddingLeft: 4 }}>
+                  <div style={{ height: PLOT_HEIGHT, position: 'relative', flexShrink: 0 }}>
+                    <div style={{ position: 'absolute', left: 0, right: 0, top: 0, bottom: 0, pointerEvents: 'none' }}>
+                      {COUNT_Y_TICKS.map((_, i) => (
+                        <div key={i} style={{ position: 'absolute', left: 0, right: 0, bottom: (i / (COUNT_Y_TICKS.length - 1)) * PLOT_HEIGHT, height: 1, background: 'var(--border)', opacity: 0.7 }} />
+                      ))}
+                    </div>
+                    <div style={{ height: '100%', display: 'flex', alignItems: 'flex-end', gap: '0.25rem', position: 'relative', zIndex: 1 }}>
+                      {chartData.months.map((month) => {
+                        const countSegMap = chartData.countMap.get(month)!
+                        const totalCount = Array.from(countSegMap.values()).reduce((a, b) => a + b, 0)
+                        const barHeightPct = totalCount > 0 ? Math.min(100, (totalCount / COUNT_Y_MAX) * 100) : 0
+                        const barHeight = (barHeightPct / 100) * PLOT_HEIGHT
+                        return (
+                          <div key={month} style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', minWidth: 0, justifyContent: 'flex-end', height: '100%' }}>
+                            <div style={{ flex: 1, minHeight: 0 }} />
+                            <div style={{ marginBottom: '0.2rem', fontWeight: 700, fontSize: '0.8rem', color: 'var(--text)', minHeight: '1.1em' }}>{totalCount}</div>
+                            <div style={{ width: '100%', maxWidth: 36, height: totalCount > 0 ? barHeight : 0, minHeight: 0, display: 'flex', flexDirection: 'column-reverse', overflow: 'hidden', borderRadius: '2px 2px 0 0' }}>
+                              {chartData.segments.map((seg) => {
+                                const count = countSegMap.get(seg) ?? 0
+                                if (count <= 0) return null
+                                const segPct = totalCount > 0 ? (count / totalCount) * 100 : 0
+                                return (
+                                  <div
+                                    key={seg}
+                                    style={{
+                                      height: `${segPct}%`,
+                                      minHeight: count >= 1 ? 20 : 0,
+                                      background: chartData.segmentColors[seg],
+                                      display: 'flex',
+                                      alignItems: 'center',
+                                      justifyContent: 'center',
+                                      color: '#fff',
+                                      fontWeight: 600,
+                                      fontSize: '0.7rem',
+                                      textShadow: '0 0 1px rgba(0,0,0,0.5)',
+                                    }}
+                                    title={`${seg}: ${count} opps`}
+                                  >
+                                    {count >= 1 ? count : ''}
+                                  </div>
+                                )
+                              })}
+                            </div>
+                          </div>
+                        )
+                      })}
+                    </div>
+                  </div>
+                  <div style={{ display: 'flex', gap: '0.25rem', marginTop: '0.35rem', paddingLeft: 0 }}>
+                    {chartData.months.map((month) => (
+                      <div key={month} style={{ flex: 1, color: 'var(--text-muted)', fontSize: '0.7rem', textAlign: 'center' }}>{formatMonthLabel(month)}</div>
+                    ))}
+                  </div>
+                </div>
+              </div>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.5rem 1rem', marginTop: '0.75rem', fontSize: '0.7rem', color: 'var(--text-muted)' }}>
+                {chartData.segments.map((seg) => (
+                  <span key={seg} style={{ display: 'inline-flex', alignItems: 'center', gap: '0.35rem' }}>
+                    <span style={{ width: 8, height: 8, borderRadius: 2, background: chartData.segmentColors[seg] }} />
+                    {seg}
+                  </span>
+                ))}
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {chartDataByRecordType.months.length > 0 && (
+          <div style={{ marginTop: '1.5rem', maxWidth: '100%', display: 'flex', gap: '2rem', flexWrap: 'wrap' }}>
+            <div style={{ flex: '1 1 320px', minWidth: 0 }}>
+              <div style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text)', marginBottom: '0.5rem' }}>Closed Won by close month and record type (ARR) — last 6 months</div>
+              <div style={{ background: 'var(--bg)', padding: '0.75rem 1rem', borderRadius: 6 }}>
+                <div style={{ display: 'flex', gap: 0, fontSize: '0.75rem' }}>
+                  <div style={{ width: 36, flexShrink: 0, height: PLOT_HEIGHT, position: 'relative', color: 'var(--text-muted)', fontSize: '0.7rem', paddingRight: 8 }}>
+                    {ARR_Y_TICKS.slice().reverse().map((tick, i) => (
+                      <span key={tick} style={{ position: 'absolute', right: 8, top: (i / (ARR_Y_TICKS.length - 1)) * PLOT_HEIGHT, transform: 'translateY(-50%)', lineHeight: 1, textAlign: 'right' }}>
+                        {formatArrTick(tick)}
+                      </span>
+                    ))}
+                  </div>
+                  <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', paddingLeft: 4 }}>
+                    <div style={{ height: PLOT_HEIGHT, position: 'relative', flexShrink: 0 }}>
+                      <div style={{ position: 'absolute', left: 0, right: 0, top: 0, bottom: 0, pointerEvents: 'none' }}>
+                        {ARR_Y_TICKS.map((_, i) => (
+                          <div key={i} style={{ position: 'absolute', left: 0, right: 0, bottom: (i / (ARR_Y_TICKS.length - 1)) * PLOT_HEIGHT, height: 1, background: 'var(--border)', opacity: 0.7 }} />
+                        ))}
+                      </div>
+                      <div style={{ height: '100%', display: 'flex', alignItems: 'flex-end', gap: '0.25rem', position: 'relative', zIndex: 1 }}>
+                        {chartDataByRecordType.months.map((month) => {
+                          const rtMap = chartDataByRecordType.arrMap.get(month)!
+                          const total = Array.from(rtMap.values()).reduce((a, b) => a + b, 0)
+                          const barHeightPct = total > 0 ? Math.min(100, (total / ARR_Y_MAX) * 100) : 0
+                          const barHeight = (barHeightPct / 100) * PLOT_HEIGHT
+                          const totalK = Math.round(total / 1000)
+                          return (
+                            <div key={month} style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', minWidth: 0, justifyContent: 'flex-end', height: '100%' }}>
+                              <div style={{ flex: 1, minHeight: 0 }} />
+                              <div style={{ marginBottom: '0.2rem', fontWeight: 700, fontSize: '0.8rem', color: 'var(--text)', minHeight: '1.1em' }}>
+                                {total > 0 ? `$${totalK}K` : '$0'}
+                              </div>
+                              <div style={{ width: '100%', maxWidth: 36, height: total > 0 ? barHeight : 0, minHeight: 0, display: 'flex', flexDirection: 'column-reverse', overflow: 'hidden', borderRadius: '2px 2px 0 0' }}>
+                                {chartDataByRecordType.recordTypes.map((rt) => {
+                                  const arr = rtMap.get(rt) ?? 0
+                                  if (arr <= 0) return null
+                                  const segPct = total > 0 ? (arr / total) * 100 : 0
+                                  const arrK = Math.round(arr / 1000)
+                                  return (
+                                    <div
+                                      key={rt}
+                                      style={{
+                                        height: `${segPct}%`,
+                                        minHeight: arrK >= 50 ? 20 : 0,
+                                        background: chartDataByRecordType.recordTypeColors[rt],
+                                        display: 'flex',
+                                        alignItems: 'center',
+                                        justifyContent: 'center',
+                                        color: '#fff',
+                                        fontWeight: 600,
+                                        fontSize: '0.7rem',
+                                        textShadow: '0 0 1px rgba(0,0,0,0.5)',
+                                      }}
+                                      title={`${rt}: ${fmtMoney(arr)}`}
+                                    >
+                                      {arrK >= 50 ? `$${arrK}K` : ''}
+                                    </div>
+                                  )
+                                })}
+                              </div>
+                            </div>
+                          )
+                        })}
+                      </div>
+                    </div>
+                    <div style={{ display: 'flex', gap: '0.25rem', marginTop: '0.35rem', paddingLeft: 0 }}>
+                      {chartDataByRecordType.months.map((month) => (
+                        <div key={month} style={{ flex: 1, color: 'var(--text-muted)', fontSize: '0.7rem', textAlign: 'center' }}>{formatMonthLabel(month)}</div>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.5rem 1rem', marginTop: '0.75rem', fontSize: '0.7rem', color: 'var(--text-muted)' }}>
+                  {chartDataByRecordType.recordTypes.map((rt) => (
+                    <span key={rt} style={{ display: 'inline-flex', alignItems: 'center', gap: '0.35rem' }}>
+                      <span style={{ width: 8, height: 8, borderRadius: 2, background: chartDataByRecordType.recordTypeColors[rt] }} />
+                      {rt}
+                    </span>
+                  ))}
+                </div>
+              </div>
+            </div>
+            <div style={{ flex: '1 1 320px', minWidth: 0 }}>
+              <div style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text)', marginBottom: '0.5rem' }}>Closed Won by close month and record type (# opportunities) — last 6 months</div>
+              <div style={{ background: 'var(--bg)', padding: '0.75rem 1rem', borderRadius: 6 }}>
+                <div style={{ display: 'flex', gap: 0, fontSize: '0.75rem' }}>
+                  <div style={{ width: 36, flexShrink: 0, height: PLOT_HEIGHT, position: 'relative', color: 'var(--text-muted)', fontSize: '0.7rem', paddingRight: 8 }}>
+                    {COUNT_Y_TICKS.slice().reverse().map((tick, i) => (
+                      <span key={tick} style={{ position: 'absolute', right: 8, top: (i / (COUNT_Y_TICKS.length - 1)) * PLOT_HEIGHT, transform: 'translateY(-50%)', lineHeight: 1, textAlign: 'right' }}>{tick}</span>
+                    ))}
+                  </div>
+                  <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', paddingLeft: 4 }}>
+                    <div style={{ height: PLOT_HEIGHT, position: 'relative', flexShrink: 0 }}>
+                      <div style={{ position: 'absolute', left: 0, right: 0, top: 0, bottom: 0, pointerEvents: 'none' }}>
+                        {COUNT_Y_TICKS.map((_, i) => (
+                          <div key={i} style={{ position: 'absolute', left: 0, right: 0, bottom: (i / (COUNT_Y_TICKS.length - 1)) * PLOT_HEIGHT, height: 1, background: 'var(--border)', opacity: 0.7 }} />
+                        ))}
+                      </div>
+                      <div style={{ height: '100%', display: 'flex', alignItems: 'flex-end', gap: '0.25rem', position: 'relative', zIndex: 1 }}>
+                        {chartDataByRecordType.months.map((month) => {
+                          const countRtMap = chartDataByRecordType.countMap.get(month)!
+                          const totalCount = Array.from(countRtMap.values()).reduce((a, b) => a + b, 0)
+                          const barHeightPct = totalCount > 0 ? Math.min(100, (totalCount / COUNT_Y_MAX) * 100) : 0
+                          const barHeight = (barHeightPct / 100) * PLOT_HEIGHT
+                          return (
+                            <div key={month} style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', minWidth: 0, justifyContent: 'flex-end', height: '100%' }}>
+                              <div style={{ flex: 1, minHeight: 0 }} />
+                              <div style={{ marginBottom: '0.2rem', fontWeight: 700, fontSize: '0.8rem', color: 'var(--text)', minHeight: '1.1em' }}>{totalCount}</div>
+                              <div style={{ width: '100%', maxWidth: 36, height: totalCount > 0 ? barHeight : 0, minHeight: 0, display: 'flex', flexDirection: 'column-reverse', overflow: 'hidden', borderRadius: '2px 2px 0 0' }}>
+                                {chartDataByRecordType.recordTypes.map((rt) => {
+                                  const count = countRtMap.get(rt) ?? 0
+                                  if (count <= 0) return null
+                                  const segPct = totalCount > 0 ? (count / totalCount) * 100 : 0
+                                  return (
+                                    <div
+                                      key={rt}
+                                      style={{
+                                        height: `${segPct}%`,
+                                        minHeight: count >= 1 ? 20 : 0,
+                                        background: chartDataByRecordType.recordTypeColors[rt],
+                                        display: 'flex',
+                                        alignItems: 'center',
+                                        justifyContent: 'center',
+                                        color: '#fff',
+                                        fontWeight: 600,
+                                        fontSize: '0.7rem',
+                                        textShadow: '0 0 1px rgba(0,0,0,0.5)',
+                                      }}
+                                      title={`${rt}: ${count} opps`}
+                                    >
+                                      {count >= 1 ? count : ''}
+                                    </div>
+                                  )
+                                })}
+                              </div>
+                            </div>
+                          )
+                        })}
+                      </div>
+                    </div>
+                    <div style={{ display: 'flex', gap: '0.25rem', marginTop: '0.35rem', paddingLeft: 0 }}>
+                      {chartDataByRecordType.months.map((month) => (
+                        <div key={month} style={{ flex: 1, color: 'var(--text-muted)', fontSize: '0.7rem', textAlign: 'center' }}>{formatMonthLabel(month)}</div>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.5rem 1rem', marginTop: '0.75rem', fontSize: '0.7rem', color: 'var(--text-muted)' }}>
+                  {chartDataByRecordType.recordTypes.map((rt) => (
+                    <span key={rt} style={{ display: 'inline-flex', alignItems: 'center', gap: '0.35rem' }}>
+                      <span style={{ width: 8, height: 8, borderRadius: 2, background: chartDataByRecordType.recordTypeColors[rt] }} />
+                      {rt}
+                    </span>
+                  ))}
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+        </>
+      )}
+
+      <p style={{ marginBottom: '1rem', display: 'flex', alignItems: 'center', gap: '0.75rem', flexWrap: 'wrap' }}>
+        <button
+          type="button"
+          onClick={handleSyncSalesforce}
+          disabled={syncStatus === 'loading'}
+          style={{
+            padding: '0.5rem 1rem',
+            fontSize: '0.9rem',
+            fontWeight: 600,
+            cursor: syncStatus === 'loading' ? 'wait' : 'pointer',
+            background: 'var(--bg)',
+            color: 'var(--text)',
+            border: '1px solid var(--border)',
+            borderRadius: 6,
+          }}
+        >
+          {syncStatus === 'loading' ? 'Syncing…' : 'Sync from Salesforce'}
+        </button>
+        {syncStatus === 'ok' && syncMessage && <span style={{ fontSize: '0.9rem', color: 'var(--positive)' }}>{syncMessage}</span>}
+        {syncStatus === 'error' && syncMessage && <span style={{ fontSize: '0.9rem', color: 'var(--negative)' }}>{syncMessage}</span>}
+        {(filterSegment.length > 0 || filterStage.length > 0 || filterRecordType.length > 0 || filterCloseDate.length > 0) && (
+          <button
+            type="button"
+            onClick={() => {
+              setFilterSegment([])
+              setFilterStage([])
+              setFilterRecordType([])
+              setFilterCloseDate([])
+              setOpenFilter(null)
+            }}
+            style={{
+              padding: '0.5rem 1rem',
+              fontSize: '0.9rem',
+              cursor: 'pointer',
+              background: 'var(--bg)',
+              color: 'var(--text-muted)',
+              border: '1px solid var(--border)',
+              borderRadius: 6,
+            }}
+          >
+            Reset filters
+          </button>
+        )}
+      </p>
+
       <div style={{ overflowX: 'auto' }}>
         <table style={{ width: '100%', minWidth: 600, borderCollapse: 'collapse', fontSize: '0.9rem', color: 'var(--text)' }}>
           <thead>
             <tr style={{ borderBottom: '1px solid var(--border)' }}>
               {th('account_name', 'Account', 'left')}
-              {th('segment', 'Segment', 'left')}
+              {thFilter('segment', 'Segment', segmentThRef, segmentPopoverRef, data.segments ?? [], filterSegment, setFilterSegment)}
               {th('opportunity_name', 'Opportunity', 'left')}
-              {th('stage_name', 'Stage', 'left')}
-              {th('record_type_name', 'Record type', 'left')}
-              {th('close_date', 'Close date', 'left')}
+              {thFilter('stage', 'Stage', stageThRef, stagePopoverRef, data.stages ?? [], filterStage, setFilterStage)}
+              {thFilter('record_type', 'Record type', recordTypeThRef, recordTypePopoverRef, data.record_types ?? [], filterRecordType, setFilterRecordType)}
+              {thFilter('close_date', 'Close date', closeDateThRef, closeDatePopoverRef, closeDateOptions, filterCloseDate, setFilterCloseDate, formatMonthLabel)}
               {th('arr', 'ARR', 'right')}
             </tr>
           </thead>
@@ -115,19 +767,7 @@ export default function Closed() {
               <tr key={row.opportunity_sf_id} style={{ borderBottom: '1px solid var(--border)' }}>
                 <td style={{ padding: '0.5rem 0.75rem', color: 'var(--text)' }}>
                   {row.account_id && salesforce_base_url ? (
-                    <a
-                      href={
-                        salesforce_base_url.includes('lightning.force.com')
-                          ? `${salesforce_base_url}/lightning/r/Account/${row.account_id}/view`
-                          : `${salesforce_base_url}/${row.account_id}`
-                      }
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      style={linkStyle}
-                      title="Open account in Salesforce"
-                    >
-                      {row.account_name}
-                    </a>
+                    <a href={salesforce_base_url.includes('lightning.force.com') ? `${salesforce_base_url}/lightning/r/Account/${row.account_id}/view` : `${salesforce_base_url}/${row.account_id}`} target="_blank" rel="noopener noreferrer" style={linkStyle} title="Open account in Salesforce">{row.account_name}</a>
                   ) : (
                     row.account_name
                   )}
@@ -135,19 +775,7 @@ export default function Closed() {
                 <td style={{ padding: '0.5rem 0.75rem', color: 'var(--text-muted)', whiteSpace: 'nowrap' }}>{row.segment}</td>
                 <td style={{ padding: '0.5rem 0.75rem', color: 'var(--text)' }}>
                   {salesforce_base_url ? (
-                    <a
-                      href={
-                        salesforce_base_url.includes('lightning.force.com')
-                          ? `${salesforce_base_url}/lightning/r/Opportunity/${row.opportunity_sf_id}/view`
-                          : `${salesforce_base_url}/${row.opportunity_sf_id}`
-                      }
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      style={linkStyle}
-                      title="Open opportunity in Salesforce"
-                    >
-                      {row.opportunity_name}
-                    </a>
+                    <a href={salesforce_base_url.includes('lightning.force.com') ? `${salesforce_base_url}/lightning/r/Opportunity/${row.opportunity_sf_id}/view` : `${salesforce_base_url}/${row.opportunity_sf_id}`} target="_blank" rel="noopener noreferrer" style={linkStyle} title="Open opportunity in Salesforce">{row.opportunity_name}</a>
                   ) : (
                     row.opportunity_name
                   )}

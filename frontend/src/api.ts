@@ -166,6 +166,34 @@ export async function getDashboardKPI(): Promise<DashboardKPI> {
   return r.json()
 }
 
+export type BookingsMTDRow = {
+  mtd: number
+  plan: number | null
+  achievement_pct: number | null
+  delta_k: number | null
+}
+
+export type BookingsPeriod = {
+  period_label: string
+  total: BookingsMTDRow
+  new_business: BookingsMTDRow
+  expansion: BookingsMTDRow
+}
+
+export type BookingsMTDResponse = {
+  previous_month: BookingsPeriod
+  current_mtd: BookingsPeriod
+  qtd: BookingsPeriod
+  plan_source: string | null
+  plan_message: string | null
+}
+
+export async function getDashboardBookingsMTD(): Promise<BookingsMTDResponse> {
+  const r = await apiFetch('/dashboard/bookings-mtd')
+  if (!r.ok) throw new Error('Failed to fetch bookings MTD')
+  return r.json()
+}
+
 export async function getARRExamples(limit = 10): Promise<ARRExamplesResponse> {
   const r = await apiFetch(`/dashboard-kpi/arr-examples?limit=${limit}`)
   if (!r.ok) throw new Error('Failed to fetch ARR examples')

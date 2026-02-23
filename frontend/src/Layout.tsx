@@ -2,9 +2,9 @@ import { Outlet, NavLink } from 'react-router-dom'
 
 const nav = [
   { to: '/dashboard', label: 'Dashboard' },
-  { to: '/customer-overview', label: 'Customer overview' },
-  { to: '/pipeline-overview', label: 'Pipeline overview' },
   { to: '/bookings', label: 'Bookings overview' },
+  { to: '/pipeline-overview', label: 'Pipeline overview' },
+  { to: '/customer-overview', label: 'Customer overview' },
   { to: '/copilot', label: 'Copilot' },
 ]
 

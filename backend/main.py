@@ -36,7 +36,18 @@ from models import (
     QuickBooksReportSnapshot,
     SalesforceEODSnapshot,
 )
-from schemas import KPISummary, PnLLineOut, CashFlowLineOut, BudgetVsActualOut, CopilotRequest, CopilotResponse, DashboardKPI
+from schemas import (
+    KPISummary,
+    PnLLineOut,
+    CashFlowLineOut,
+    BudgetVsActualOut,
+    CopilotRequest,
+    CopilotResponse,
+    DashboardKPI,
+    BookingsMTDResponse,
+    BookingsMTDRow,
+    BookingsPeriod,
+)
 from seed_data import seed
 
 # Load .env from backend directory so GOOGLE_SHEET_ID etc. are available
@@ -402,8 +413,20 @@ _ARR_TOTAL_PRICE_IS_ANNUAL = os.getenv("ARR_TOTAL_PRICE_IS_ANNUAL", "").strip().
 PIPELINE_ARR_MULTIPLIER = 1 if _ARR_TOTAL_PRICE_IS_ANNUAL else ARR_MULTIPLIER
 
 # Products excluded from ARR (not counted in totals or shown as columns). Case-insensitive match.
-# Price book: "Verify Monthly Credits", "Kipu API" — excluded; 6 one-time ProServ products are out of scope for ARR.
-ARR_PRODUCT_EXCLUDE = frozenset({"iverify monthly credits", "verify monthly credits", "kipu api"})
+# Recurring but excluded: iVerify Monthly Credits, Kipu API.
+# One-time (ProServ): Implementation, Data Migration, Kipu API Set Up, Customer Integration Development — out of scope for ARR.
+ARR_PRODUCT_EXCLUDE = frozenset({
+    "iverify monthly credits",
+    "verify monthly credits",
+    "kipu api",
+    # One-time / non-recurring (ProServ)
+    "crm implementation services",
+    "iq implementation services",
+    "icampaign implementation services",
+    "data migration services",
+    "kipu api set up",
+    "customer integration development",
+})
 
 # Canonical ARR product columns: order = display order (Account, Segment, then these, then Other).
 # One-time products (Implementation, Data Migration, Kipu API Set Up, etc.) are not in ARR.
@@ -860,6 +883,167 @@ async def get_dashboard_kpi(db: AsyncSession = Depends(get_db)):
         arr=float(arr),
         pipeline=float(pipeline),
         salesforce_synced_at=salesforce_synced_at,
+    )
+
+
+def _to_float_sheet(x) -> Optional[float]:
+    if x is None:
+        return None
+    if isinstance(x, (int, float)):
+        return float(x)
+    if isinstance(x, str) and x.strip():
+        try:
+            return float(x.replace(",", "").strip())
+        except ValueError:
+            return None
+    return None
+
+
+def _bookings_row(mtd: float, plan_val: Optional[float]) -> BookingsMTDRow:
+    achievement_pct = (mtd / plan_val * 100) if plan_val and plan_val != 0 else None
+    delta_k = (mtd - plan_val) / 1000.0 if plan_val is not None else None
+    return BookingsMTDRow(mtd=mtd, plan=plan_val, achievement_pct=achievement_pct, delta_k=delta_k)
+
+
+async def _closed_won_arr_in_range(
+    db: AsyncSession,
+    first_day: date,
+    last_day: date,
+) -> tuple[float, float, float]:
+    """Return (total, new_business, expansion) ARR for Closed Won, New Business + Expansion in [first_day, last_day]."""
+    q_closed = select(Opportunity).where(
+        Opportunity.stage_name == "Closed Won",
+        Opportunity.close_date.isnot(None),
+        Opportunity.close_date >= first_day,
+        Opportunity.close_date <= last_day,
+    )
+    r = await db.execute(q_closed)
+    closed_opps = [o for o in r.scalars().all() if _is_pipeline_record_type(o.record_type_name)]
+    closed_sf_ids = {o.sf_id for o in closed_opps}
+    opp_to_arr: dict[str, float] = {}
+    if closed_sf_ids:
+        q_lines = select(OpportunityLineItem).where(
+            OpportunityLineItem.opportunity_sf_id.in_(closed_sf_ids)
+        )
+        r_lines = await db.execute(q_lines)
+        for li in r_lines.scalars().all():
+            raw = _normalized_product_name(li.product_name)
+            if _is_arr_excluded_product(raw) or _is_arr_excluded_product(li.product_name):
+                continue
+            opp_sf_id = li.opportunity_sf_id
+            mrr = float(li.total_price or 0)
+            opp_to_arr[opp_sf_id] = opp_to_arr.get(opp_sf_id, 0) + mrr * PIPELINE_ARR_MULTIPLIER
+    # ARR from product line items only (excl iVerify/Kipu), consistent with ARR overview
+    nb, exp = 0.0, 0.0
+    for o in closed_opps:
+        arr = opp_to_arr.get(o.sf_id, 0)
+        rt = (o.record_type_name or "").strip().lower()
+        if rt == "new business":
+            nb += arr
+        elif rt == "expansion":
+            exp += arr
+    return nb + exp, nb, exp
+
+
+@app.get("/api/dashboard/bookings-mtd", response_model=BookingsMTDResponse)
+async def get_dashboard_bookings_mtd(db: AsyncSession = Depends(get_db)):
+    """
+    Previous month, current month MTD, and current quarter-to-date Closed Won bookings (New Business + Expansion) vs plan.
+    ARR from product line items only (excl. iVerify/Kipu), consistent with ARR overview.
+    Plan from sheet ARR_Calculations_2026P: row 11 = new business, row 12 = expansion; columns BU..CF = Jan..Dec.
+    """
+    now_est = datetime.now(EST)
+    year, month = now_est.year, now_est.month
+    today = now_est.date()
+
+    # Previous month date range
+    if month == 1:
+        prev_first = date(year - 1, 12, 1)
+        prev_last = date(year - 1, 12, 31)
+        prev_label = datetime(year - 1, 12, 1).strftime("%b %y")
+    else:
+        prev_first = date(year, month - 1, 1)
+        prev_last = date(year, month - 1, 1) + timedelta(days=32)
+        prev_last = prev_last.replace(day=1) - timedelta(days=1)
+        prev_label = datetime(year, month - 1, 1).strftime("%b %y")
+
+    # Current month MTD
+    first_of_month = date(year, month, 1)
+    current_mtd_last = min(today, first_of_month + timedelta(days=32))
+    current_mtd_last = (current_mtd_last.replace(day=1) - timedelta(days=1)) if current_mtd_last.month != month else current_mtd_last
+    current_mtd_last = min(today, current_mtd_last)
+    current_label = now_est.strftime("%b %y") + " MTD"
+
+    # Quarter to date: first day of quarter through today
+    quarter_month = ((month - 1) // 3) * 3 + 1
+    qtd_first = date(year, quarter_month, 1)
+    qtd_label = f"Q{(quarter_month - 1) // 3 + 1} {str(year)[2:]} QTD"
+
+    # Load sheet once for plan data
+    plan_by_month: list[tuple[Optional[float], Optional[float]]] = [(None, None)] * 12  # (nb, exp) per month 1..12
+    plan_source: Optional[str] = None
+    plan_message: Optional[str] = None
+    sheet_range = "ARR_Calculations_2026P!A1:ZZ1000"
+    r_snap = await db.execute(
+        select(SheetSnapshot).where(SheetSnapshot.range_name == sheet_range).order_by(SheetSnapshot.as_of.desc()).limit(1)
+    )
+    snap = r_snap.scalar_one_or_none()
+    if snap and snap.data_json:
+        data = json.loads(snap.data_json)
+        row_11 = data[10] if len(data) > 10 else []
+        row_12 = data[11] if len(data) > 11 else []
+        try:
+            for m in range(12):
+                col_idx = _a1_col_to_index(ARR_2026P_MONTH_COLUMNS[m])
+                v11 = row_11[col_idx] if col_idx < len(row_11) else None
+                v12 = row_12[col_idx] if col_idx < len(row_12) else None
+                plan_by_month[m] = (_to_float_sheet(v11), _to_float_sheet(v12))
+            plan_source = "ARR_Calculations_2026P"
+        except (TypeError, ValueError, IndexError):
+            plan_message = "Could not read plan from sheet."
+    else:
+        plan_message = "No sheet snapshot. Sync ARR_Calculations_2026P first."
+
+    # Actuals for each period
+    prev_total, prev_nb, prev_exp = await _closed_won_arr_in_range(db, prev_first, prev_last)
+    mtd_total, mtd_nb, mtd_exp = await _closed_won_arr_in_range(db, first_of_month, today)
+    qtd_total, qtd_nb, qtd_exp = await _closed_won_arr_in_range(db, qtd_first, today)
+
+    # Plan for previous month (month index 0-based)
+    prev_m = (month - 2 + 12) % 12
+    p_nb, p_exp = plan_by_month[prev_m]
+    p_tot = (p_nb or 0) + (p_exp or 0) if (p_nb is not None or p_exp is not None) else None
+
+    # Plan for current month
+    c_nb, c_exp = plan_by_month[month - 1]
+    c_tot = (c_nb or 0) + (c_exp or 0) if (c_nb is not None or c_exp is not None) else None
+
+    # Plan for quarter = sum of plans for the three months in the quarter
+    q_nb = sum(plan_by_month[i][0] or 0 for i in range(quarter_month - 1, min(quarter_month + 2, 12)))
+    q_exp = sum(plan_by_month[i][1] or 0 for i in range(quarter_month - 1, min(quarter_month + 2, 12)))
+    q_tot = q_nb + q_exp
+
+    return BookingsMTDResponse(
+        previous_month=BookingsPeriod(
+            period_label=prev_label,
+            total=_bookings_row(prev_total, p_tot),
+            new_business=_bookings_row(prev_nb, p_nb),
+            expansion=_bookings_row(prev_exp, p_exp),
+        ),
+        current_mtd=BookingsPeriod(
+            period_label=current_label,
+            total=_bookings_row(mtd_total, c_tot),
+            new_business=_bookings_row(mtd_nb, c_nb),
+            expansion=_bookings_row(mtd_exp, c_exp),
+        ),
+        qtd=BookingsPeriod(
+            period_label=qtd_label,
+            total=_bookings_row(qtd_total, q_tot),
+            new_business=_bookings_row(qtd_nb, q_nb),
+            expansion=_bookings_row(qtd_exp, q_exp),
+        ),
+        plan_source=plan_source,
+        plan_message=plan_message,
     )
 
 
@@ -1339,6 +1523,20 @@ def _is_pipeline_record_type(record_type_name: Optional[str]) -> bool:
     return (record_type_name or "").strip().lower() in PIPELINE_RECORD_TYPES
 
 
+def _a1_col_to_index(col_letters: str) -> int:
+    """Convert A1 column letters to 0-based index (A=0, B=1, ..., Z=25, AA=26, BV=73)."""
+    n = 0
+    for c in (col_letters or "").strip().upper():
+        n = n * 26 + (ord(c) - ord("A") + 1)
+    return n - 1 if n else 0
+
+
+# ARR_Calculations_2026P: row 11 = new business plan, row 12 = expansion plan; Feb = BV (user-specified).
+ARR_2026P_MONTH_COLUMNS = [
+    "BU", "BV", "BW", "BX", "BY", "BZ", "CA", "CB", "CC", "CD", "CE", "CF",
+]  # Jan..Dec
+
+
 def _pipeline_from_snapshot_payload(
     payload: dict,
     filter_segment_list: Optional[List[str]] = None,
@@ -1568,7 +1766,8 @@ async def get_closed_overview(
 ):
     """
     Closed opportunities (Closed Won + Closed Lost); record type = New Business or Expansion only.
-    Optional filters: segment, stage, record_type, months (YYYY-MM). ARR = Opportunity.MRR (Finance Details) × 12 per opportunity.
+    Optional filters: segment, stage, record_type, months (YYYY-MM).
+    ARR = sum of product line item ARR per opportunity (excl. iVerify/Kipu), consistent with ARR overview.
     """
     q_closed = select(Opportunity).where(
         Opportunity.stage_name.in_(CLOSED_STAGES),
@@ -1640,7 +1839,7 @@ async def get_closed_overview(
     else:
         closed_opps = [o for o in closed_opps_all if _keep(o)]
     closed_sf_ids = {o.sf_id for o in closed_opps}
-    # Fallback: when Opportunity.MRR is null/zero, use sum(OpportunityLineItem.TotalPrice)×12
+    # ARR from product line items only (excl iVerify/Kipu), consistent with ARR overview
     opp_to_arr_from_lines: dict[str, float] = {}
     if closed_sf_ids:
         q_lines = select(OpportunityLineItem).where(
@@ -1658,10 +1857,7 @@ async def get_closed_overview(
     rows = []
     grand_total = 0.0
     for o in closed_opps:
-        if o.mrr is not None and o.mrr != 0:
-            arr = round(float(o.mrr) * PIPELINE_ARR_MULTIPLIER, 2)
-        else:
-            arr = opp_to_arr_from_lines.get(o.sf_id, 0)
+        arr = opp_to_arr_from_lines.get(o.sf_id, 0)
         grand_total += arr
         seg = account_segment.get(o.account_id) if o.account_id else DEFAULT_SEGMENT
         rows.append({

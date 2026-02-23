@@ -11,6 +11,31 @@ class DashboardKPI(BaseModel):
     salesforce_synced_at: Optional[datetime] = None
 
 
+class BookingsMTDRow(BaseModel):
+    """One row for dashboard: actual, plan, % achievement, delta $K."""
+    mtd: float
+    plan: Optional[float] = None
+    achievement_pct: Optional[float] = None
+    delta_k: Optional[float] = None  # actual - plan in thousands
+
+
+class BookingsPeriod(BaseModel):
+    """One period: label (e.g. Jan 26, Feb 26 MTD, Q1 26 QTD) and rows."""
+    period_label: str
+    total: BookingsMTDRow
+    new_business: BookingsMTDRow
+    expansion: BookingsMTDRow
+
+
+class BookingsMTDResponse(BaseModel):
+    """Bookings vs plan: previous month, current MTD, quarter to date."""
+    previous_month: BookingsPeriod
+    current_mtd: BookingsPeriod
+    qtd: BookingsPeriod
+    plan_source: Optional[str] = None
+    plan_message: Optional[str] = None
+
+
 class KPISummary(BaseModel):
     as_of_date: date
     cash_balance: float

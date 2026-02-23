@@ -139,10 +139,17 @@ function BookingsMTDBlock({ data, sheetSyncError }: { data: BookingsMTDResponse;
   const { previous_month, current_mtd, qtd, plan_message } = data
   const periods: BookingsPeriod[] = [previous_month, current_mtd, qtd]
   const planNote = sheetSyncError || plan_message
+  const needsGoogleConfig =
+    planNote && /GOOGLE_SHEET_ID|not configured|credentials/i.test(planNote)
   return (
     <>
       {planNote && (
-        <p style={{ fontSize: '0.75rem', color: 'var(--text-muted)', marginBottom: '0.5rem' }}>{planNote}</p>
+        <p style={{ fontSize: '0.75rem', color: 'var(--text-muted)', marginBottom: '0.5rem' }}>
+          {planNote}
+          {needsGoogleConfig && (
+            <> — Set <strong>GOOGLE_SHEET_ID</strong> (and credentials) in the backend environment (e.g. Railway → Variables).</>
+          )}
+        </p>
       )}
       <div style={{ display: 'grid', gridTemplateColumns: `repeat(${periods.length}, 1fr)`, gap: '1.5rem', minWidth: 0 }}>
         {periods.map((period) => (

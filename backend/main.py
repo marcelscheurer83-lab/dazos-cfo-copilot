@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 from typing import List, Optional
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, Depends, Query
+from fastapi import FastAPI, Depends, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -730,6 +730,21 @@ async def list_eod_snapshots(db: AsyncSession = Depends(get_db)):
         "snapshots": [{"snapshot_date": d.isoformat(), "snapshot_utc": (t.isoformat() if t else None)} for d, t in rows],
         "message": "EOD snapshots are taken daily at 23:59:59 EST when the backend is running.",
     }
+
+
+@app.post("/api/salesforce/eod-snapshots/take")
+async def take_eod_snapshot_now(db: AsyncSession = Depends(get_db)):
+    """
+    Take an EOD snapshot now (for testing persistence). Uses current Salesforce data in DB.
+    Requires X-App-Password if APP_PASSWORD is set.
+    """
+    try:
+        await _take_salesforce_eod_snapshot(db)
+        await db.commit()
+        return {"ok": True, "message": "EOD snapshot saved. Check GET /api/salesforce/eod-snapshots to verify."}
+    except Exception as e:
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 async def _take_salesforce_eod_snapshot(db: AsyncSession) -> None:

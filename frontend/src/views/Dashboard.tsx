@@ -58,18 +58,14 @@ export default function Dashboard() {
 
     if (!hasAutoSyncedThisSession.current) {
       hasAutoSyncedThisSession.current = true
-      // Sync Salesforce and plan sheet on first open, then fetch
-      const afterSync = () => {
-        if (!hasSyncedSheetThisSession.current) {
-          hasSyncedSheetThisSession.current = true
-          syncGoogleSheet(ARR_2026P_RANGE).finally(() => runSyncAndFetch())
-        } else {
-          runSyncAndFetch()
-        }
+      // On first open: sync plan sheet, then fetch (so Dashboard has plan data). Salesforce sync in parallel.
+      syncSalesforce().catch(() => {})
+      if (!hasSyncedSheetThisSession.current) {
+        hasSyncedSheetThisSession.current = true
+        syncGoogleSheet(ARR_2026P_RANGE).finally(() => runSyncAndFetch())
+      } else {
+        runSyncAndFetch()
       }
-      syncSalesforce()
-        .then(() => afterSync())
-        .catch(() => afterSync())
     } else {
       runSyncAndFetch()
     }

@@ -87,6 +87,9 @@ class RequireAppPasswordMiddleware(BaseHTTPMiddleware):
         # Let OPTIONS (CORS preflight) through so the browser gets 200 and can send the real request with the password header
         if request.method == "OPTIONS":
             return await call_next(request)
+        # Read-only status check: list EOD snapshot dates (no sensitive data)
+        if request.method == "GET" and request.url.path == "/api/salesforce/eod-snapshots":
+            return await call_next(request)
         password = os.getenv("APP_PASSWORD")
         if not password:
             return await call_next(request)
@@ -709,6 +712,24 @@ async def sync_salesforce(db: AsyncSession = Depends(get_db)):
     Requires SALESFORCE_USERNAME, SALESFORCE_PASSWORD, and SALESFORCE_SECURITY_TOKEN in .env.
     """
     return await _run_salesforce_sync(db)
+
+
+@app.get("/api/salesforce/eod-snapshots")
+async def list_eod_snapshots(db: AsyncSession = Depends(get_db)):
+    """
+    List all EOD snapshot dates (for verifying the daily 23:59 EST job on Railway).
+    Snapshots are stored in the DB table salesforce_eod_snapshots.
+    """
+    r = await db.execute(
+        select(SalesforceEODSnapshot.snapshot_date, SalesforceEODSnapshot.snapshot_utc)
+        .order_by(SalesforceEODSnapshot.snapshot_date.desc())
+    )
+    rows = r.all()
+    return {
+        "count": len(rows),
+        "snapshots": [{"snapshot_date": d.isoformat(), "snapshot_utc": (t.isoformat() if t else None)} for d, t in rows],
+        "message": "EOD snapshots are taken daily at 23:59:59 EST when the backend is running.",
+    }
 
 
 async def _take_salesforce_eod_snapshot(db: AsyncSession) -> None:

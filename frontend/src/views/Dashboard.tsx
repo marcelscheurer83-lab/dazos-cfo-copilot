@@ -43,6 +43,7 @@ export default function Dashboard() {
   const [bookingsMTD, setBookingsMTD] = useState<BookingsMTDResponse | null>(null)
   const [err, setErr] = useState<string | null>(null)
   const [bookingsErr, setBookingsErr] = useState<string | null>(null)
+  const [sheetSyncError, setSheetSyncError] = useState<string | null>(null)
 
   useEffect(() => {
     const fetchKpi = () => getDashboardKPI().then(setKpi).catch((e) => setErr(e.message))
@@ -58,11 +59,16 @@ export default function Dashboard() {
 
     if (!hasAutoSyncedThisSession.current) {
       hasAutoSyncedThisSession.current = true
-      // On first open: sync plan sheet, then fetch (so Dashboard has plan data). Salesforce sync in parallel.
       syncSalesforce().catch(() => {})
       if (!hasSyncedSheetThisSession.current) {
         hasSyncedSheetThisSession.current = true
-        syncGoogleSheet(ARR_2026P_RANGE).finally(() => runSyncAndFetch())
+        // Sync plan sheet first, then fetch so bookings block can show plan when available
+        syncGoogleSheet(ARR_2026P_RANGE)
+          .then((res) => {
+            if (!res.ok && res.error) setSheetSyncError(res.error)
+          })
+          .catch((e) => setSheetSyncError(e?.message || 'Sheet sync failed'))
+          .finally(() => runSyncAndFetch())
       } else {
         runSyncAndFetch()
       }
@@ -94,7 +100,7 @@ export default function Dashboard() {
             <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>{bookingsErr}</p>
           )}
           {!bookingsErr && bookingsMTD && (
-            <BookingsMTDBlock data={bookingsMTD} />
+            <BookingsMTDBlock data={bookingsMTD} sheetSyncError={sheetSyncError} />
           )}
           {!bookingsErr && !bookingsMTD && (
             <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>Loading…</p>
@@ -129,13 +135,14 @@ export default function Dashboard() {
   )
 }
 
-function BookingsMTDBlock({ data }: { data: BookingsMTDResponse }) {
+function BookingsMTDBlock({ data, sheetSyncError }: { data: BookingsMTDResponse; sheetSyncError?: string | null }) {
   const { previous_month, current_mtd, qtd, plan_message } = data
   const periods: BookingsPeriod[] = [previous_month, current_mtd, qtd]
+  const planNote = sheetSyncError || plan_message
   return (
     <>
-      {plan_message && (
-        <p style={{ fontSize: '0.75rem', color: 'var(--text-muted)', marginBottom: '0.5rem' }}>{plan_message}</p>
+      {planNote && (
+        <p style={{ fontSize: '0.75rem', color: 'var(--text-muted)', marginBottom: '0.5rem' }}>{planNote}</p>
       )}
       <div style={{ display: 'grid', gridTemplateColumns: `repeat(${periods.length}, 1fr)`, gap: '1.5rem', minWidth: 0 }}>
         {periods.map((period) => (

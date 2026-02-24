@@ -1097,6 +1097,11 @@ def _is_renewal_record_type(name: Optional[str]) -> bool:
     return (name or "").strip().lower() == "renewal"
 
 
+def _is_amendment_record_type(name: Optional[str]) -> bool:
+    """True if record type is Amendment (case-insensitive, trimmed)."""
+    return (name or "").strip().lower() == "amendment"
+
+
 async def _get_record_type_overrides(db: AsyncSession) -> dict[str, str]:
     """Load manual record-type overrides: opportunity_sf_id -> record_type_name.
     Keys stripped. Both 15- and 18-char SF IDs are stored so lookup matches either format."""
@@ -1248,6 +1253,49 @@ async def _closed_won_arr_in_range(
     return nb + exp, nb, exp
 
 
+async def _closed_won_renewal_expansion_arr_in_range(
+    db: AsyncSession,
+    first_day: date,
+    last_day: date,
+) -> float:
+    """Return sum of positive booking ARR (delta) for Closed Won renewals with close_date in [first_day, last_day]. Used to add to dashboard expansion."""
+    overrides = await _get_record_type_overrides(db)
+
+    def _effective_record_type(o: Opportunity) -> str:
+        key = (o.sf_id or "").strip()
+        override = overrides.get(key) or (overrides.get(key[:15]) if len(key) >= 15 else None)
+        return (override or o.record_type_name or "").strip() or "—"
+
+    q = select(Opportunity).where(
+        Opportunity.stage_name == "Closed Won",
+        Opportunity.close_date.isnot(None),
+        Opportunity.close_date >= first_day,
+        Opportunity.close_date <= last_day,
+    )
+    r = await db.execute(q)
+    closed = [o for o in r.scalars().all() if _is_renewal_record_type(_effective_record_type(o))]
+    if not closed:
+        return 0.0
+    sf_ids = {o.sf_id for o in closed}
+    opp_to_arr: dict[str, float] = {}
+    q_lines = select(OpportunityLineItem).where(OpportunityLineItem.opportunity_sf_id.in_(sf_ids))
+    r_lines = await db.execute(q_lines)
+    for li in r_lines.scalars().all():
+        raw = _normalized_product_name(li.product_name)
+        if not _include_line_item_in_arr(raw, li.product_name):
+            continue
+        opp_sf_id = li.opportunity_sf_id
+        mrr = _line_item_effective_total(li)
+        opp_to_arr[opp_sf_id] = opp_to_arr.get(opp_sf_id, 0) + mrr * PIPELINE_ARR_MULTIPLIER
+    total = 0.0
+    for o in closed:
+        arr = opp_to_arr.get(o.sf_id, 0)
+        ufr = float(o.original_acv) if getattr(o, "original_acv", None) is not None else 0.0
+        delta = arr - ufr
+        total += max(0.0, delta)
+    return round(total, 2)
+
+
 async def _renewals_metrics_in_range(
     db: AsyncSession,
     first_day: date,
@@ -1378,10 +1426,22 @@ async def get_dashboard_bookings_mtd(db: AsyncSession = Depends(get_db)):
     else:
         plan_message = "No sheet snapshot. Sync ARR_Calculations_2026P first."
 
-    # Actuals for each period
+    # Actuals for each period (pipeline NB + Expansion); add Closed Won renewal positive delta to expansion
     prev_total, prev_nb, prev_exp = await _closed_won_arr_in_range(db, prev_first, prev_last)
     mtd_total, mtd_nb, mtd_exp = await _closed_won_arr_in_range(db, first_of_month, today)
     qtd_total, qtd_nb, qtd_exp = await _closed_won_arr_in_range(db, qtd_first, today)
+    prev_renewal_exp = await _closed_won_renewal_expansion_arr_in_range(db, prev_first, prev_last)
+    mtd_renewal_exp = await _closed_won_renewal_expansion_arr_in_range(db, first_of_month, today)
+    qtd_renewal_exp = await _closed_won_renewal_expansion_arr_in_range(db, qtd_first, today)
+    prev_exp_mid_term, prev_exp_upon_renewal = prev_exp, prev_renewal_exp
+    mtd_exp_mid_term, mtd_exp_upon_renewal = mtd_exp, mtd_renewal_exp
+    qtd_exp_mid_term, qtd_exp_upon_renewal = qtd_exp, qtd_renewal_exp
+    prev_exp += prev_renewal_exp
+    prev_total += prev_renewal_exp
+    mtd_exp += mtd_renewal_exp
+    mtd_total += mtd_renewal_exp
+    qtd_exp += qtd_renewal_exp
+    qtd_total += qtd_renewal_exp
 
     # Plan for previous month (month index 0-based)
     prev_m = (month - 2 + 12) % 12
@@ -1403,18 +1463,24 @@ async def get_dashboard_bookings_mtd(db: AsyncSession = Depends(get_db)):
             total=_bookings_row(prev_total, p_tot),
             new_business=_bookings_row(prev_nb, p_nb),
             expansion=_bookings_row(prev_exp, p_exp),
+            expansion_mid_term=prev_exp_mid_term,
+            expansion_upon_renewal=prev_exp_upon_renewal,
         ),
         current_mtd=BookingsPeriod(
             period_label=current_label,
             total=_bookings_row(mtd_total, c_tot),
             new_business=_bookings_row(mtd_nb, c_nb),
             expansion=_bookings_row(mtd_exp, c_exp),
+            expansion_mid_term=mtd_exp_mid_term,
+            expansion_upon_renewal=mtd_exp_upon_renewal,
         ),
         qtd=BookingsPeriod(
             period_label=qtd_label,
             total=_bookings_row(qtd_total, q_tot),
             new_business=_bookings_row(qtd_nb, q_nb),
             expansion=_bookings_row(qtd_exp, q_exp),
+            expansion_mid_term=qtd_exp_mid_term,
+            expansion_upon_renewal=qtd_exp_upon_renewal,
         ),
         plan_source=plan_source,
         plan_message=plan_message,
@@ -2276,16 +2342,27 @@ async def get_closed_overview(
     months: Optional[List[str]] = Query(None, description="Filter by close-date month(s), e.g. 2026-02, 2026-03"),
 ):
     """
-    Closed opportunities (Closed Won + Closed Lost); record type = New Business or Expansion only.
-    Optional filters: segment, stage, record_type, months (YYYY-MM).
+    Closed opportunities (Closed Won + Closed Lost). List includes New Business, Expansion, Renewal, and Amendment (for display).
+    Dashboard and bookings metrics still use New Business + Expansion only. Optional filters: segment, stage, record_type, months.
     ARR = sum of product line item ARR per opportunity (excl. iVerify/Kipu), consistent with ARR overview.
     """
+    overrides = await _get_record_type_overrides(db)
+
+    def _effective_record_type(o: Opportunity) -> str:
+        key = (o.sf_id or "").strip()
+        override = overrides.get(key) or (overrides.get(key[:15]) if len(key) >= 15 else None)
+        return (override or o.record_type_name or "").strip() or "—"
+
+    def _in_bookings_list(o: Opportunity) -> bool:
+        rt = _effective_record_type(o)
+        return _is_pipeline_record_type(rt) or _is_renewal_record_type(rt) or _is_amendment_record_type(rt)
+
     q_closed = select(Opportunity).where(
         Opportunity.stage_name.in_(CLOSED_STAGES),
         Opportunity.close_date.isnot(None),
     ).order_by(Opportunity.close_date.desc())
     r = await db.execute(q_closed)
-    closed_opps_all = [o for o in r.scalars().all() if _is_pipeline_record_type(o.record_type_name)]
+    closed_opps_all = [o for o in r.scalars().all() if _in_bookings_list(o)]
     account_ids_all = {o.account_id for o in closed_opps_all if o.account_id}
     account_segment: dict[str, str] = {}
     if account_ids_all:
@@ -2302,7 +2379,7 @@ async def get_closed_overview(
         seg = account_segment.get(o.account_id) if o.account_id else DEFAULT_SEGMENT
         segments_set.add(seg)
         stages_set.add(o.stage_name or "—")
-        record_types_set.add(o.record_type_name or "—")
+        record_types_set.add(_effective_record_type(o))
         if o.close_date:
             available_months_set.add(o.close_date.strftime("%Y-%m"))
     # Apply filters (case-insensitive)
@@ -2319,7 +2396,7 @@ async def get_closed_overview(
             return False
         if filter_stages and _norm(o.stage_name or "") not in filter_stages:
             return False
-        if filter_record_types and _norm(o.record_type_name or "") not in filter_record_types:
+        if filter_record_types and _norm(_effective_record_type(o)) not in filter_record_types:
             return False
         return True
 
@@ -2368,7 +2445,25 @@ async def get_closed_overview(
     rows = []
     grand_total = 0.0
     for o in closed_opps:
-        arr = opp_to_arr_from_lines.get(o.sf_id, 0)
+        arr_from_lines = opp_to_arr_from_lines.get(o.sf_id, 0)
+        # For renewals and amendments, booking ARR = delta (renewal change) as in renewals overview
+        if _is_renewal_record_type(_effective_record_type(o)) or _is_amendment_record_type(_effective_record_type(o)):
+            stage = (o.stage_name or "").strip()
+            if stage == "Closed Won":
+                ufr_val = float(o.original_acv) if getattr(o, "original_acv", None) is not None else None
+                ufr = (ufr_val if ufr_val is not None else 0) or 0
+                arr = round(arr_from_lines - ufr, 2)
+            elif stage == "Closed Lost":
+                arr = round(0.0 - arr_from_lines, 2)
+            else:
+                arr = arr_from_lines
+        else:
+            arr = arr_from_lines
+        # Closed Lost New Business: booking ARR = 0
+        if (o.stage_name or "").strip() == "Closed Lost" and (_effective_record_type(o) or "").strip().lower() == "new business":
+            arr = 0.0
+        # Booking ARR is only positive; set to 0 if not positive
+        arr = max(0.0, arr)
         grand_total += arr
         seg = account_segment.get(o.account_id) if o.account_id else DEFAULT_SEGMENT
         rows.append({
@@ -2378,7 +2473,7 @@ async def get_closed_overview(
             "opportunity_sf_id": o.sf_id,
             "opportunity_name": o.name or "—",
             "stage_name": o.stage_name or "—",
-            "record_type_name": o.record_type_name or "—",
+            "record_type_name": _effective_record_type(o),
             "close_date": o.close_date.isoformat() if o.close_date else None,
             "arr": arr,
         })

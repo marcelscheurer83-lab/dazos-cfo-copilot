@@ -113,12 +113,27 @@ export default function Closed() {
     return out
   }, [])
 
+  // Charts: New Business + Expansion + Closed Won Renewals with positive booking ARR (renewals count as Expansion)
+  const pipelineRecordTypes = useMemo(() => new Set(['new business', 'expansion']), [])
+  const isPipelineRow = (r: { record_type_name?: string | null }) =>
+    pipelineRecordTypes.has((r.record_type_name || '').trim().toLowerCase())
+  const isClosedWonRenewalWithPositiveArr = (r: { stage_name?: string | null; record_type_name?: string | null; arr?: number | null }) =>
+    (r.stage_name || '').trim() === 'Closed Won' &&
+    (r.record_type_name || '').trim().toLowerCase() === 'renewal' &&
+    (r.arr ?? 0) > 0
+  const closedWonForCharts = useMemo(
+    () =>
+      rows.filter(
+        (r) => (r.stage_name || '').trim() === 'Closed Won' && (isPipelineRow(r) || isClosedWonRenewalWithPositiveArr(r))
+      ),
+    [rows]
+  )
+
   const chartData = useMemo(() => {
     const monthSet = new Set(chartMonths)
     const arrMap = new Map<string, Map<string, number>>()
     const countMap = new Map<string, Map<string, number>>()
-    const closedWonOnly = rows.filter((r) => (r.stage_name || '').trim() === 'Closed Won')
-    for (const r of closedWonOnly) {
+    for (const r of closedWonForCharts) {
       const month = r.close_date ? r.close_date.slice(0, 7) : null
       if (!month || !monthSet.has(month)) continue
       if (!arrMap.has(month)) {
@@ -140,7 +155,7 @@ export default function Closed() {
     const palette = ['#3b82f6', '#10b981', '#f59e0b', '#8b5cf6', '#ec4899', '#06b6d4']
     segments.forEach((s, i) => { segmentColors[s] = palette[i % palette.length] })
     return { months, segments, arrMap, countMap, segmentColors }
-  }, [rows, chartMonths])
+  }, [closedWonForCharts, chartMonths])
 
   const formatMonthLabel = (month: string) => {
     const [y, m] = month.split('-')
@@ -155,20 +170,20 @@ export default function Closed() {
   const COUNT_Y_TICKS = [0, 10, 20, 30, 40]
   const COUNT_Y_MAX = 40
 
-  // By record type (Closed Won) — different palette from segment charts
+  // By record type (Closed Won) — Renewals with positive booking ARR count as Expansion
   const chartDataByRecordType = useMemo(() => {
     const monthSet = new Set(chartMonths)
     const arrMap = new Map<string, Map<string, number>>()
     const countMap = new Map<string, Map<string, number>>()
-    const closedWonOnly = rows.filter((r) => (r.stage_name || '').trim() === 'Closed Won')
-    for (const r of closedWonOnly) {
+    for (const r of closedWonForCharts) {
       const month = r.close_date ? r.close_date.slice(0, 7) : null
       if (!month || !monthSet.has(month)) continue
       if (!arrMap.has(month)) {
         arrMap.set(month, new Map())
         countMap.set(month, new Map())
       }
-      const rt = (r.record_type_name || '—').trim() || '—'
+      const rtRaw = (r.record_type_name || '—').trim() || '—'
+      const rt = rtRaw.toLowerCase() === 'renewal' ? 'Expansion' : rtRaw
       const arrRt = arrMap.get(month)!
       const countRt = countMap.get(month)!
       arrRt.set(rt, (arrRt.get(rt) ?? 0) + r.arr)
@@ -183,7 +198,7 @@ export default function Closed() {
     const paletteRT = ['#c2410c', '#ca8a04'] // orange, gold
     recordTypes.forEach((rt, i) => { recordTypeColors[rt] = paletteRT[i % paletteRT.length] })
     return { months, recordTypes, arrMap, countMap, recordTypeColors }
-  }, [rows, chartMonths])
+  }, [closedWonForCharts, chartMonths])
 
   const handleSort = (key: SortKey) => {
     if (sortKey === key) {

@@ -224,6 +224,8 @@ function BookingsMTDBlock({ data, sheetSyncError }: { data: BookingsMTDResponse;
                 <MTDRow label="Total" row={period.total} />
                 <MTDRow label="New business" row={period.new_business} />
                 <MTDRow label="Expansion" row={period.expansion} />
+                <MTDRowSub label="Mid-term" value={period.expansion_mid_term ?? 0} />
+                <MTDRowSub label="Upon renewal" value={period.expansion_upon_renewal ?? 0} />
               </tbody>
             </table>
           </div>
@@ -244,6 +246,19 @@ function MTDRow({ label, row }: { label: string; row: BookingsMTDRow }) {
       </td>
       <td style={{ textAlign: 'right', padding: '0.35rem 0.5rem', color: 'var(--text)' }}>{fmtPct(row.achievement_pct)}</td>
       <td style={{ textAlign: 'right', padding: '0.35rem 0', color: deltaColor }}>{fmtDeltaK(row.delta_k)}</td>
+    </tr>
+  )
+}
+
+/** Indented sub-row: value only in first data column, no plan/%/delta */
+function MTDRowSub({ label, value }: { label: string; value: number }) {
+  return (
+    <tr style={{ borderBottom: '1px solid var(--border)' }}>
+      <td style={{ padding: '0.35rem 0.5rem 0.35rem 0', color: 'var(--text-muted)', paddingLeft: '1.25rem' }}>{label}</td>
+      <td style={{ textAlign: 'right', padding: '0.35rem 0.5rem', color: 'var(--text)' }}>{fmtK(value)}</td>
+      <td style={{ textAlign: 'right', padding: '0.35rem 0.5rem', color: 'var(--text-muted)' }}>—</td>
+      <td style={{ textAlign: 'right', padding: '0.35rem 0.5rem', color: 'var(--text-muted)' }}>—</td>
+      <td style={{ textAlign: 'right', padding: '0.35rem 0', color: 'var(--text-muted)' }}>—</td>
     </tr>
   )
 }

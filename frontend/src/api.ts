@@ -178,6 +178,10 @@ export type BookingsPeriod = {
   total: BookingsMTDRow
   new_business: BookingsMTDRow
   expansion: BookingsMTDRow
+  /** Booking ARR from closed won expansions (no plan/delta) */
+  expansion_mid_term?: number | null
+  /** Booking ARR from renewals (no plan/delta) */
+  expansion_upon_renewal?: number | null
 }
 
 export type BookingsMTDResponse = {

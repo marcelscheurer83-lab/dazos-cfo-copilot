@@ -20,11 +20,13 @@ class BookingsMTDRow(BaseModel):
 
 
 class BookingsPeriod(BaseModel):
-    """One period: label (e.g. Jan 26, Feb 26 MTD, Q1 26 QTD) and rows."""
+    """One period: label (e.g. Jan 26, Feb 26 MTD, Q1 26 QTD) and rows. Expansion breakdown: mid_term (closed won expansions), upon_renewal (renewals)."""
     period_label: str
     total: BookingsMTDRow
     new_business: BookingsMTDRow
     expansion: BookingsMTDRow
+    expansion_mid_term: Optional[float] = None  # booking ARR from closed won expansions (no plan/delta)
+    expansion_upon_renewal: Optional[float] = None  # booking ARR from renewals (no plan/delta)
 
 
 class BookingsMTDResponse(BaseModel):

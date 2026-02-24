@@ -182,6 +182,12 @@ export type BookingsPeriod = {
   expansion_mid_term?: number | null
   /** Booking ARR from renewals (no plan/delta) */
   expansion_upon_renewal?: number | null
+  /** Total open pipeline ARR / shortfall to plan (MTD/QTD only) */
+  pipe_coverage_total?: number | null
+  /** Open pipeline NB ARR / shortfall to plan (MTD/QTD only) */
+  pipe_coverage_new_business?: number | null
+  /** Open pipeline expansion ARR / shortfall to plan (MTD/QTD only) */
+  pipe_coverage_expansion?: number | null
 }
 
 export type BookingsMTDResponse = {

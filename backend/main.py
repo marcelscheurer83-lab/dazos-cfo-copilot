@@ -1253,6 +1253,76 @@ async def _closed_won_arr_in_range(
     return nb + exp, nb, exp
 
 
+def _open_pipeline_arr_from_opps(
+    open_opps: list, opp_to_arr_from_lines: dict[str, float]
+) -> tuple[float, float]:
+    """Split ARR by record type (New Business / Expansion). Per-opp ARR: o.mrr when set, else opp_to_arr_from_lines."""
+    nb, exp = 0.0, 0.0
+    for o in open_opps:
+        if o.mrr is not None and o.mrr != 0:
+            arr = round(float(o.mrr) * PIPELINE_ARR_MULTIPLIER, 2)
+        else:
+            arr = opp_to_arr_from_lines.get(o.sf_id, 0)
+        rt = (o.record_type_name or "").strip().lower()
+        if rt == "new business":
+            nb += arr
+        elif rt == "expansion":
+            exp += arr
+    return round(nb, 2), round(exp, 2)
+
+
+async def _open_pipeline_arr_by_record_type(db: AsyncSession) -> tuple[float, float]:
+    """Return (new_business_arr, expansion_arr) for all open pipeline (not Closed Won/Lost). Same logic as pipeline-overview: Opportunity.MRR when set, else line-item ARR."""
+    q = select(Opportunity).where(
+        Opportunity.stage_name.isnot(None),
+        ~Opportunity.stage_name.in_(CLOSED_STAGES),
+    )
+    r = await db.execute(q)
+    open_opps = [o for o in r.scalars().all() if _is_pipeline_record_type(o.record_type_name)]
+    if not open_opps:
+        return 0.0, 0.0
+    sf_ids = {o.sf_id for o in open_opps}
+    opp_to_arr_from_lines = await _line_item_arr_for_opportunities(db, sf_ids)
+    return _open_pipeline_arr_from_opps(open_opps, opp_to_arr_from_lines)
+
+
+async def _open_pipeline_arr_by_record_type_in_range(
+    db: AsyncSession,
+    first_day: date,
+    last_day: date,
+) -> tuple[float, float]:
+    """Return (new_business_arr, expansion_arr) for open pipeline with close_date in [first_day, last_day]. Same ARR logic as pipeline-overview (MRR when set, else line items)."""
+    q = select(Opportunity).where(
+        Opportunity.stage_name.isnot(None),
+        ~Opportunity.stage_name.in_(CLOSED_STAGES),
+        Opportunity.close_date.isnot(None),
+        Opportunity.close_date >= first_day,
+        Opportunity.close_date <= last_day,
+    )
+    r = await db.execute(q)
+    open_opps = [o for o in r.scalars().all() if _is_pipeline_record_type(o.record_type_name)]
+    if not open_opps:
+        return 0.0, 0.0
+    sf_ids = {o.sf_id for o in open_opps}
+    opp_to_arr_from_lines = await _line_item_arr_for_opportunities(db, sf_ids)
+    return _open_pipeline_arr_from_opps(open_opps, opp_to_arr_from_lines)
+
+
+async def _line_item_arr_for_opportunities(db: AsyncSession, sf_ids: set) -> dict[str, float]:
+    """Build opp_sf_id -> ARR from line items (same product filter as pipeline-overview)."""
+    opp_to_arr: dict[str, float] = {}
+    q_lines = select(OpportunityLineItem).where(OpportunityLineItem.opportunity_sf_id.in_(sf_ids))
+    r_lines = await db.execute(q_lines)
+    for li in r_lines.scalars().all():
+        raw = _normalized_product_name(li.product_name)
+        if not _include_line_item_in_arr(raw, li.product_name):
+            continue
+        opp_sf_id = li.opportunity_sf_id
+        mrr = _line_item_effective_total(li)
+        opp_to_arr[opp_sf_id] = opp_to_arr.get(opp_sf_id, 0) + mrr * PIPELINE_ARR_MULTIPLIER
+    return {k: round(v, 2) for k, v in opp_to_arr.items()}
+
+
 async def _closed_won_renewal_expansion_arr_in_range(
     db: AsyncSession,
     first_day: date,
@@ -1400,6 +1470,8 @@ async def get_dashboard_bookings_mtd(db: AsyncSession = Depends(get_db)):
     quarter_month = ((month - 1) // 3) * 3 + 1
     qtd_first = date(year, quarter_month, 1)
     qtd_label = f"Q{(quarter_month - 1) // 3 + 1} {str(year)[2:]} QTD"
+    last_day_month = (first_of_month + timedelta(days=32)).replace(day=1) - timedelta(days=1)
+    last_day_quarter = (date(year, quarter_month + 3, 1) - timedelta(days=1)) if quarter_month <= 9 else date(year, 12, 31)
 
     # Load sheet once for plan data
     plan_by_month: list[tuple[Optional[float], Optional[float]]] = [(None, None)] * 12  # (nb, exp) per month 1..12
@@ -1457,6 +1529,25 @@ async def get_dashboard_bookings_mtd(db: AsyncSession = Depends(get_db)):
     q_exp = sum(plan_by_month[i][1] or 0 for i in range(quarter_month - 1, min(quarter_month + 2, 12)))
     q_tot = q_nb + q_exp
 
+    # Pipe coverage = (open pipeline ARR) / (shortfall to plan). MTD = open pipe with close_date in current month; QTD = close_date in current quarter. Same ARR logic as pipeline-overview (MRR when set else line items).
+    pipeline_mtd_nb, pipeline_mtd_exp = await _open_pipeline_arr_by_record_type_in_range(db, first_of_month, last_day_month)
+    pipeline_mtd_tot = pipeline_mtd_nb + pipeline_mtd_exp
+    pipeline_qtd_nb, pipeline_qtd_exp = await _open_pipeline_arr_by_record_type_in_range(db, qtd_first, last_day_quarter)
+    pipeline_qtd_tot = pipeline_qtd_nb + pipeline_qtd_exp
+    # Shortfall in same unit as plan/actual (dollars); dashboard displays plan/actual in $K via fmtK
+    shortfall_mtd_tot = max(0, (c_tot or 0) - mtd_total)
+    shortfall_mtd_nb = max(0, (c_nb or 0) - mtd_nb)
+    shortfall_mtd_exp = max(0, (c_exp or 0) - mtd_exp)
+    shortfall_qtd_tot = max(0, q_tot - qtd_total)
+    shortfall_qtd_nb = max(0, q_nb - qtd_nb)
+    shortfall_qtd_exp = max(0, q_exp - qtd_exp)
+    pipe_cov_mtd_tot = round(pipeline_mtd_tot / shortfall_mtd_tot, 2) if shortfall_mtd_tot > 0 else None
+    pipe_cov_mtd_nb = round(pipeline_mtd_nb / shortfall_mtd_nb, 2) if shortfall_mtd_nb > 0 else None
+    pipe_cov_mtd_exp = round(pipeline_mtd_exp / shortfall_mtd_exp, 2) if shortfall_mtd_exp > 0 else None
+    pipe_cov_qtd_tot = round(pipeline_qtd_tot / shortfall_qtd_tot, 2) if shortfall_qtd_tot > 0 else None
+    pipe_cov_qtd_nb = round(pipeline_qtd_nb / shortfall_qtd_nb, 2) if shortfall_qtd_nb > 0 else None
+    pipe_cov_qtd_exp = round(pipeline_qtd_exp / shortfall_qtd_exp, 2) if shortfall_qtd_exp > 0 else None
+
     return BookingsMTDResponse(
         previous_month=BookingsPeriod(
             period_label=prev_label,
@@ -1473,6 +1564,9 @@ async def get_dashboard_bookings_mtd(db: AsyncSession = Depends(get_db)):
             expansion=_bookings_row(mtd_exp, c_exp),
             expansion_mid_term=mtd_exp_mid_term,
             expansion_upon_renewal=mtd_exp_upon_renewal,
+            pipe_coverage_total=pipe_cov_mtd_tot,
+            pipe_coverage_new_business=pipe_cov_mtd_nb,
+            pipe_coverage_expansion=pipe_cov_mtd_exp,
         ),
         qtd=BookingsPeriod(
             period_label=qtd_label,
@@ -1481,6 +1575,9 @@ async def get_dashboard_bookings_mtd(db: AsyncSession = Depends(get_db)):
             expansion=_bookings_row(qtd_exp, q_exp),
             expansion_mid_term=qtd_exp_mid_term,
             expansion_upon_renewal=qtd_exp_upon_renewal,
+            pipe_coverage_total=pipe_cov_qtd_tot,
+            pipe_coverage_new_business=pipe_cov_qtd_nb,
+            pipe_coverage_expansion=pipe_cov_qtd_exp,
         ),
         plan_source=plan_source,
         plan_message=plan_message,

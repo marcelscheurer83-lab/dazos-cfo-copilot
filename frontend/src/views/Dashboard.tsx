@@ -218,12 +218,13 @@ function BookingsMTDBlock({ data, sheetSyncError }: { data: BookingsMTDResponse;
                   <th style={{ textAlign: 'right', padding: '0.25rem 0.5rem', fontWeight: 500, color: 'var(--text-muted)' }}>Plan</th>
                   <th style={{ textAlign: 'right', padding: '0.25rem 0', fontWeight: 500, color: 'var(--text-muted)' }}>%</th>
                   <th style={{ textAlign: 'right', padding: '0.25rem 0', fontWeight: 500, color: 'var(--text-muted)' }}>Δ $K</th>
+                  <th style={{ textAlign: 'right', padding: '0.25rem 0', fontWeight: 500, color: 'var(--text-muted)' }}>Pipe cov.</th>
                 </tr>
               </thead>
               <tbody>
-                <MTDRow label="Total" row={period.total} />
-                <MTDRow label="New business" row={period.new_business} />
-                <MTDRow label="Expansion" row={period.expansion} />
+                <MTDRow label="Total" row={period.total} pipeCoverage={period.pipe_coverage_total ?? null} />
+                <MTDRow label="New business" row={period.new_business} pipeCoverage={period.pipe_coverage_new_business ?? null} />
+                <MTDRow label="Expansion" row={period.expansion} pipeCoverage={period.pipe_coverage_expansion ?? null} />
                 <MTDRowSub label="Mid-term" value={period.expansion_mid_term ?? 0} />
                 <MTDRowSub label="Upon renewal" value={period.expansion_upon_renewal ?? 0} />
               </tbody>
@@ -235,7 +236,11 @@ function BookingsMTDBlock({ data, sheetSyncError }: { data: BookingsMTDResponse;
   )
 }
 
-function MTDRow({ label, row }: { label: string; row: BookingsMTDRow }) {
+function fmtPipeCoverage(value: number | null): string {
+  return value != null ? `${value.toFixed(1)}×` : '—'
+}
+
+function MTDRow({ label, row, pipeCoverage }: { label: string; row: BookingsMTDRow; pipeCoverage?: number | null }) {
   const deltaColor = row.delta_k != null ? (row.delta_k >= 0 ? 'var(--positive)' : 'var(--negative)') : 'var(--text-muted)'
   return (
     <tr style={{ borderBottom: '1px solid var(--border)' }}>
@@ -246,11 +251,12 @@ function MTDRow({ label, row }: { label: string; row: BookingsMTDRow }) {
       </td>
       <td style={{ textAlign: 'right', padding: '0.35rem 0.5rem', color: 'var(--text)' }}>{fmtPct(row.achievement_pct)}</td>
       <td style={{ textAlign: 'right', padding: '0.35rem 0', color: deltaColor }}>{fmtDeltaK(row.delta_k)}</td>
+      <td style={{ textAlign: 'right', padding: '0.35rem 0', color: 'var(--text)' }}>{fmtPipeCoverage(pipeCoverage ?? null)}</td>
     </tr>
   )
 }
 
-/** Indented sub-row: value only in first data column, no plan/%/delta */
+/** Indented sub-row: value only in first data column, no plan/%/delta/pipe coverage */
 function MTDRowSub({ label, value }: { label: string; value: number }) {
   return (
     <tr style={{ borderBottom: '1px solid var(--border)' }}>
@@ -258,6 +264,7 @@ function MTDRowSub({ label, value }: { label: string; value: number }) {
       <td style={{ textAlign: 'right', padding: '0.35rem 0.5rem', color: 'var(--text)' }}>{fmtK(value)}</td>
       <td style={{ textAlign: 'right', padding: '0.35rem 0.5rem', color: 'var(--text-muted)' }}>—</td>
       <td style={{ textAlign: 'right', padding: '0.35rem 0.5rem', color: 'var(--text-muted)' }}>—</td>
+      <td style={{ textAlign: 'right', padding: '0.35rem 0', color: 'var(--text-muted)' }}>—</td>
       <td style={{ textAlign: 'right', padding: '0.35rem 0', color: 'var(--text-muted)' }}>—</td>
     </tr>
   )
@@ -345,7 +352,7 @@ function RenewalsMTDBlock({
                 <RenewalsMTDRow label="Renewed" row={period.renewed} />
                 <RenewalsMTDRow label="Open" row={period.open} />
                 <RenewalsMTDRow label="Churn" row={period.churn} deltaBadWhenPositive />
-                <RenewalsMTDRow label="Contracted" row={period.contraction} deltaBadWhenPositive />
+                <RenewalsMTDRow label="Contraction" row={period.contraction} deltaBadWhenPositive />
                 <RenewalsMTDRow label="Renewal rate" row={period.renewal_rate} asPct />
               </tbody>
             </table>

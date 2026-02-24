@@ -378,6 +378,22 @@ export async function takeEodSnapshotNow(): Promise<{ ok: boolean; message?: str
   return { ok: true, message: data.message }
 }
 
+export async function getEodSnapshotContents(
+  snapshotDate: string,
+  full = false
+): Promise<{
+  snapshot_date: string
+  snapshot_utc: string | null
+  counts: { accounts: number; opportunities: number; opportunity_line_items: number }
+  carr_summary: { grand_total: number; accounts_with_arr: number }
+  payload?: unknown
+}> {
+  const path = `/salesforce/eod-snapshots/${encodeURIComponent(snapshotDate)}${full ? '?full=1' : ''}`
+  const r = await apiFetch(path)
+  if (!r.ok) throw new Error(r.status === 404 ? 'No snapshot for that date' : 'Failed to fetch snapshot')
+  return r.json()
+}
+
 export async function getKPI(asOf?: string): Promise<KPISummary> {
   const path = asOf ? `/kpi?as_of=${asOf}` : '/kpi'
   const r = await apiFetch(path)

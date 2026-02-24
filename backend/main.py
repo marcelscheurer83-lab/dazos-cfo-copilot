@@ -915,6 +915,42 @@ async def list_eod_snapshots(db: AsyncSession = Depends(get_db)):
     }
 
 
+@app.get("/api/salesforce/eod-snapshots/{snapshot_date}")
+async def get_eod_snapshot_contents(
+    snapshot_date: str,
+    db: AsyncSession = Depends(get_db),
+    full: Optional[bool] = Query(False, description="Include full payload (accounts, opportunities, line items)"),
+):
+    """
+    Return contents of the EOD snapshot for a given date (YYYY-MM-DD).
+    By default returns a summary (counts + CARR). Use ?full=1 to get the full JSON payload.
+    """
+    try:
+        target = date.fromisoformat(snapshot_date.strip())
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date; use YYYY-MM-DD")
+    r = await db.execute(
+        select(SalesforceEODSnapshot).where(SalesforceEODSnapshot.snapshot_date == target).limit(1)
+    )
+    row = r.scalar_one_or_none()
+    if not row or not row.data_json:
+        raise HTTPException(status_code=404, detail=f"No EOD snapshot found for {snapshot_date}")
+    payload = json.loads(row.data_json)
+    accounts = payload.get("accounts") or []
+    opportunities = payload.get("opportunities") or []
+    line_items = payload.get("opportunity_line_items") or []
+    arr_data = _arr_from_snapshot_payload(payload)
+    out = {
+        "snapshot_date": row.snapshot_date.isoformat(),
+        "snapshot_utc": row.snapshot_utc.isoformat() if row.snapshot_utc else None,
+        "counts": {"accounts": len(accounts), "opportunities": len(opportunities), "opportunity_line_items": len(line_items)},
+        "carr_summary": {"grand_total": arr_data.get("grand_total"), "accounts_with_arr": len(arr_data.get("rows") or [])},
+    }
+    if full:
+        out["payload"] = payload
+    return out
+
+
 @app.post("/api/salesforce/eod-snapshots/take")
 async def take_eod_snapshot_now(db: AsyncSession = Depends(get_db)):
     """

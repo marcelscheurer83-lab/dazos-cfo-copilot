@@ -82,9 +82,13 @@ export default function Renewals() {
       .then((res) => {
         if (res.ok) {
           setSyncStatus('ok')
-          setSyncMessage(
-            res.message ?? `Synced ${res.synced_opportunities ?? 0} opportunities, ${res.synced_line_items ?? 0} product lines.`
-          )
+          let msg = res.message ?? `Synced ${res.synced_opportunities ?? 0} opportunities, ${res.synced_line_items ?? 0} product lines.`
+          if (res.renewal_date_field_configured !== undefined) {
+            msg += res.renewal_date_field_used
+              ? ' Renewal date field: in use.'
+              : ' Renewal date field: not used (check API name in Railway and restart backend).'
+          }
+          setSyncMessage(msg)
           loadData()
         } else {
           setSyncStatus('error')

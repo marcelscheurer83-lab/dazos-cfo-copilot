@@ -346,9 +346,11 @@ export async function syncSalesforce(): Promise<{
   synced_line_items?: number
   renewal_opportunities_count?: number
   message?: string
+  renewal_date_field_used?: boolean
+  renewal_date_field_configured?: boolean
 }> {
   const r = await apiFetch('/sync/salesforce', { method: 'POST' })
-  let data: { ok?: boolean; error?: string; detail?: unknown }
+  let data: { ok?: boolean; error?: string; detail?: unknown; renewal_date_field_used?: boolean; renewal_date_field_configured?: boolean }
   try {
     const text = await r.text()
     data = text ? JSON.parse(text) : {}
@@ -356,7 +358,7 @@ export async function syncSalesforce(): Promise<{
     return { ok: false, error: r.ok ? 'Invalid response from server.' : 'Sync failed. Restart the backend and try again.' }
   }
   if (!r.ok) return { ok: false, error: data.error || (Array.isArray(data.detail) ? data.detail.map((d: { msg?: string }) => d.msg).join(' ') : String(data.detail ?? 'Sync failed')) }
-  return data as { ok: boolean; error?: string; synced_opportunities?: number; synced_line_items?: number; renewal_opportunities_count?: number; message?: string }
+  return data as { ok: boolean; error?: string; synced_opportunities?: number; synced_line_items?: number; renewal_opportunities_count?: number; message?: string; renewal_date_field_used?: boolean; renewal_date_field_configured?: boolean }
 }
 
 export async function getKPI(asOf?: string): Promise<KPISummary> {

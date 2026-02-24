@@ -102,6 +102,9 @@ class RequireAppPasswordMiddleware(BaseHTTPMiddleware):
         # Read-only status check: list EOD snapshot dates (no sensitive data)
         if request.method == "GET" and request.url.path == "/api/salesforce/eod-snapshots":
             return await call_next(request)
+        # Debug endpoints: config and field names only, so you can open them in the browser without the password
+        if request.method == "GET" and request.url.path.startswith("/api/debug/"):
+            return await call_next(request)
         password = os.getenv("APP_PASSWORD")
         if not password:
             return await call_next(request)
@@ -865,6 +868,8 @@ async def _run_salesforce_sync(db: AsyncSession) -> dict:
         "synced_line_items": len(line_records),
         "renewal_opportunities_count": renewal_count,
         "message": msg,
+        "renewal_date_field_used": use_renewal_date_field,
+        "renewal_date_field_configured": bool(_SALESFORCE_RENEWAL_DATE_FIELD),
     }
 
 
@@ -2331,6 +2336,29 @@ async def delete_manual_overwrite(
     return {"ok": True, "opportunity_sf_id": opportunity_sf_id}
 
 
+@app.get("/api/debug/renewal-date-config")
+async def debug_renewal_date_config(db: AsyncSession = Depends(get_db)):
+    """
+    Debug: check if SALESFORCE_RENEWAL_DATE_FIELD is set and how many opportunities have renewal_date populated.
+    Call after adding the variable and running Sync to verify it worked.
+    """
+    configured = bool(_SALESFORCE_RENEWAL_DATE_FIELD)
+    field_name = _SALESFORCE_RENEWAL_DATE_FIELD or "(not set)"
+    q_total = select(func.count(Opportunity.id))
+    r_total = await db.execute(q_total)
+    total = r_total.scalar() or 0
+    q_with_date = select(func.count(Opportunity.id)).where(Opportunity.renewal_date.isnot(None))
+    r_with = await db.execute(q_with_date)
+    with_date = r_with.scalar() or 0
+    return {
+        "renewal_date_field_configured": configured,
+        "renewal_date_field_name": field_name,
+        "opportunities_total": total,
+        "opportunities_with_renewal_date": with_date,
+        "hint": "Set SALESFORCE_RENEWAL_DATE_FIELD (e.g. Renewal_Date__c) in Railway, redeploy/restart, then Sync from Salesforce."
+    }
+
+
 @app.get("/api/debug/salesforce-opportunity-fields")
 async def debug_salesforce_opportunity_fields():
     """
@@ -2350,12 +2378,15 @@ async def debug_salesforce_opportunity_fields():
         rec = opp_records[0]
         all_keys = sorted(rec.keys())
         acv_like = {k: rec.get(k) for k in all_keys if "acv" in (k or "").lower() or "original" in (k or "").lower()}
+        renewal_like = {k: rec.get(k) for k in all_keys if "renewal" in (k or "").lower() or "renewal_date" in (k or "").lower()}
         return {
             "soql": soql,
             "record_count": len(opp_records),
             "first_record_keys": all_keys,
             "acv_related_fields": acv_like,
+            "renewal_related_fields": renewal_like,
             "configured_ufr_field": _SALESFORCE_UFR_ARR_FIELD,
+            "configured_renewal_date_field": _SALESFORCE_RENEWAL_DATE_FIELD or "(not set)",
         }
     except Exception as e:
         return {"error": str(e)}

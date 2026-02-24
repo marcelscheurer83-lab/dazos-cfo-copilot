@@ -48,6 +48,8 @@ from schemas import (
     BookingsMTDResponse,
     BookingsMTDRow,
     BookingsPeriod,
+    RenewalsMTDResponse,
+    RenewalsMTDPeriod,
 )
 from seed_data import seed
 
@@ -1174,6 +1176,32 @@ def _to_float_sheet(x) -> Optional[float]:
     return None
 
 
+def _to_float_sheet_pct(x) -> Optional[float]:
+    """Like _to_float_sheet but also strips '%' so '60%' or '60' parses; for renewal rate plan cells."""
+    if x is None:
+        return None
+    if isinstance(x, (int, float)):
+        return float(x)
+    if isinstance(x, str) and x.strip():
+        s = x.replace(",", "").strip().rstrip("%").strip()
+        if not s:
+            return None
+        try:
+            return float(s)
+        except ValueError:
+            return None
+    return None
+
+
+def _normalize_renewal_rate_pct(val: Optional[float]) -> Optional[float]:
+    """If sheet stores renewal rate as decimal (e.g. 0.588 for 58.8%), convert to percentage."""
+    if val is None:
+        return None
+    if 0 < val <= 1:
+        return val * 100
+    return val
+
+
 def _bookings_row(mtd: float, plan_val: Optional[float]) -> BookingsMTDRow:
     achievement_pct = (mtd / plan_val * 100) if plan_val and plan_val != 0 else None
     delta_k = (mtd - plan_val) / 1000.0 if plan_val is not None else None
@@ -1218,6 +1246,77 @@ async def _closed_won_arr_in_range(
         elif rt == "expansion":
             exp += arr
     return nb + exp, nb, exp
+
+
+async def _renewals_metrics_in_range(
+    db: AsyncSession,
+    first_day: date,
+    last_day: date,
+) -> tuple[float, float, float, float, float, Optional[float]]:
+    """Return (total, renewed, open, churn, contracted, renewal_rate_pct) for renewals with renewal_date in [first_day, last_day].
+    Definitions (consistent with Renewals overview):
+    - Up for renewal (total) = sum of all UFR ARR for opps with renewal date in month
+    - Open = UFR ARR for opps not closed won yet (open stage)
+    - Churned = UFR ARR for all closed lost
+    - Contracted = sum of |delta| for closed won with negative delta (UFR - renewed)
+    - Renewed = sum of UFR for closed won with 0 or positive delta (renewed amount when no contraction)
+    Then total = open + churned + contracted + renewed. Renewal rate = renewed / total (up for renewal) * 100.
+    """
+    overrides = await _get_record_type_overrides(db)
+
+    def _effective_record_type(o: Opportunity) -> str:
+        key = (o.sf_id or "").strip()
+        override = overrides.get(key) or (overrides.get(key[:15]) if len(key) >= 15 else None)
+        return (override or o.record_type_name or "").strip() or "—"
+
+    def _renewal_date(o) -> date | None:
+        return o.renewal_date if (getattr(o, "renewal_date", None) and o.renewal_date) else o.close_date
+
+    q = select(Opportunity).where(Opportunity.record_type_name.isnot(None))
+    r = await db.execute(q)
+    all_opps = [o for o in r.scalars().all() if _is_renewal_record_type(_effective_record_type(o))]
+    in_range = [o for o in all_opps if _renewal_date(o) and first_day <= _renewal_date(o) <= last_day]
+    if not in_range:
+        return 0.0, 0.0, 0.0, 0.0, 0.0, None
+    sf_ids = {o.sf_id for o in in_range}
+    opp_to_arr = await _compute_arr_from_line_items(db, sf_ids)
+    open_arr = 0.0
+    churned = 0.0
+    contracted = 0.0
+    renewed = 0.0
+    for o in in_range:
+        arr_from_lines = opp_to_arr.get(o.sf_id, 0)
+        stage = (o.stage_name or "").strip()
+        if stage == "Closed Won":
+            ufr_val = float(o.original_acv) if getattr(o, "original_acv", None) is not None else None
+            ufr = (ufr_val if ufr_val is not None else arr_from_lines) or 0
+            renewed_arr = arr_from_lines
+            delta = renewed_arr - ufr
+            if delta >= 0:
+                renewed += ufr
+            else:
+                contracted += -delta  # UFR - renewed
+                renewed += renewed_arr  # renewed part (so contracted + renewed = UFR for this opp)
+        elif stage == "Closed Lost":
+            ufr = arr_from_lines
+            churned += ufr
+        else:
+            open_arr += arr_from_lines
+    # Total = sum of all UFR in period; must equal open + churned + contracted + renewed
+    total = open_arr + churned + contracted + renewed
+    renewal_rate_pct = (renewed / total * 100) if total > 0 else None
+    return total, renewed, open_arr, churned, contracted, renewal_rate_pct
+
+
+def _renewals_period_row(mtd: float, plan_val: Optional[float], is_pct: bool = False) -> BookingsMTDRow:
+    """Build a row; for is_pct=True mtd/plan are percentages (renewal rate)."""
+    if is_pct:
+        achievement_pct = (mtd / plan_val * 100) if plan_val and plan_val != 0 else None
+        delta_k = (mtd - plan_val) if plan_val is not None else None  # percentage point delta
+    else:
+        achievement_pct = (mtd / plan_val * 100) if plan_val and plan_val != 0 else None
+        delta_k = (mtd - plan_val) / 1000.0 if plan_val is not None else None
+    return BookingsMTDRow(mtd=mtd, plan=plan_val, achievement_pct=achievement_pct, delta_k=delta_k)
 
 
 @app.get("/api/dashboard/bookings-mtd", response_model=BookingsMTDResponse)
@@ -1317,6 +1416,141 @@ async def get_dashboard_bookings_mtd(db: AsyncSession = Depends(get_db)):
             new_business=_bookings_row(qtd_nb, q_nb),
             expansion=_bookings_row(qtd_exp, q_exp),
         ),
+        plan_source=plan_source,
+        plan_message=plan_message,
+    )
+
+
+# ARR_Calculations_2026P: row 52 = renewal rate %, row 54 = contraction rate % (Jan..Dec = BU..CF; Q1..Q4 = X,Y,Z,AA). Churn plan = up for renewal - renewed plan - contraction plan.
+ARR_2026P_RENEWALS_PLAN_ROWS = (12, 13, 51)  # 0-based: row 13, 14, 52 -> churn $ (unused), contraction $ (unused), renewal_rate_pct
+ARR_2026P_ROW_CONTRACTION_RATE = 53  # 0-based row 54 = contraction rate %
+ARR_2026P_QUARTER_RR_COLUMNS = ("X", "Y", "Z", "AA")  # Q1..Q4 renewal rate and contraction rate in row 52 / 54
+
+
+@app.get("/api/dashboard/renewals-mtd", response_model=RenewalsMTDResponse)
+async def get_dashboard_renewals_mtd(db: AsyncSession = Depends(get_db)):
+    """
+    Renewals metrics: previous month, current MTD, QTD. Total, Renewed, Open, Churn, Contraction, Renewal rate (ARR-based).
+    Plan from sheet: row 52 = renewal rate %, row 54 = contraction rate % (Jan..Dec = BU..CF; Q1..Q4 = X,Y,Z,AA). Churn plan = up for renewal - renewed plan - contraction plan.
+    """
+    now_est = datetime.now(EST)
+    year, month = now_est.year, now_est.month
+    today = now_est.date()
+
+    if month == 1:
+        prev_first = date(year - 1, 12, 1)
+        prev_last = date(year - 1, 12, 31)
+        prev_label = datetime(year - 1, 12, 1).strftime("%b %y")
+    else:
+        prev_first = date(year, month - 1, 1)
+        prev_last = date(year, month - 1, 1) + timedelta(days=32)
+        prev_last = (prev_last.replace(day=1) - timedelta(days=1))
+        prev_label = datetime(year, month - 1, 1).strftime("%b %y")
+
+    first_of_month = date(year, month, 1)
+    # Use full month range so cohort matches renewals overview (open + churn + renewed for the whole month)
+    last_of_month = (first_of_month + timedelta(days=32)).replace(day=1) - timedelta(days=1)
+    current_mtd_last = last_of_month
+    current_label = now_est.strftime("%b %y") + " MTD"
+
+    quarter_month = ((month - 1) // 3) * 3 + 1
+    qtd_first = date(year, quarter_month, 1)
+    # Full quarter range so QTD cohort matches quarter (like current month uses full month)
+    qtd_last = (date(year, quarter_month + 3, 1) - timedelta(days=1)) if quarter_month <= 9 else date(year, 12, 31)
+    qtd_label = f"Q{(quarter_month - 1) // 3 + 1} {str(year)[2:]} QTD"
+
+    # Plan: renewal_rate (row 52), contraction rate % (row 54) by month; churn plan = up for renewal - renewed plan - contraction plan
+    plan_renewal_rate_by_month: list[Optional[float]] = [None] * 12
+    plan_contraction_rate_by_month: list[Optional[float]] = [None] * 12
+    q_rr_plan: Optional[float] = None
+    q_cont_rate: Optional[float] = None
+    plan_source: Optional[str] = None
+    plan_message: Optional[str] = None
+    sheet_range = "ARR_Calculations_2026P!A1:ZZ1000"
+    r_snap = await db.execute(
+        select(SheetSnapshot).where(SheetSnapshot.range_name == sheet_range).order_by(SheetSnapshot.as_of.desc()).limit(1)
+    )
+    snap = r_snap.scalar_one_or_none()
+    if snap and snap.data_json:
+        data = json.loads(snap.data_json)
+        try:
+            # Sheets API returns variable-length rows (trailing empty cells omitted). Pad to max row
+            # length so we can read BU/BV (Jan/Feb) on row 52 same as row 11/12 for bookings.
+            max_cols = max(len(row) for row in data) if data else 0
+            if max_cols > 0:
+                data = [list(row) + [None] * (max_cols - len(row)) for row in data]
+            for m in range(12):
+                col_idx = _a1_col_to_index(ARR_2026P_MONTH_COLUMNS[m])
+                # Renewal rate % from row 52
+                rr_row = data[51] if len(data) > 51 else []
+                v = rr_row[col_idx] if col_idx < len(rr_row) else None
+                val = _to_float_sheet_pct(v)
+                plan_renewal_rate_by_month[m] = _normalize_renewal_rate_pct(val)
+                # Contraction rate % from row 54
+                cr_row = data[ARR_2026P_ROW_CONTRACTION_RATE] if len(data) > ARR_2026P_ROW_CONTRACTION_RATE else []
+                v_c = cr_row[col_idx] if col_idx < len(cr_row) else None
+                val_c = _to_float_sheet_pct(v_c)
+                norm_c = _normalize_renewal_rate_pct(val_c)
+                plan_contraction_rate_by_month[m] = (norm_c * -1) if norm_c is not None else None
+            # Q1..Q4 renewal rate and contraction rate from row 52 and 54: X, Y, Z, AA
+            q_num = (quarter_month - 1) // 3  # 0..3 for Q1..Q4
+            if q_num < len(ARR_2026P_QUARTER_RR_COLUMNS):
+                col_idx = _a1_col_to_index(ARR_2026P_QUARTER_RR_COLUMNS[q_num])
+                rr_row = data[51] if len(data) > 51 else []
+                if col_idx < len(rr_row):
+                    val = _to_float_sheet_pct(rr_row[col_idx])
+                    q_rr_plan = _normalize_renewal_rate_pct(val)
+                cr_row = data[ARR_2026P_ROW_CONTRACTION_RATE] if len(data) > ARR_2026P_ROW_CONTRACTION_RATE else []
+                if col_idx < len(cr_row):
+                    val_c = _to_float_sheet_pct(cr_row[col_idx])
+                    norm_c = _normalize_renewal_rate_pct(val_c)
+                    q_cont_rate = (norm_c * -1) if norm_c is not None else None
+            plan_source = "ARR_Calculations_2026P"
+        except (TypeError, ValueError, IndexError):
+            plan_message = "Could not read renewal plan from sheet."
+    else:
+        plan_message = "No sheet snapshot. Sync ARR_Calculations_2026P first."
+
+    # If renewal rate plan is missing but sheet loaded, hint that row 52 must extend to BU/BV (Jan/Feb)
+    if plan_message is None and plan_source and all(plan_renewal_rate_by_month[i] is None for i in range(12)) and q_rr_plan is None:
+        plan_message = "Renewal rate plan: add values in row 52 at BU (Jan), BV (Feb), X (Q1), then re-sync sheet."
+
+    prev_t, prev_r, prev_o, prev_ch, prev_cont, prev_rr = await _renewals_metrics_in_range(db, prev_first, prev_last)
+    mtd_t, mtd_r, mtd_o, mtd_ch, mtd_cont, mtd_rr = await _renewals_metrics_in_range(db, first_of_month, current_mtd_last)
+    qtd_t, qtd_r, qtd_o, qtd_ch, qtd_cont, qtd_rr = await _renewals_metrics_in_range(db, qtd_first, qtd_last)
+
+    prev_m = (month - 2 + 12) % 12
+    c_m = month - 1
+    if q_rr_plan is None:
+        q_rr_vals = [plan_renewal_rate_by_month[i] for i in range(quarter_month - 1, min(quarter_month + 2, 12)) if plan_renewal_rate_by_month[i] is not None]
+        q_rr_plan = sum(q_rr_vals) / len(q_rr_vals) if q_rr_vals else None
+    if q_cont_rate is None:
+        q_cr_vals = [plan_contraction_rate_by_month[i] for i in range(quarter_month - 1, min(quarter_month + 2, 12)) if plan_contraction_rate_by_month[i] is not None]
+        q_cont_rate = sum(q_cr_vals) / len(q_cr_vals) if q_cr_vals else None
+
+    def period(
+        label: str,
+        t: float, r: float, o: float, ch: float, cont: float, rr: Optional[float],
+        cont_rate: Optional[float], rr_plan: Optional[float],
+    ) -> RenewalsMTDPeriod:
+        # Up for renewal plan = actual. Renewed plan = rr_plan × up for renewal. Contraction plan = cont_rate × up for renewal. Churn plan = up for renewal - renewed plan - contraction plan.
+        renewed_plan = (rr_plan / 100.0 * t) if rr_plan is not None else None
+        cont_plan = (cont_rate / 100.0 * t) if cont_rate is not None else None
+        ch_plan = (t - renewed_plan - cont_plan) if (renewed_plan is not None and cont_plan is not None) else None
+        return RenewalsMTDPeriod(
+            period_label=label,
+            total=_renewals_period_row(t, t),  # plan = actual
+            renewed=_renewals_period_row(r, renewed_plan),
+            open=_renewals_period_row(o, None),
+            churn=_renewals_period_row(ch, ch_plan),
+            contraction=_renewals_period_row(cont, cont_plan),
+            renewal_rate=_renewals_period_row(rr or 0, rr_plan, is_pct=True),
+        )
+
+    return RenewalsMTDResponse(
+        previous_month=period(prev_label, prev_t, prev_r, prev_o, prev_ch, prev_cont, prev_rr, plan_contraction_rate_by_month[prev_m], plan_renewal_rate_by_month[prev_m]),
+        current_mtd=period(current_label, mtd_t, mtd_r, mtd_o, mtd_ch, mtd_cont, mtd_rr, plan_contraction_rate_by_month[c_m], plan_renewal_rate_by_month[c_m]),
+        qtd=period(qtd_label, qtd_t, qtd_r, qtd_o, qtd_ch, qtd_cont, qtd_rr, q_cont_rate, q_rr_plan if q_rr_plan else None),
         plan_source=plan_source,
         plan_message=plan_message,
     )

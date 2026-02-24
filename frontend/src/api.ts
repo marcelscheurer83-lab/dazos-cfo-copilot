@@ -194,6 +194,30 @@ export async function getDashboardBookingsMTD(): Promise<BookingsMTDResponse> {
   return r.json()
 }
 
+export type RenewalsMTDPeriod = {
+  period_label?: string
+  total: BookingsMTDRow
+  renewed: BookingsMTDRow
+  open: BookingsMTDRow
+  churn: BookingsMTDRow
+  contraction: BookingsMTDRow
+  renewal_rate: BookingsMTDRow
+}
+
+export type RenewalsMTDResponse = {
+  previous_month: RenewalsMTDPeriod
+  current_mtd: RenewalsMTDPeriod
+  qtd: RenewalsMTDPeriod
+  plan_source: string | null
+  plan_message: string | null
+}
+
+export async function getDashboardRenewalsMTD(): Promise<RenewalsMTDResponse> {
+  const r = await apiFetch('/dashboard/renewals-mtd')
+  if (!r.ok) throw new Error('Failed to fetch renewals MTD')
+  return r.json()
+}
+
 export async function getARRExamples(limit = 10): Promise<ARRExamplesResponse> {
   const r = await apiFetch(`/dashboard-kpi/arr-examples?limit=${limit}`)
   if (!r.ok) throw new Error('Failed to fetch ARR examples')

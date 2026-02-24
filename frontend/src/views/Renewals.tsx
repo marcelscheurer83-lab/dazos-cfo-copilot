@@ -155,7 +155,7 @@ export default function Renewals() {
     return { months, stages, arrMap, countMap, stageColors }
   }, [rows, last6Months])
 
-  // Right chart: Renewed = Closed Won, Lost = Closed Lost, Open = open. Renewal rate = closed won / (closed won + closed lost).
+  // Right chart: Renewed = Closed Won, Lost = Closed Lost, Open = open. Renewal rate = renewed / (renewed + open + lost).
   const chartDataByStageCount = useMemo(() => {
     const monthSet = new Set(last6Months)
     const arrMap = new Map<string, Map<string, number>>()
@@ -521,7 +521,7 @@ export default function Renewals() {
                   </div>
                 </div>
               </div>
-              {/* Renewal rate row (left): Renewed / (Renewed + Churned) */}
+              {/* Renewal rate row (left): Renewed / Up for renewal (renewed + churned + open) */}
               <div style={{ display: 'flex', gap: 0, marginTop: '0.5rem', alignItems: 'center', fontSize: '0.75rem' }}>
                 <div style={{ width: 40, flexShrink: 0, paddingRight: 8, paddingLeft: 0, color: 'var(--text-muted)', textAlign: 'left' }}>Renewal rate</div>
                 <div style={{ flex: 1, minWidth: 0, paddingLeft: 4, display: 'flex', gap: '0.25rem' }}>
@@ -529,11 +529,12 @@ export default function Renewals() {
                     const stageMap = chartDataByStage.arrMap.get(month)!
                     const renewed = stageMap.get('Renewed') ?? 0
                     const churned = stageMap.get('Churned/ contracted') ?? 0
-                    const closed = renewed + churned
-                    const rate = closed > 0 ? (renewed / closed) * 100 : null
+                    const open = stageMap.get('Open') ?? 0
+                    const upForRenewal = renewed + churned + open
+                    const rate = upForRenewal > 0 ? (renewed / upForRenewal) * 100 : null
                     return (
                       <div key={month} style={{ flex: 1, textAlign: 'center', fontWeight: 600, color: rate != null ? 'var(--text)' : 'var(--text-muted)' }}>
-                        {rate != null ? `${Math.round(rate)}%` : '—'}
+                        {rate != null ? `${rate.toFixed(1)}%` : '—'}
                       </div>
                     )
                   })}
@@ -619,19 +620,20 @@ export default function Renewals() {
                   </div>
                 </div>
               </div>
-              {/* Renewal rate row: Closed Won / (Closed Won + Closed Lost) */}
+              {/* Renewal rate row: Renewed / (Renewed + Open + Lost) */}
               <div style={{ display: 'flex', gap: 0, marginTop: '0.5rem', alignItems: 'center', fontSize: '0.75rem' }}>
                 <div style={{ width: 36, flexShrink: 0, paddingRight: 8, paddingLeft: 0, color: 'var(--text-muted)', textAlign: 'left' }}>Renewal rate</div>
                 <div style={{ flex: 1, minWidth: 0, paddingLeft: 4, display: 'flex', gap: '0.25rem' }}>
                   {chartDataByStageCount.months.map((month) => {
                     const countStageMap = chartDataByStageCount.countMap.get(month)!
-                    const won = countStageMap.get('Renewed') ?? 0
+                    const renewed = countStageMap.get('Renewed') ?? 0
+                    const open = countStageMap.get('Open') ?? 0
                     const lost = countStageMap.get('Lost') ?? 0
-                    const closed = won + lost
-                    const rate = closed > 0 ? (won / closed) * 100 : null
+                    const upForRenewal = renewed + open + lost
+                    const rate = upForRenewal > 0 ? (renewed / upForRenewal) * 100 : null
                     return (
                       <div key={month} style={{ flex: 1, textAlign: 'center', fontWeight: 600, color: rate != null ? 'var(--text)' : 'var(--text-muted)' }}>
-                        {rate != null ? `${Math.round(rate)}%` : '—'}
+                        {rate != null ? `${rate.toFixed(1)}%` : '—'}
                       </div>
                     )
                   })}

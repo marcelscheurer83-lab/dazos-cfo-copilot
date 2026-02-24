@@ -1534,13 +1534,28 @@ async def get_dashboard_bookings_mtd(db: AsyncSession = Depends(get_db)):
     pipeline_mtd_tot = pipeline_mtd_nb + pipeline_mtd_exp
     pipeline_qtd_nb, pipeline_qtd_exp = await _open_pipeline_arr_by_record_type_in_range(db, qtd_first, last_day_quarter)
     pipeline_qtd_tot = pipeline_qtd_nb + pipeline_qtd_exp
-    # Shortfall in same unit as plan/actual (dollars); dashboard displays plan/actual in $K via fmtK
-    shortfall_mtd_tot = max(0, (c_tot or 0) - mtd_total)
-    shortfall_mtd_nb = max(0, (c_nb or 0) - mtd_nb)
-    shortfall_mtd_exp = max(0, (c_exp or 0) - mtd_exp)
-    shortfall_qtd_tot = max(0, q_tot - qtd_total)
-    shortfall_qtd_nb = max(0, q_nb - qtd_nb)
-    shortfall_qtd_exp = max(0, q_exp - qtd_exp)
+    # Shortfall: plan and actuals must be in same unit (dollars). If sheet stores plan in $K, normalize to dollars for shortfall so pipe coverage computes.
+    def _plan_dollars(plan_val: Optional[float], actual: float) -> float:
+        if plan_val is None:
+            return 0.0
+        if actual > 0 and 0 < plan_val < actual / 100:
+            return plan_val * 1000.0
+        if actual == 0 and 0 < plan_val < 10000:
+            return plan_val * 1000.0
+        return plan_val
+
+    c_tot_d = _plan_dollars(c_tot, mtd_total)
+    c_nb_d = _plan_dollars(c_nb, mtd_nb)
+    c_exp_d = _plan_dollars(c_exp, mtd_exp)
+    q_tot_d = _plan_dollars(q_tot, qtd_total)
+    q_nb_d = _plan_dollars(q_nb, qtd_nb)
+    q_exp_d = _plan_dollars(q_exp, qtd_exp)
+    shortfall_mtd_tot = max(0, c_tot_d - mtd_total)
+    shortfall_mtd_nb = max(0, c_nb_d - mtd_nb)
+    shortfall_mtd_exp = max(0, c_exp_d - mtd_exp)
+    shortfall_qtd_tot = max(0, q_tot_d - qtd_total)
+    shortfall_qtd_nb = max(0, q_nb_d - qtd_nb)
+    shortfall_qtd_exp = max(0, q_exp_d - qtd_exp)
     pipe_cov_mtd_tot = round(pipeline_mtd_tot / shortfall_mtd_tot, 2) if shortfall_mtd_tot > 0 else None
     pipe_cov_mtd_nb = round(pipeline_mtd_nb / shortfall_mtd_nb, 2) if shortfall_mtd_nb > 0 else None
     pipe_cov_mtd_exp = round(pipeline_mtd_exp / shortfall_mtd_exp, 2) if shortfall_mtd_exp > 0 else None
@@ -1556,6 +1571,9 @@ async def get_dashboard_bookings_mtd(db: AsyncSession = Depends(get_db)):
             expansion=_bookings_row(prev_exp, p_exp),
             expansion_mid_term=prev_exp_mid_term,
             expansion_upon_renewal=prev_exp_upon_renewal,
+            pipe_coverage_total=None,
+            pipe_coverage_new_business=None,
+            pipe_coverage_expansion=None,
         ),
         current_mtd=BookingsPeriod(
             period_label=current_label,

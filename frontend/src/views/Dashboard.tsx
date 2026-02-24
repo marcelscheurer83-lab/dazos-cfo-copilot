@@ -205,7 +205,10 @@ function BookingsMTDBlock({ data, sheetSyncError }: { data: BookingsMTDResponse;
         </p>
       )}
       <div style={{ display: 'grid', gridTemplateColumns: `repeat(${periods.length}, 1fr)`, gap: '1.5rem', minWidth: 0 }}>
-        {periods.map((period) => (
+        {periods.map((period, idx) => {
+          const showPipeCov = idx > 0 // only MTD & QTD
+          const isFirstBlock = idx === 0
+          return (
           <div key={period.period_label}>
             <div style={{ fontSize: '0.75rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '0.5rem' }}>
               {period.period_label}
@@ -213,24 +216,37 @@ function BookingsMTDBlock({ data, sheetSyncError }: { data: BookingsMTDResponse;
             <table style={{ width: '100%', fontSize: '0.8rem', borderCollapse: 'collapse' }}>
               <thead>
                 <tr style={{ borderBottom: '1px solid var(--border)' }}>
-                  <th style={{ textAlign: 'left', padding: '0.25rem 0.5rem 0.25rem 0', fontWeight: 500, color: 'var(--text-muted)' }} />
-                  <th style={{ textAlign: 'right', padding: '0.25rem 0.5rem', fontWeight: 500, color: 'var(--text-muted)' }}>{periodValueColumnLabel(period.period_label)}</th>
+                  <th style={{ textAlign: 'left', padding: '0.25rem 0.5rem 0.25rem 0', fontWeight: 500, color: 'var(--text-muted)' }}>
+                    {isFirstBlock && (
+                      <>
+                        <br />
+                        &nbsp;
+                      </>
+                    )}
+                  </th>
+                  <th style={{ textAlign: 'right', padding: '0.25rem 0.5rem', fontWeight: 500, color: 'var(--text-muted)' }}>
+                    {periodValueColumnLabel(period.period_label)}
+                  </th>
                   <th style={{ textAlign: 'right', padding: '0.25rem 0.5rem', fontWeight: 500, color: 'var(--text-muted)' }}>Plan</th>
                   <th style={{ textAlign: 'right', padding: '0.25rem 0', fontWeight: 500, color: 'var(--text-muted)' }}>%</th>
-                  <th style={{ textAlign: 'right', padding: '0.25rem 0', fontWeight: 500, color: 'var(--text-muted)' }}>Δ $K</th>
-                  <th style={{ textAlign: 'right', padding: '0.25rem 0', fontWeight: 500, color: 'var(--text-muted)' }}>Pipe cov.</th>
+                  <th style={{ textAlign: 'right', padding: '0.25rem 0', fontWeight: 500, color: 'var(--text-muted)' }}>Δ</th>
+                  {showPipeCov && (
+                    <th style={{ textAlign: 'right', padding: '0.25rem 0', fontWeight: 500, color: 'var(--text-muted)' }}>
+                      Pipe cov.
+                    </th>
+                  )}
                 </tr>
               </thead>
               <tbody>
-                <MTDRow label="Total" row={period.total} pipeCoverage={period.pipe_coverage_total ?? null} />
-                <MTDRow label="New business" row={period.new_business} pipeCoverage={period.pipe_coverage_new_business ?? null} />
-                <MTDRow label="Expansion" row={period.expansion} pipeCoverage={period.pipe_coverage_expansion ?? null} />
-                <MTDRowSub label="Mid-term" value={period.expansion_mid_term ?? 0} />
-                <MTDRowSub label="Upon renewal" value={period.expansion_upon_renewal ?? 0} />
+                <MTDRow label="Total" row={period.total} pipeCoverage={period.pipe_coverage_total ?? null} showPipeCov={showPipeCov} />
+                <MTDRow label="New business" row={period.new_business} pipeCoverage={period.pipe_coverage_new_business ?? null} showPipeCov={showPipeCov} />
+                <MTDRow label="Expansion" row={period.expansion} pipeCoverage={period.pipe_coverage_expansion ?? null} showPipeCov={showPipeCov} />
+                <MTDRowSub label="Mid-term" value={period.expansion_mid_term ?? 0} showPipeCov={showPipeCov} />
+                <MTDRowSub label="Upon renewal" value={period.expansion_upon_renewal ?? 0} showPipeCov={showPipeCov} />
               </tbody>
             </table>
           </div>
-        ))}
+        )})}
       </div>
     </>
   )
@@ -240,7 +256,17 @@ function fmtPipeCoverage(value: number | null): string {
   return value != null ? `${value.toFixed(1)}×` : '—'
 }
 
-function MTDRow({ label, row, pipeCoverage }: { label: string; row: BookingsMTDRow; pipeCoverage?: number | null }) {
+function MTDRow({
+  label,
+  row,
+  pipeCoverage,
+  showPipeCov,
+}: {
+  label: string
+  row: BookingsMTDRow
+  pipeCoverage?: number | null
+  showPipeCov?: boolean
+}) {
   const deltaColor = row.delta_k != null ? (row.delta_k >= 0 ? 'var(--positive)' : 'var(--negative)') : 'var(--text-muted)'
   return (
     <tr style={{ borderBottom: '1px solid var(--border)' }}>
@@ -251,21 +277,36 @@ function MTDRow({ label, row, pipeCoverage }: { label: string; row: BookingsMTDR
       </td>
       <td style={{ textAlign: 'right', padding: '0.35rem 0.5rem', color: 'var(--text)' }}>{fmtPct(row.achievement_pct)}</td>
       <td style={{ textAlign: 'right', padding: '0.35rem 0', color: deltaColor }}>{fmtDeltaK(row.delta_k)}</td>
-      <td style={{ textAlign: 'right', padding: '0.35rem 0', color: 'var(--text)' }}>{fmtPipeCoverage(pipeCoverage ?? null)}</td>
+      {showPipeCov && (
+        <td style={{ textAlign: 'right', padding: '0.35rem 0', color: 'var(--text)' }}>
+          {fmtPipeCoverage(pipeCoverage ?? null)}
+        </td>
+      )}
     </tr>
   )
 }
 
-/** Indented sub-row: value only in first data column, no plan/%/delta/pipe coverage */
-function MTDRowSub({ label, value }: { label: string; value: number }) {
+/** Indented sub-row: value only in first data column, no plan/%/delta; optional empty pipe cov cell for alignment */
+function MTDRowSub({ label, value, showPipeCov }: { label: string; value: number; showPipeCov?: boolean }) {
   return (
     <tr style={{ borderBottom: '1px solid var(--border)' }}>
-      <td style={{ padding: '0.35rem 0.5rem 0.35rem 0', color: 'var(--text-muted)', paddingLeft: '1.25rem' }}>{label}</td>
+      <td
+        style={{
+          padding: '0.35rem 0.5rem 0.35rem 0',
+          color: 'var(--text-muted)',
+          paddingLeft: '1.25rem',
+          whiteSpace: 'nowrap',
+        }}
+      >
+        {label}
+      </td>
       <td style={{ textAlign: 'right', padding: '0.35rem 0.5rem', color: 'var(--text)' }}>{fmtK(value)}</td>
       <td style={{ textAlign: 'right', padding: '0.35rem 0.5rem', color: 'var(--text-muted)' }}>—</td>
       <td style={{ textAlign: 'right', padding: '0.35rem 0.5rem', color: 'var(--text-muted)' }}>—</td>
       <td style={{ textAlign: 'right', padding: '0.35rem 0', color: 'var(--text-muted)' }}>—</td>
-      <td style={{ textAlign: 'right', padding: '0.35rem 0', color: 'var(--text-muted)' }}>—</td>
+      {showPipeCov && (
+        <td style={{ textAlign: 'right', padding: '0.35rem 0', color: 'var(--text-muted)' }}>—</td>
+      )}
     </tr>
   )
 }

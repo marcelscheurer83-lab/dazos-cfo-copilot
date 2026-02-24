@@ -364,9 +364,9 @@ export default function Closed() {
 
   return (
     <>
-      <h1 style={{ margin: '0 0 1.5rem', fontSize: '1.5rem', fontWeight: 600, color: 'var(--text)' }}>Bookings overview</h1>
+      <h1 style={{ margin: '0 0 1.5rem', fontSize: '1.5rem', fontWeight: 600, color: 'var(--text)' }}>New and Expansion Bookings Overview</h1>
       <p style={{ fontSize: '0.9rem', color: 'var(--text-muted)', marginBottom: '1rem' }}>
-        Closed Won and Closed Lost: New Business and Expansion only. ARR = MRR × 12 from Opportunity Finance Details.
+        Closed Won and Closed Lost: New Business and Expansion only. ARR from product line items (excl. iVerify/Kipu), same as Customer base.
       </p>
 
       {chartData.months.length > 0 && (

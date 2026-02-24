@@ -17,6 +17,8 @@ async def create_tables():
             "ALTER TABLE opportunities ADD COLUMN record_type_name VARCHAR(128)",
             "ALTER TABLE opportunity_line_items ADD COLUMN product_name VARCHAR(255)",
             "ALTER TABLE opportunities ADD COLUMN mrr FLOAT",
+            "ALTER TABLE opportunities ADD COLUMN renewal_date DATE",
+            "ALTER TABLE opportunities ADD COLUMN original_acv FLOAT",
         ]:
             try:
                 await conn.execute(text(stmt))

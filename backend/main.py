@@ -33,6 +33,7 @@ from models import (
     Account,
     Opportunity,
     OpportunityLineItem,
+    OpportunityRecordTypeOverride,
     QuickBooksReportSnapshot,
     SalesforceEODSnapshot,
 )
@@ -398,10 +399,29 @@ async def sync_google_sheets(
 # Default SOQL for opportunities (ARR / pipeline). RecordType.Name for ARR (renewals only). MRR from Finance Details.
 # If your MRR field has a different API name, set SALESFORCE_MRR_FIELD in .env (e.g. MRR__c).
 _SALESFORCE_MRR_FIELD = os.getenv("SALESFORCE_MRR_FIELD", "MRR__c").strip() or "MRR__c"
+# Optional: custom Renewal Date field on Opportunity (e.g. Renewal_Date__c). When set, renewals overview uses it instead of Close Date.
+_SALESFORCE_RENEWAL_DATE_FIELD = (os.getenv("SALESFORCE_RENEWAL_DATE_FIELD") or "").strip()
+# Optional: Original ACV = ARR up for renewal (UFR ARR), e.g. Original_ACV__c.
+_SALESFORCE_UFR_ARR_FIELD = (os.getenv("SALESFORCE_UFR_ARR_FIELD") or "Original_ACV__c").strip() or None
+def _opp_soql_extra_fields() -> str:
+    parts = []
+    if _SALESFORCE_RENEWAL_DATE_FIELD:
+        parts.append(_SALESFORCE_RENEWAL_DATE_FIELD)
+    if _SALESFORCE_UFR_ARR_FIELD:
+        parts.append(_SALESFORCE_UFR_ARR_FIELD)
+    return ", " + ", ".join(parts) if parts else ""
 DEFAULT_OPPORTUNITY_SOQL = (
     "SELECT Id, Name, Amount, CloseDate, StageName, Type, RecordType.Name, "
-    "Account.Id, Account.Name, CreatedDate, " + _SALESFORCE_MRR_FIELD + " "
-    "FROM Opportunity ORDER BY CloseDate DESC NULLS LAST"
+    "Account.Id, Account.Name, CreatedDate, " + _SALESFORCE_MRR_FIELD
+    + _opp_soql_extra_fields()
+    + " FROM Opportunity ORDER BY CloseDate DESC NULLS LAST"
+)
+# Fallback SOQL without renewal date field (used if that field is invalid in org). Still includes UFR (Original ACV) when set.
+DEFAULT_OPPORTUNITY_SOQL_NO_RENEWAL = (
+    "SELECT Id, Name, Amount, CloseDate, StageName, Type, RecordType.Name, "
+    "Account.Id, Account.Name, CreatedDate, " + _SALESFORCE_MRR_FIELD
+    + (", " + _SALESFORCE_UFR_ARR_FIELD if _SALESFORCE_UFR_ARR_FIELD else "")
+    + " FROM Opportunity ORDER BY CloseDate DESC NULLS LAST"
 )
 # Opportunity products: TotalPrice = MRR; ARR = MRR * 12. Product2.Name (or Name) for product columns.
 DEFAULT_OPPORTUNITY_LINE_ITEM_SOQL = (
@@ -477,12 +497,31 @@ def _is_arr_excluded_product(product_name: str | None) -> bool:
     return any(exc in key for exc in ARR_PRODUCT_EXCLUDE)
 
 
+def _include_line_item_in_arr(normalized_name: str | None, raw_product_name: str | None) -> bool:
+    """True if this line item should count toward ARR. Known ARR products (IQ Platform, Add. MR/IQ, etc.) are always included even if the name contains an exclude phrase (e.g. 'iq implementation')."""
+    if _match_arr_product(normalized_name) is not None or _match_arr_product(raw_product_name) is not None:
+        return True
+    if _is_arr_excluded_product(normalized_name) or _is_arr_excluded_product(raw_product_name):
+        return False
+    return True
+
+
+def _arr_product_key(name: str | None) -> str:
+    """Normalize product name for matching: collapse whitespace, normalize slashes, lower."""
+    if not name or not name.strip():
+        return ""
+    s = " ".join(name.split()).strip().lower()
+    s = s.replace(" / ", "/").replace(" /", "/").replace("/ ", "/")
+    return s
+
+
 def _match_arr_product(sf_product_name: str | None) -> str | None:
     """Map Salesforce product name to canonical ARR column, or None -> 'Other'. Uses SF-to-canonical map, then exact then contains match."""
     if not sf_product_name or not sf_product_name.strip():
         return None
-    raw = sf_product_name.strip()
-    key = raw.lower()
+    key = _arr_product_key(sf_product_name)
+    if not key:
+        return None
     # Check display-name overrides first (e.g. "Dazos CRM Platform (Legacy)" -> "CRM Platform")
     if key in _ARR_SF_TO_CANONICAL:
         return _ARR_SF_TO_CANONICAL[key]
@@ -499,6 +538,51 @@ def _match_arr_product(sf_product_name: str | None) -> str | None:
 
 # Stages that count as "closed" (excluded from pipeline and from renewal ARR).
 CLOSED_STAGES = frozenset({"Closed Won", "Closed Lost"})
+
+
+def _line_item_effective_total(li) -> float:
+    """Use total_price for ARR; when 0 or null, use unit_price * quantity (e.g. closed-opp line items from SF)."""
+    total = float(li.total_price or 0)
+    if total != 0:
+        return total
+    try:
+        return float(li.unit_price or 0) * float(li.quantity or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _line_item_effective_total_dict(li: dict) -> float:
+    """Same for line item dict (e.g. from EOD snapshot JSON)."""
+    total = float(li.get("total_price") or 0)
+    if total != 0:
+        return total
+    try:
+        return float(li.get("unit_price") or 0) * float(li.get("quantity") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+async def _compute_arr_from_line_items(db: AsyncSession, opportunity_sf_ids: set[str]) -> dict[str, float]:
+    """
+    Single source of truth: ARR per opportunity from product line items.
+    Same logic as Customer base: include line if _include_line_item_in_arr, sum effective total * ARR_MULTIPLIER.
+    Returns dict opportunity_sf_id -> ARR (rounded).
+    """
+    if not opportunity_sf_ids:
+        return {}
+    q = select(OpportunityLineItem).where(
+        OpportunityLineItem.opportunity_sf_id.in_(opportunity_sf_ids)
+    )
+    r = await db.execute(q)
+    out: dict[str, float] = {}
+    for li in r.scalars().all():
+        raw = _normalized_product_name(li.product_name)
+        if not _include_line_item_in_arr(raw, li.product_name):
+            continue
+        opp_sf_id = li.opportunity_sf_id
+        mrr = _line_item_effective_total(li)
+        out[opp_sf_id] = out.get(opp_sf_id, 0) + mrr * ARR_MULTIPLIER
+    return {k: round(v, 2) for k, v in out.items()}
 # Default SOQL for accounts. Add custom fields to the SELECT if needed.
 # Default segment when Salesforce Segment__c is empty.
 DEFAULT_SEGMENT = "SMB/ MM"
@@ -595,10 +679,43 @@ def _parse_datetime(s: Optional[str]) -> Optional[datetime]:
 def _float_or_none(x) -> Optional[float]:
     if x is None:
         return None
+    if isinstance(x, dict):
+        x = x.get("value", x.get("amount"))
     try:
         return float(x)
     except (TypeError, ValueError):
         return None
+
+
+def _original_acv_from_record(rec: dict) -> Optional[float]:
+    """Get Original ACV from a Salesforce opportunity record. Tries configured key, then Original_ACV__c, then case-insensitive match."""
+    candidates = []
+    if _SALESFORCE_UFR_ARR_FIELD and rec.get(_SALESFORCE_UFR_ARR_FIELD) is not None:
+        candidates.append(rec.get(_SALESFORCE_UFR_ARR_FIELD))
+    if rec.get("Original_ACV__c") is not None:
+        candidates.append(rec.get("Original_ACV__c"))
+    for key, value in rec.items():
+        if key and key.lower() == "original_acv__c" and value is not None:
+            candidates.append(value)
+            break
+    for v in candidates:
+        out = _float_or_none(v)
+        if out is not None:
+            return out
+    return None
+
+
+async def _salesforce_query_with_retry(connector, soql: str, max_attempts: int = 3):
+    """Run a Salesforce SOQL query with retries on connection errors (e.g. Remote end closed connection)."""
+    last_error = None
+    for attempt in range(max_attempts):
+        try:
+            return await asyncio.to_thread(connector.query, soql)
+        except Exception as e:
+            last_error = e
+            if attempt < max_attempts - 1:
+                await asyncio.sleep(2 + attempt)  # 2s, then 3s before next try
+    raise last_error
 
 
 async def _run_salesforce_sync(db: AsyncSession) -> dict:
@@ -613,7 +730,7 @@ async def _run_salesforce_sync(db: AsyncSession) -> dict:
         }
 
     try:
-        account_records = await asyncio.to_thread(connector.query, DEFAULT_ACCOUNT_SOQL)
+        account_records = await _salesforce_query_with_retry(connector, DEFAULT_ACCOUNT_SOQL)
     except Exception as e:
         return {"ok": False, "error": f"Accounts sync failed: {e}"}
     await db.execute(delete(Account))
@@ -643,11 +760,22 @@ async def _run_salesforce_sync(db: AsyncSession) -> dict:
         )
         db.add(acc)
 
+    opp_records = None
+    use_renewal_date_field = bool(_SALESFORCE_RENEWAL_DATE_FIELD)
     try:
-        opp_records = await asyncio.to_thread(connector.query, DEFAULT_OPPORTUNITY_SOQL)
+        opp_records = await _salesforce_query_with_retry(connector, DEFAULT_OPPORTUNITY_SOQL)
     except Exception as e:
-        await db.rollback()
-        return {"ok": False, "error": f"Opportunities sync failed: {e}"}
+        err_str = str(e)
+        if _SALESFORCE_RENEWAL_DATE_FIELD and ("INVALID_FIELD" in err_str or "No such column" in err_str):
+            try:
+                opp_records = await _salesforce_query_with_retry(connector, DEFAULT_OPPORTUNITY_SOQL_NO_RENEWAL)
+                use_renewal_date_field = False
+            except Exception as e2:
+                await db.rollback()
+                return {"ok": False, "error": f"Opportunities sync failed: {e2}"}
+        else:
+            await db.rollback()
+            return {"ok": False, "error": f"Opportunities sync failed: {e}"}
     await db.execute(delete(Opportunity))
     for rec in opp_records:
         sf_id = rec.get("Id")
@@ -657,11 +785,15 @@ async def _run_salesforce_sync(db: AsyncSession) -> dict:
         if rt is None and isinstance(rec.get("RecordType"), dict):
             rt = (rec.get("RecordType") or {}).get("Name") or (rec.get("RecordType") or {}).get("name")
         record_type_name = (rt or "").strip() or None
+        renewal_dt = _parse_date(rec.get(_SALESFORCE_RENEWAL_DATE_FIELD)) if use_renewal_date_field else None
+        original_acv_val = _original_acv_from_record(rec)
         opp = Opportunity(
             sf_id=sf_id,
             name=rec.get("Name"),
             amount=float(rec.get("Amount") or 0),
             close_date=_parse_date(rec.get("CloseDate")),
+            renewal_date=renewal_dt,
+            original_acv=original_acv_val,
             stage_name=rec.get("StageName"),
             type=rec.get("Type"),
             record_type_name=record_type_name,
@@ -673,7 +805,7 @@ async def _run_salesforce_sync(db: AsyncSession) -> dict:
         db.add(opp)
 
     try:
-        line_records = await asyncio.to_thread(connector.query, DEFAULT_OPPORTUNITY_LINE_ITEM_SOQL)
+        line_records = await _salesforce_query_with_retry(connector, DEFAULT_OPPORTUNITY_LINE_ITEM_SOQL)
     except Exception as e:
         await db.rollback()
         return {"ok": False, "error": f"OpportunityLineItem sync failed: {e}"}
@@ -683,13 +815,18 @@ async def _run_salesforce_sync(db: AsyncSession) -> dict:
         if not opp_sf_id:
             continue
         total = rec.get("TotalPrice")
-        if total is None:
-            try:
-                total = float(rec.get("UnitPrice") or 0) * float(rec.get("Quantity") or 0)
-            except (TypeError, ValueError):
-                total = 0
-        else:
+        if total is not None:
             total = float(total)
+        if total is None or total == 0:
+            try:
+                computed = float(rec.get("UnitPrice") or 0) * float(rec.get("Quantity") or 0)
+                if computed != 0:
+                    total = computed
+                elif total is None:
+                    total = 0
+            except (TypeError, ValueError):
+                if total is None:
+                    total = 0
         product_name = (
             rec.get("Product2_Name")
             or rec.get("Product2.Name")
@@ -718,13 +855,16 @@ async def _run_salesforce_sync(db: AsyncSession) -> dict:
     r_count = await db.execute(q_renewal_count)
     all_open = r_count.scalars().all()
     renewal_count = sum(1 for o in all_open if _is_renewal_record_type(o.record_type_name))
+    msg = "Accounts, opportunities, and opportunity products synced."
+    if _SALESFORCE_RENEWAL_DATE_FIELD and not use_renewal_date_field:
+        msg += " Renewal Date field not found in Salesforce; renewals use Close Date. Check Setup → Opportunity → Fields for the correct API name, or remove SALESFORCE_RENEWAL_DATE_FIELD from .env."
     return {
         "ok": True,
         "synced_accounts": len(account_records),
         "synced_opportunities": len(opp_records),
         "synced_line_items": len(line_records),
         "renewal_opportunities_count": renewal_count,
-        "message": "Accounts, opportunities, and opportunity products synced.",
+        "message": msg,
     }
 
 
@@ -734,7 +874,15 @@ async def sync_salesforce(db: AsyncSession = Depends(get_db)):
     Sync opportunities and accounts from Salesforce into the app.
     Requires SALESFORCE_USERNAME, SALESFORCE_PASSWORD, and SALESFORCE_SECURITY_TOKEN in .env.
     """
-    return await _run_salesforce_sync(db)
+    try:
+        result = await _run_salesforce_sync(db)
+        return result
+    except Exception as e:
+        await db.rollback()
+        return JSONResponse(
+            status_code=200,
+            content={"ok": False, "error": f"Sync failed: {e}"},
+        )
 
 
 @app.get("/api/salesforce/eod-snapshots")
@@ -771,18 +919,69 @@ async def take_eod_snapshot_now(db: AsyncSession = Depends(get_db)):
 
 
 async def _take_salesforce_eod_snapshot(db: AsyncSession) -> None:
-    """Store end-of-day snapshot of all Salesforce data (EST date, UTC timestamp). Caller must commit."""
+    """Store end-of-day snapshot of all Salesforce data (EST date, UTC timestamp). Caller must commit.
+    Captures applicable Salesforce IDs: account_sf_id for accounts, opportunity_sf_id and account_sf_id for opportunities, opportunity_sf_id for line items."""
     from datetime import timezone
 
     now_utc = datetime.now(timezone.utc)
     today_est = datetime.fromtimestamp(now_utc.timestamp(), tz=EST).date()
 
     r_acc = await db.execute(select(Account))
-    accounts = [{"sf_id": a.sf_id, "name": a.name, "type": a.type, "status": a.status, "segment": (a.segment or "").strip() or DEFAULT_SEGMENT, "industry": a.industry, "annual_revenue": a.annual_revenue, "number_of_employees": a.number_of_employees, "billing_country": a.billing_country, "billing_city": a.billing_city, "billing_state": a.billing_state, "phone": a.phone, "website": a.website, "created_date": a.created_date.isoformat() if a.created_date else None, "synced_at": a.synced_at.isoformat() if a.synced_at else None} for a in r_acc.scalars().all()]
+    accounts = [
+        {
+            "sf_id": a.sf_id,
+            "account_sf_id": a.sf_id,
+            "name": a.name,
+            "type": a.type,
+            "status": a.status,
+            "segment": (a.segment or "").strip() or DEFAULT_SEGMENT,
+            "industry": a.industry,
+            "annual_revenue": a.annual_revenue,
+            "number_of_employees": a.number_of_employees,
+            "billing_country": a.billing_country,
+            "billing_city": a.billing_city,
+            "billing_state": a.billing_state,
+            "phone": a.phone,
+            "website": a.website,
+            "created_date": a.created_date.isoformat() if a.created_date else None,
+            "synced_at": a.synced_at.isoformat() if a.synced_at else None,
+        }
+        for a in r_acc.scalars().all()
+    ]
     r_opp = await db.execute(select(Opportunity))
-    opportunities = [{"sf_id": o.sf_id, "name": o.name, "amount": o.amount, "close_date": o.close_date.isoformat() if o.close_date else None, "stage_name": o.stage_name, "type": o.type, "record_type_name": o.record_type_name, "account_id": o.account_id, "account_name": o.account_name, "mrr": o.mrr, "created_date": o.created_date.isoformat() if o.created_date else None, "synced_at": o.synced_at.isoformat() if o.synced_at else None} for o in r_opp.scalars().all()]
+    opportunities = [
+        {
+            "sf_id": o.sf_id,
+            "opportunity_sf_id": o.sf_id,
+            "account_id": o.account_id,
+            "account_sf_id": o.account_id,
+            "name": o.name,
+            "amount": o.amount,
+            "close_date": o.close_date.isoformat() if o.close_date else None,
+            "renewal_date": o.renewal_date.isoformat() if o.renewal_date else None,
+            "stage_name": o.stage_name,
+            "type": o.type,
+            "record_type_name": o.record_type_name,
+            "account_name": o.account_name,
+            "mrr": o.mrr,
+            "original_acv": o.original_acv,
+            "created_date": o.created_date.isoformat() if o.created_date else None,
+            "synced_at": o.synced_at.isoformat() if o.synced_at else None,
+        }
+        for o in r_opp.scalars().all()
+    ]
     r_li = await db.execute(select(OpportunityLineItem))
-    line_items = [{"opportunity_sf_id": li.opportunity_sf_id, "product_name": li.product_name, "quantity": li.quantity, "unit_price": li.unit_price, "total_price": li.total_price, "synced_at": li.synced_at.isoformat() if li.synced_at else None} for li in r_li.scalars().all()]
+    line_items = [
+        {
+            "opportunity_sf_id": li.opportunity_sf_id,
+            "product_name": li.product_name,
+            "quantity": li.quantity,
+            "unit_price": li.unit_price,
+            "total_price": li.total_price,
+            "synced_at": li.synced_at.isoformat() if li.synced_at else None,
+        }
+        for li in r_li.scalars().all()
+    ]
 
     payload = {"accounts": accounts, "opportunities": opportunities, "opportunity_line_items": line_items}
     await db.execute(delete(SalesforceEODSnapshot).where(SalesforceEODSnapshot.snapshot_date == today_est))
@@ -838,6 +1037,23 @@ def _is_renewal_record_type(name: Optional[str]) -> bool:
     return (name or "").strip().lower() == "renewal"
 
 
+async def _get_record_type_overrides(db: AsyncSession) -> dict[str, str]:
+    """Load manual record-type overrides: opportunity_sf_id -> record_type_name.
+    Keys stripped. Both 15- and 18-char SF IDs are stored so lookup matches either format."""
+    q = select(OpportunityRecordTypeOverride).order_by(OpportunityRecordTypeOverride.id.asc())
+    r = await db.execute(q)
+    out: dict[str, str] = {}
+    for row in r.scalars().all():
+        val = (row.record_type_name or "").strip() or "—"
+        key = (row.opportunity_sf_id or "").strip()
+        out[key] = val
+        if len(key) == 18:
+            out[key[:15]] = val
+        elif len(key) == 15:
+            out[key] = val
+    return out
+
+
 @app.get("/api/dashboard-kpi", response_model=DashboardKPI)
 async def get_dashboard_kpi(db: AsyncSession = Depends(get_db)):
     """
@@ -862,9 +1078,10 @@ async def get_dashboard_kpi(db: AsyncSession = Depends(get_db)):
         )
         r_lines = await db.execute(q_lines)
         for li in r_lines.scalars().all():
-            if _is_arr_excluded_product(_normalized_product_name(li.product_name)):
+            raw = _normalized_product_name(li.product_name)
+            if not _include_line_item_in_arr(raw, li.product_name):
                 continue
-            mrr += float(li.total_price or 0)
+            mrr += _line_item_effective_total(li)
     arr = mrr * ARR_MULTIPLIER
 
     # Pipeline = sum(Amount) for open opportunities
@@ -928,10 +1145,10 @@ async def _closed_won_arr_in_range(
         r_lines = await db.execute(q_lines)
         for li in r_lines.scalars().all():
             raw = _normalized_product_name(li.product_name)
-            if _is_arr_excluded_product(raw) or _is_arr_excluded_product(li.product_name):
+            if not _include_line_item_in_arr(raw, li.product_name):
                 continue
             opp_sf_id = li.opportunity_sf_id
-            mrr = float(li.total_price or 0)
+            mrr = _line_item_effective_total(li)
             opp_to_arr[opp_sf_id] = opp_to_arr.get(opp_sf_id, 0) + mrr * PIPELINE_ARR_MULTIPLIER
     # ARR from product line items only (excl iVerify/Kipu), consistent with ARR overview
     nb, exp = 0.0, 0.0
@@ -1072,10 +1289,11 @@ async def get_arr_examples(
         )
         r_lines = await db.execute(q_lines)
         for li in r_lines.scalars().all():
-            if _is_arr_excluded_product(_normalized_product_name(li.product_name)):
+            raw = _normalized_product_name(li.product_name)
+            if not _include_line_item_in_arr(raw, li.product_name):
                 continue
             opp_sf_id = li.opportunity_sf_id
-            opp_to_total[opp_sf_id] = opp_to_total.get(opp_sf_id, 0) + float(li.total_price or 0)
+            opp_to_total[opp_sf_id] = opp_to_total.get(opp_sf_id, 0) + _line_item_effective_total(li)
 
     open_mrr = 0.0
     closed_won_mrr = 0.0
@@ -1146,10 +1364,11 @@ async def get_arr_by_account(db: AsyncSession = Depends(get_db)):
         )
         r_lines = await db.execute(q_lines)
         for li in r_lines.scalars().all():
-            if _is_arr_excluded_product(_normalized_product_name(li.product_name)):
+            raw = _normalized_product_name(li.product_name)
+            if not _include_line_item_in_arr(raw, li.product_name):
                 continue
             opp_sf_id = li.opportunity_sf_id
-            opp_to_total[opp_sf_id] = opp_to_total.get(opp_sf_id, 0) + float(li.total_price or 0)
+            opp_to_total[opp_sf_id] = opp_to_total.get(opp_sf_id, 0) + _line_item_effective_total(li)
 
     # Group by account: (account_id, account_name) -> { count, mrr } then ARR = mrr * 12
     by_account: dict[tuple[str | None, str | None], tuple[int, float]] = {}
@@ -1197,7 +1416,7 @@ async def _get_arr_by_account_product_data(db: AsyncSession) -> dict:
         if not acc:
             continue
         raw = _normalized_product_name(li.product_name)
-        if _is_arr_excluded_product(raw) or _is_arr_excluded_product(li.product_name):
+        if not _include_line_item_in_arr(raw, li.product_name):
             continue
         if not raw:
             continue
@@ -1205,7 +1424,7 @@ async def _get_arr_by_account_product_data(db: AsyncSession) -> dict:
             by_account_product[acc] = {p: 0.0 for p in products}
         canonical = _match_arr_product(raw) if raw else None
         canonical = canonical or "Other"
-        by_account_product[acc][canonical] = by_account_product[acc].get(canonical, 0) + (li.total_price or 0)
+        by_account_product[acc][canonical] = by_account_product[acc].get(canonical, 0) + _line_item_effective_total(li)
     # Per-account subscription end date = latest close_date among renewal opps for that account
     account_end_date: dict[tuple[str | None, str | None], date | None] = {}
     for o in renewal_opps:
@@ -1276,7 +1495,7 @@ def _arr_from_snapshot_payload(payload: dict) -> dict:
         if not acc:
             continue
         raw = _normalized_product_name(li.get("product_name"))
-        if _is_arr_excluded_product(raw) or _is_arr_excluded_product(li.get("product_name")):
+        if not _include_line_item_in_arr(raw, li.get("product_name")):
             continue
         if not raw:
             continue
@@ -1284,7 +1503,7 @@ def _arr_from_snapshot_payload(payload: dict) -> dict:
             by_account_product[acc] = {p: 0.0 for p in products}
         canonical = _match_arr_product(raw) if raw else None
         canonical = canonical or "Other"
-        by_account_product[acc][canonical] = by_account_product[acc].get(canonical, 0) + (li.get("total_price") or 0)
+        by_account_product[acc][canonical] = by_account_product[acc].get(canonical, 0) + _line_item_effective_total_dict(li)
 
     account_end_date: dict[tuple[str | None, str | None], date | None] = {}
     for o in renewal_opps:
@@ -1585,9 +1804,9 @@ def _pipeline_from_snapshot_payload(
         if opp_sf_id not in pipeline_sf_ids:
             continue
         raw = _normalized_product_name(li.get("product_name"))
-        if _is_arr_excluded_product(raw) or _is_arr_excluded_product(li.get("product_name")):
+        if not _include_line_item_in_arr(raw, li.get("product_name")):
             continue
-        mrr = float(li.get("total_price") or 0)
+        mrr = _line_item_effective_total_dict(li)
         opp_to_arr_from_lines[opp_sf_id] = opp_to_arr_from_lines.get(opp_sf_id, 0) + mrr * PIPELINE_ARR_MULTIPLIER
     opp_to_arr_from_lines = {k: round(v, 2) for k, v in opp_to_arr_from_lines.items()}
     rows = []
@@ -1716,10 +1935,10 @@ async def get_pipeline_overview(
         r_lines = await db.execute(q_lines)
         for li in r_lines.scalars().all():
             raw = _normalized_product_name(li.product_name)
-            if _is_arr_excluded_product(raw) or _is_arr_excluded_product(li.product_name):
+            if not _include_line_item_in_arr(raw, li.product_name):
                 continue
             opp_sf_id = li.opportunity_sf_id
-            mrr = float(li.total_price or 0)
+            mrr = _line_item_effective_total(li)
             opp_to_arr_from_lines[opp_sf_id] = opp_to_arr_from_lines.get(opp_sf_id, 0) + mrr * PIPELINE_ARR_MULTIPLIER
         opp_to_arr_from_lines = {k: round(v, 2) for k, v in opp_to_arr_from_lines.items()}
     rows = []
@@ -1848,10 +2067,10 @@ async def get_closed_overview(
         r_lines = await db.execute(q_lines)
         for li in r_lines.scalars().all():
             raw = _normalized_product_name(li.product_name)
-            if _is_arr_excluded_product(raw) or _is_arr_excluded_product(li.product_name):
+            if not _include_line_item_in_arr(raw, li.product_name):
                 continue
             opp_sf_id = li.opportunity_sf_id
-            mrr = float(li.total_price or 0)
+            mrr = _line_item_effective_total(li)
             opp_to_arr_from_lines[opp_sf_id] = opp_to_arr_from_lines.get(opp_sf_id, 0) + mrr * PIPELINE_ARR_MULTIPLIER
         opp_to_arr_from_lines = {k: round(v, 2) for k, v in opp_to_arr_from_lines.items()}
     rows = []
@@ -1884,6 +2103,309 @@ async def get_closed_overview(
     if base and ("salesforce.com" in base or "lightning.force.com" in base):
         out["salesforce_base_url"] = base
     return out
+
+
+@app.get("/api/renewals-overview")
+async def get_renewals_overview(
+    db: AsyncSession = Depends(get_db),
+    segment: Optional[List[str]] = Query(None, description="Filter by segment"),
+    stage: Optional[List[str]] = Query(None, description="Filter by stage (e.g. Closed Won)"),
+    record_type: Optional[List[str]] = Query(None, description="Filter by record type"),
+    months: Optional[List[str]] = Query(None, description="Filter by renewal date (close date) month(s), e.g. 2026-02"),
+):
+    """
+    All renewal opportunities (open + Closed Won + Closed Lost). Record type = Renewal only.
+    Renewal date = Opportunity.renewal_date (if set, e.g. from Renewal_Date__c) else close_date.
+    Same filters and response shape as closed-overview. ARR from product line items (excl. iVerify/Kipu).
+    """
+    def _renewal_date(o) -> date | None:
+        return o.renewal_date if (getattr(o, "renewal_date", None) and o.renewal_date) else o.close_date
+
+    overrides = await _get_record_type_overrides(db)
+
+    def _effective_record_type(o: Opportunity) -> str:
+        key = (o.sf_id or "").strip()
+        override = overrides.get(key) or (overrides.get(key[:15]) if len(key) >= 15 else None)
+        return (override or o.record_type_name or "").strip() or "—"
+
+    q_renewals = select(Opportunity).where(
+        Opportunity.record_type_name.isnot(None),
+    ).order_by(Opportunity.close_date.desc().nullslast(), Opportunity.id.desc())
+    r = await db.execute(q_renewals)
+    renewal_opps_all = [o for o in r.scalars().all() if _is_renewal_record_type(_effective_record_type(o))]
+    account_ids_all = {o.account_id for o in renewal_opps_all if o.account_id}
+    account_segment: dict[str, str] = {}
+    if account_ids_all:
+        q_acc = select(Account.sf_id, Account.segment).where(Account.sf_id.in_(account_ids_all))
+        r_acc = await db.execute(q_acc)
+        for (sf_id, seg) in r_acc.all():
+            account_segment[sf_id] = (seg or "").strip() or DEFAULT_SEGMENT
+    segments_set: set[str] = set()
+    stages_set: set[str] = set()
+    record_types_set: set[str] = set()
+    available_months_set: set[str] = set()
+    for o in renewal_opps_all:
+        seg = account_segment.get(o.account_id) if o.account_id else DEFAULT_SEGMENT
+        segments_set.add(seg)
+        stages_set.add(o.stage_name or "—")
+        record_types_set.add(_effective_record_type(o))
+        rd = _renewal_date(o)
+        if rd:
+            available_months_set.add(rd.strftime("%Y-%m"))
+
+    def _norm(s: str) -> str:
+        return (s or "").strip().lower()
+
+    filter_segments = {_norm(s) for s in (segment or [])}
+    filter_stages = {_norm(s) for s in (stage or [])}
+    filter_record_types = {_norm(s) for s in (record_type or [])}
+
+    def _keep(o) -> bool:
+        seg = account_segment.get(o.account_id) if o.account_id else DEFAULT_SEGMENT
+        if filter_segments and _norm(seg) not in filter_segments:
+            return False
+        if filter_stages and _norm(o.stage_name or "") not in filter_stages:
+            return False
+        if filter_record_types and _norm(_effective_record_type(o)) not in filter_record_types:
+            return False
+        return True
+
+    if months:
+        month_ranges: list[tuple[date, date]] = []
+        for yyyy_mm in months:
+            parts = (yyyy_mm or "").strip().split("-")
+            if len(parts) != 2:
+                continue
+            try:
+                y, m = int(parts[0]), int(parts[1])
+                if 1 <= m <= 12:
+                    first = date(y, m, 1)
+                    if m == 12:
+                        last = date(y, 12, 31)
+                    else:
+                        last = date(y, m + 1, 1) - timedelta(days=1)
+                    month_ranges.append((first, last))
+            except (ValueError, TypeError):
+                continue
+        if month_ranges:
+            def _in_selected(d: date) -> bool:
+                return any(first <= d <= last for first, last in month_ranges)
+            renewal_opps = [o for o in renewal_opps_all if _keep(o) and _renewal_date(o) and _in_selected(_renewal_date(o))]
+        else:
+            renewal_opps = [o for o in renewal_opps_all if _keep(o)]
+    else:
+        renewal_opps = [o for o in renewal_opps_all if _keep(o)]
+    renewal_sf_ids = {o.sf_id for o in renewal_opps}
+    opp_to_arr_from_lines = await _compute_arr_from_line_items(db, renewal_sf_ids)
+    rows = []
+    grand_total = 0.0
+    for o in renewal_opps:
+        arr_from_lines = opp_to_arr_from_lines.get(o.sf_id, 0)
+        stage = (o.stage_name or "").strip()
+        is_closed = stage in CLOSED_STAGES
+        if is_closed:
+            if stage == "Closed Won":
+                # Closed Won: UFR = Original ACV from SF, Renewed ARR = line-item ARR.
+                ufr_val = float(o.original_acv) if getattr(o, "original_acv", None) is not None else None
+                ufr_arr = round(ufr_val, 2) if ufr_val is not None else None
+                renewed_arr = round(arr_from_lines, 2)
+                renewal_change_arr = round(renewed_arr - (ufr_val or 0), 2)
+            else:
+                # Closed Lost: UFR = from line items (same as customer base), Renewed ARR = 0.
+                ufr_arr = round(arr_from_lines, 2) if arr_from_lines else None
+                renewed_arr = 0.0
+                renewal_change_arr = round(0.0 - (arr_from_lines or 0), 2)
+        else:
+            # Open: UFR ARR = from line items (same as customer base). Renewed ARR = 0 (not closed yet).
+            ufr_arr = round(arr_from_lines, 2) if arr_from_lines else None
+            renewed_arr = 0.0
+            renewal_change_arr = round(0.0 - (arr_from_lines or 0), 2)  # delta = renewed - ufr = 0 - ufr
+        grand_total += renewed_arr
+        seg = account_segment.get(o.account_id) if o.account_id else DEFAULT_SEGMENT
+        rd = _renewal_date(o)
+        rows.append({
+            "account_id": o.account_id,
+            "account_name": o.account_name or "—",
+            "segment": seg,
+            "opportunity_sf_id": o.sf_id,
+            "opportunity_name": o.name or "—",
+            "stage_name": o.stage_name or "—",
+            "record_type_name": _effective_record_type(o),
+            "close_date": o.close_date.isoformat() if o.close_date else None,
+            "renewal_date": rd.isoformat() if rd else None,
+            "ufr_arr": ufr_arr,
+            "arr": renewed_arr,
+            "renewal_change_arr": renewal_change_arr,
+        })
+    # Sort by renewal date (newest first), then ARR desc; rows with no date last
+    def _sort_key(row: dict) -> tuple:
+        rdd = row.get("renewal_date") or row.get("close_date")
+        od = date.fromisoformat(rdd).toordinal() if rdd else (date.max.toordinal() + 1)
+        return (-od, -row["arr"])
+    rows.sort(key=_sort_key)
+    out = {
+        "rows": rows,
+        "grand_total": round(grand_total, 2),
+        "available_months": sorted(available_months_set, reverse=True),
+        "segments": sorted(segments_set),
+        "stages": sorted(stages_set),
+        "record_types": sorted(record_types_set),
+    }
+    base = os.getenv("SALESFORCE_BASE_URL", "").strip().rstrip("/")
+    if base and ("salesforce.com" in base or "lightning.force.com" in base):
+        out["salesforce_base_url"] = base
+    return out
+
+
+@app.get("/api/manual-overwrites")
+async def list_manual_overwrites(db: AsyncSession = Depends(get_db)):
+    """List all manual record-type overrides (log)."""
+    q = select(OpportunityRecordTypeOverride).order_by(OpportunityRecordTypeOverride.created_at.desc())
+    r = await db.execute(q)
+    rows = r.scalars().all()
+    return {
+        "overwrites": [
+            {
+                "opportunity_sf_id": row.opportunity_sf_id,
+                "record_type_name": row.record_type_name,
+                "note": row.note,
+                "created_at": row.created_at.isoformat() if row.created_at else None,
+            }
+            for row in rows
+        ],
+    }
+
+
+@app.post("/api/manual-overwrites")
+async def create_manual_overwrite(
+    db: AsyncSession = Depends(get_db),
+    opportunity_sf_id: str = Query(..., description="18-digit Salesforce Opportunity Id"),
+    record_type_name: str = Query(..., description="Override record type, e.g. Amendment"),
+    note: Optional[str] = Query(None, description="Optional note for the log"),
+):
+    """Add or update a manual record-type override for an opportunity."""
+    opportunity_sf_id = (opportunity_sf_id or "").strip()
+    record_type_name = (record_type_name or "").strip() or "—"
+    if not opportunity_sf_id:
+        raise HTTPException(status_code=400, detail="opportunity_sf_id is required")
+    existing = await db.execute(
+        select(OpportunityRecordTypeOverride).where(
+            OpportunityRecordTypeOverride.opportunity_sf_id == opportunity_sf_id
+        )
+    )
+    row = existing.scalars().one_or_none()
+    if row:
+        row.record_type_name = record_type_name
+        row.note = (note or "").strip() or None
+    else:
+        db.add(OpportunityRecordTypeOverride(
+            opportunity_sf_id=opportunity_sf_id,
+            record_type_name=record_type_name,
+            note=(note or "").strip() or None,
+        ))
+    await db.commit()
+    return {"ok": True, "opportunity_sf_id": opportunity_sf_id, "record_type_name": record_type_name}
+
+
+@app.delete("/api/manual-overwrites/{opportunity_sf_id}")
+async def delete_manual_overwrite(
+    opportunity_sf_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """Remove the manual record-type override for an opportunity."""
+    r = await db.execute(
+        select(OpportunityRecordTypeOverride).where(
+            OpportunityRecordTypeOverride.opportunity_sf_id == opportunity_sf_id.strip()
+        )
+    )
+    row = r.scalars().one_or_none()
+    if not row:
+        raise HTTPException(status_code=404, detail="Override not found")
+    await db.delete(row)
+    await db.commit()
+    return {"ok": True, "opportunity_sf_id": opportunity_sf_id}
+
+
+@app.get("/api/debug/salesforce-opportunity-fields")
+async def debug_salesforce_opportunity_fields():
+    """
+    Debug: run the same Opportunity SOQL used for sync and return the first record's keys and ACV-related values.
+    Use to verify the exact API name of Original ACV (e.g. namespaced or different casing).
+    """
+    from connectors.salesforce import SalesforceConnector
+
+    try:
+        connector = SalesforceConnector()
+        if not connector.is_configured():
+            return {"error": "Salesforce not configured (SALESFORCE_USERNAME/PASSWORD)."}
+        soql = DEFAULT_OPPORTUNITY_SOQL
+        opp_records = await _salesforce_query_with_retry(connector, soql)
+        if not opp_records:
+            return {"soql": soql, "record_count": 0, "message": "No opportunities returned."}
+        rec = opp_records[0]
+        all_keys = sorted(rec.keys())
+        acv_like = {k: rec.get(k) for k in all_keys if "acv" in (k or "").lower() or "original" in (k or "").lower()}
+        return {
+            "soql": soql,
+            "record_count": len(opp_records),
+            "first_record_keys": all_keys,
+            "acv_related_fields": acv_like,
+            "configured_ufr_field": _SALESFORCE_UFR_ARR_FIELD,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/api/debug/renewal-line-items")
+async def debug_renewal_line_items(
+    db: AsyncSession = Depends(get_db),
+    account_name: Optional[str] = Query(None, description="Filter by account name (contains, case-insensitive)"),
+    opportunity_sf_id: Optional[str] = Query(None, description="Specific opportunity Salesforce Id"),
+):
+    """
+    Debug: list line items for renewal opportunity/opportunities and show whether each is included in ARR.
+    Use ?account_name=Sierra or ?opportunity_sf_id=xxx to inspect why ARR might be wrong.
+    """
+    q = select(Opportunity).where(Opportunity.record_type_name.isnot(None))
+    r = await db.execute(q)
+    renewal_opps = [o for o in r.scalars().all() if _is_renewal_record_type(o.record_type_name)]
+    if account_name:
+        want = (account_name or "").strip().lower()
+        renewal_opps = [o for o in renewal_opps if (o.account_name or "").lower().find(want) >= 0]
+    if opportunity_sf_id:
+        renewal_opps = [o for o in renewal_opps if o.sf_id == opportunity_sf_id.strip()]
+    if not renewal_opps:
+        return {"opportunities": [], "message": "No renewal opportunities matched."}
+    sf_ids = {o.sf_id for o in renewal_opps}
+    arr_by_opp = await _compute_arr_from_line_items(db, sf_ids)
+    q_li = select(OpportunityLineItem).where(OpportunityLineItem.opportunity_sf_id.in_(sf_ids))
+    r_li = await db.execute(q_li)
+    line_items = r_li.scalars().all()
+    by_opp: dict[str, list] = {sf_id: [] for sf_id in sf_ids}
+    for li in line_items:
+        raw = _normalized_product_name(li.product_name)
+        included = _include_line_item_in_arr(raw, li.product_name)
+        canonical = _match_arr_product(raw) or _match_arr_product(li.product_name)
+        arr_contribution = (_line_item_effective_total(li) * ARR_MULTIPLIER) if included else 0
+        by_opp.setdefault(li.opportunity_sf_id, []).append({
+            "product_name": li.product_name,
+            "total_price": li.total_price,
+            "normalized": raw,
+            "canonical": canonical,
+            "included": included,
+            "arr_contribution": round(arr_contribution, 2),
+        })
+    opportunities = []
+    for o in renewal_opps:
+        opportunities.append({
+            "sf_id": o.sf_id,
+            "name": o.name,
+            "account_name": o.account_name,
+            "stage_name": o.stage_name,
+            "arr_from_line_items": arr_by_opp.get(o.sf_id, 0),
+            "line_items": by_opp.get(o.sf_id, []),
+        })
+    return {"opportunities": opportunities}
 
 
 # ----- QuickBooks sync (Phase 1c) -----

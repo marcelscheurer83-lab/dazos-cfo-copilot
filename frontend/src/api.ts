@@ -252,6 +252,8 @@ export type PipelineOverviewRow = {
   stage_name: string
   record_type_name: string
   close_date: string | null
+  /** Renewals overview only: effective renewal date (SF Renewal Date or close date). */
+  renewal_date?: string | null
   arr: number
 }
 
@@ -313,17 +315,46 @@ export async function getClosedOverview(filters?: ClosedOverviewFilters): Promis
   return r.json()
 }
 
+/** Renewals overview: same as closed but with UFR ARR (up for renewal) and renewal change. */
+export type RenewalsOverviewRow = ClosedOverviewRow & {
+  ufr_arr: number | null
+  renewal_change_arr: number
+}
+
+export type RenewalsOverviewResponse = Omit<ClosedOverviewResponse, 'rows'> & {
+  rows: RenewalsOverviewRow[]
+}
+
+export async function getRenewalsOverview(filters?: ClosedOverviewFilters): Promise<RenewalsOverviewResponse> {
+  const params = new URLSearchParams()
+  if (filters?.segment?.length) filters.segment.forEach((s) => params.append('segment', s))
+  if (filters?.stage?.length) filters.stage.forEach((s) => params.append('stage', s))
+  if (filters?.record_type?.length) filters.record_type.forEach((r) => params.append('record_type', r))
+  if (filters?.months?.length) filters.months.forEach((m) => params.append('months', m))
+  const qs = params.toString()
+  const r = await apiFetch(`/renewals-overview${qs ? `?${qs}` : ''}`)
+  if (!r.ok) throw new Error('Failed to fetch renewals overview')
+  return r.json()
+}
+
 export async function syncSalesforce(): Promise<{
   ok: boolean
   error?: string
   synced_opportunities?: number
   synced_line_items?: number
   renewal_opportunities_count?: number
+  message?: string
 }> {
   const r = await apiFetch('/sync/salesforce', { method: 'POST' })
-  const data = await r.json()
-  if (!r.ok) return { ok: false, error: data.error || data.detail?.toString() || 'Sync failed' }
-  return data
+  let data: { ok?: boolean; error?: string; detail?: unknown }
+  try {
+    const text = await r.text()
+    data = text ? JSON.parse(text) : {}
+  } catch {
+    return { ok: false, error: r.ok ? 'Invalid response from server.' : 'Sync failed. Restart the backend and try again.' }
+  }
+  if (!r.ok) return { ok: false, error: data.error || (Array.isArray(data.detail) ? data.detail.map((d: { msg?: string }) => d.msg).join(' ') : String(data.detail ?? 'Sync failed')) }
+  return data as { ok: boolean; error?: string; synced_opportunities?: number; synced_line_items?: number; renewal_opportunities_count?: number; message?: string }
 }
 
 export async function getKPI(asOf?: string): Promise<KPISummary> {

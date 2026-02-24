@@ -101,6 +101,8 @@ class Opportunity(Base):
     name = Column(String(255), nullable=True)
     amount = Column(Float, default=0)
     close_date = Column(Date, nullable=True)
+    renewal_date = Column(Date, nullable=True)  # Optional; from SF custom e.g. Renewal_Date__c. Used for renewals when set.
+    original_acv = Column(Float, nullable=True)  # Optional; from SF Original_ACV__c = ARR up for renewal (UFR ARR).
     stage_name = Column(String(128), nullable=True)
     type = Column(String(128), nullable=True)  # Opportunity type
     record_type_name = Column(String(128), nullable=True)  # RecordType.Name, e.g. 'Renewal'
@@ -109,6 +111,16 @@ class Opportunity(Base):
     mrr = Column(Float, nullable=True)  # MRR from Opportunity Finance Details (e.g. MRR__c); ARR = mrr * 12
     created_date = Column(DateTime, nullable=True)
     synced_at = Column(DateTime, server_default=func.now())
+
+
+class OpportunityRecordTypeOverride(Base):
+    """Manual overwrite of opportunity record type for reporting (e.g. treat as Amendment instead of Renewal). Logged with note."""
+    __tablename__ = "opportunity_record_type_overrides"
+    id = Column(Integer, primary_key=True)
+    opportunity_sf_id = Column(String(18), unique=True, nullable=False)
+    record_type_name = Column(String(128), nullable=False)  # Override value, e.g. 'Amendment'
+    note = Column(String(512), nullable=True)
+    created_at = Column(DateTime, server_default=func.now())
 
 
 class SalesforceEODSnapshot(Base):

@@ -16,6 +16,11 @@ function fmtMoney(n: number) {
   return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 }).format(n)
 }
 
+/** Format as $XK (thousands) for dashboard. */
+function fmtK(n: number): string {
+  return `$${Math.round(n / 1000)}K`
+}
+
 function fmtDeltaK(deltaK: number | null | undefined): string {
   if (deltaK == null) return '—'
   const sign = deltaK >= 0 ? '+' : ''
@@ -185,9 +190,9 @@ function MTDRow({ label, row }: { label: string; row: BookingsMTDRow }) {
   return (
     <tr style={{ borderBottom: '1px solid var(--border)' }}>
       <td style={{ padding: '0.35rem 0.5rem 0.35rem 0', color: 'var(--text)' }}>{label}</td>
-      <td style={{ textAlign: 'right', padding: '0.35rem 0.5rem', color: 'var(--text)' }}>{fmtMoney(row.mtd)}</td>
+      <td style={{ textAlign: 'right', padding: '0.35rem 0.5rem', color: 'var(--text)' }}>{fmtK(row.mtd)}</td>
       <td style={{ textAlign: 'right', padding: '0.35rem 0.5rem', color: 'var(--text-muted)' }}>
-        {row.plan != null ? fmtMoney(row.plan) : '—'}
+        {row.plan != null ? fmtK(row.plan) : '—'}
       </td>
       <td style={{ textAlign: 'right', padding: '0.35rem 0.5rem', color: 'var(--text)' }}>{fmtPct(row.achievement_pct)}</td>
       <td style={{ textAlign: 'right', padding: '0.35rem 0', color: deltaColor }}>{fmtDeltaK(row.delta_k)}</td>

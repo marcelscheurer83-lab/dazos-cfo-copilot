@@ -1,14 +1,61 @@
-import { Outlet, NavLink } from 'react-router-dom'
+import { useEffect, useState } from 'react'
+import { Outlet, NavLink, useLocation } from 'react-router-dom'
 
-const nav = [
+type NavLinkItem = { to: string; label: string }
+type NavSection = { label: string; children: NavLinkItem[] }
+type NavItem = NavLinkItem | NavSection
+
+function isSection(item: NavItem): item is NavSection {
+  return 'children' in item && Array.isArray((item as NavSection).children)
+}
+
+const nav: NavItem[] = [
   { to: '/dashboard', label: 'Dashboard' },
-  { to: '/bookings', label: 'Bookings overview' },
-  { to: '/pipeline-overview', label: 'Pipeline overview' },
-  { to: '/customer-overview', label: 'Customer overview' },
+  {
+    label: 'Go-To-Market',
+    children: [
+      { to: '/bookings', label: 'Bookings' },
+      { to: '/gtm/renewals', label: 'Renewals' },
+      { to: '/pipeline-overview', label: 'Pipeline' },
+      { to: '/customer-overview', label: 'Customer base' },
+    ],
+  },
+  { to: '/financials', label: 'Financials' },
   { to: '/copilot', label: 'Copilot' },
 ]
 
+const topLevelFontSize = '0.875rem'
+const subLevelFontSize = '0.8rem'
+
+const topLevelStyle = (isActive: boolean) => ({
+  display: 'block' as const,
+  padding: '0.6rem 1.25rem',
+  fontSize: topLevelFontSize,
+  color: isActive ? 'var(--accent)' : 'var(--text-muted)',
+  fontWeight: isActive ? 600 : 400,
+  borderLeft: isActive ? '3px solid var(--accent)' : '3px solid transparent',
+  marginLeft: 0,
+  textDecoration: 'none' as const,
+})
+
+const subLinkStyle = (isActive: boolean) => ({
+  ...topLevelStyle(isActive),
+  paddingLeft: '1.75rem',
+  fontSize: subLevelFontSize,
+})
+
+const GTM_PATHS = ['/bookings', '/gtm/renewals', '/pipeline-overview', '/customer-overview']
+
 export default function Layout() {
+  const location = useLocation()
+  const [gtmExpanded, setGtmExpanded] = useState(true)
+
+  useEffect(() => {
+    if (GTM_PATHS.some((p) => location.pathname === p || location.pathname.startsWith(p + '/'))) {
+      setGtmExpanded(true)
+    }
+  }, [location.pathname])
+
   return (
     <div style={{ display: 'flex', minHeight: '100vh' }}>
       <aside
@@ -26,22 +73,53 @@ export default function Layout() {
           <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>CFO Copilot</div>
         </div>
         <nav style={{ flex: 1 }}>
-          {nav.map(({ to, label }) => (
-            <NavLink
-              key={to}
-              to={to}
-              style={({ isActive }) => ({
-                display: 'block',
-                padding: '0.6rem 1.25rem',
-                color: isActive ? 'var(--accent)' : 'var(--text-muted)',
-                fontWeight: isActive ? 600 : 400,
-                borderLeft: isActive ? '3px solid var(--accent)' : '3px solid transparent',
-                marginLeft: 0,
-              })}
-            >
-              {label}
-            </NavLink>
-          ))}
+          {nav.map((item, idx) => {
+            if (isSection(item)) {
+              const isSectionActive = item.children.some((c) =>
+                location.pathname === c.to || (c.to !== '/dashboard' && location.pathname.startsWith(c.to + '/'))
+              )
+              const isExpanded = item.label === 'Go-To-Market' ? gtmExpanded : true
+              const setExpanded = item.label === 'Go-To-Market' ? (v: boolean) => setGtmExpanded(v) : () => {}
+              return (
+                <div key={idx} style={{ marginBottom: '0.25rem' }}>
+                  <button
+                    type="button"
+                    onClick={() => setExpanded(!isExpanded)}
+                    style={{
+                      width: '100%',
+                      padding: '0.6rem 1.25rem',
+                      fontSize: topLevelFontSize,
+                      fontWeight: isSectionActive ? 600 : 400,
+                      color: isSectionActive ? 'var(--accent)' : 'var(--text-muted)',
+                      borderLeft: '3px solid transparent',
+                      marginLeft: 0,
+                      background: 'transparent',
+                      border: 'none',
+                      cursor: 'pointer',
+                      textAlign: 'left',
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: '0.35rem',
+                    }}
+                  >
+                    <span style={{ fontSize: '0.65rem', lineHeight: 1 }}>{isExpanded ? '▼' : '▶'}</span>
+                    {item.label}
+                  </button>
+                  {isExpanded &&
+                    item.children.map((child) => (
+                      <NavLink key={child.to} to={child.to} style={({ isActive }) => subLinkStyle(isActive)}>
+                        {child.label}
+                      </NavLink>
+                    ))}
+                </div>
+              )
+            }
+            return (
+              <NavLink key={item.to} to={item.to} style={({ isActive }) => topLevelStyle(isActive)}>
+                {item.label}
+              </NavLink>
+            )
+          })}
         </nav>
         <div style={{ marginTop: 'auto', padding: '1rem 1.25rem', borderTop: '1px solid var(--border)' }}>
           <button

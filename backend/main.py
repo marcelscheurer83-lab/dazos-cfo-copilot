@@ -925,14 +925,24 @@ async def get_eod_snapshot_contents(
     Return contents of the EOD snapshot for a given date (YYYY-MM-DD).
     By default returns a summary (counts + CARR). Use ?full=1 to get the full JSON payload.
     """
+    date_str = snapshot_date.strip()
     try:
-        target = date.fromisoformat(snapshot_date.strip())
+        target = date.fromisoformat(date_str)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid date; use YYYY-MM-DD")
     r = await db.execute(
         select(SalesforceEODSnapshot).where(SalesforceEODSnapshot.snapshot_date == target).limit(1)
     )
     row = r.scalar_one_or_none()
+    # Fallback: some DBs store dates differently; find by matching date string
+    if not row:
+        r2 = await db.execute(
+            select(SalesforceEODSnapshot).order_by(SalesforceEODSnapshot.snapshot_date.desc())
+        )
+        for candidate in r2.scalars().all():
+            if candidate.snapshot_date and candidate.snapshot_date.isoformat() == date_str:
+                row = candidate
+                break
     if not row or not row.data_json:
         raise HTTPException(status_code=404, detail=f"No EOD snapshot found for {snapshot_date}")
     payload = json.loads(row.data_json)

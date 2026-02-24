@@ -323,6 +323,8 @@ export type RenewalsOverviewRow = ClosedOverviewRow & {
 
 export type RenewalsOverviewResponse = Omit<ClosedOverviewResponse, 'rows'> & {
   rows: RenewalsOverviewRow[]
+  /** When false, no opp has renewal_date set so months are based on close date. Set SALESFORCE_RENEWAL_DATE_FIELD and sync for correct bucketing. */
+  renewal_date_used?: boolean
 }
 
 export async function getRenewalsOverview(filters?: ClosedOverviewFilters): Promise<RenewalsOverviewResponse> {

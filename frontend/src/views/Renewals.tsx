@@ -27,15 +27,26 @@ export default function Renewals() {
   const closeDateThRef = useRef<HTMLTableHeaderCellElement>(null)
   const closeDatePopoverRef = useRef<HTMLDivElement>(null)
 
+  // Last 6 months (current + previous 5) — used for API filter and charts so backend is source of truth for renewal date bucketing
+  const last6Months = useMemo(() => {
+    const now = new Date()
+    const out: string[] = []
+    for (let i = 0; i < 6; i++) {
+      const d = new Date(now.getFullYear(), now.getMonth() - i, 1)
+      out.push(`${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`)
+    }
+    return out
+  }, [])
+
   const loadData = useCallback(() => {
     getRenewalsOverview({
       segment: filterSegment.length ? filterSegment : undefined,
       stage: filterStage.length ? filterStage : undefined,
-      months: filterCloseDate.length ? filterCloseDate : undefined,
+      months: filterCloseDate.length ? filterCloseDate : last6Months,
     })
       .then(setData)
       .catch((e) => setErr(e.message))
-  }, [filterSegment, filterStage, filterCloseDate])
+  }, [filterSegment, filterStage, filterCloseDate, last6Months])
 
   useEffect(() => {
     loadData()
@@ -93,20 +104,9 @@ export default function Renewals() {
       ? data.salesforce_base_url
       : undefined
 
-  // Last 6 months: current + previous 5 (by renewal date)
-  const chartMonths = useMemo(() => {
-    const now = new Date()
-    const out: string[] = []
-    for (let i = 0; i < 6; i++) {
-      const d = new Date(now.getFullYear(), now.getMonth() - i, 1)
-      out.push(`${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`)
-    }
-    return out
-  }, [])
-
   // Left ARR chart: Churned/contracted, Renewed, Open (delta-based).
   const chartDataByStage = useMemo(() => {
-    const monthSet = new Set(chartMonths)
+    const monthSet = new Set(last6Months)
     const arrMap = new Map<string, Map<string, number>>()
     const countMap = new Map<string, Map<string, number>>()
     const CHURNED = 'Churned/ contracted'
@@ -141,7 +141,7 @@ export default function Renewals() {
         cMap.set(OPEN, (cMap.get(OPEN) ?? 0) + 1)
       }
     }
-    const months = chartMonths.filter((m) => arrMap.has(m)).reverse()
+    const months = last6Months.filter((m) => arrMap.has(m)).reverse()
     const stages = [CHURNED, RENEWED, OPEN]
     const stageColors: Record<string, string> = {
       [CHURNED]: '#ef4444',
@@ -149,11 +149,11 @@ export default function Renewals() {
       [OPEN]: '#94a3b8',
     }
     return { months, stages, arrMap, countMap, stageColors }
-  }, [rows, chartMonths])
+  }, [rows, last6Months])
 
   // Right chart: Renewed = Closed Won, Lost = Closed Lost, Open = open. Renewal rate = closed won / (closed won + closed lost).
   const chartDataByStageCount = useMemo(() => {
-    const monthSet = new Set(chartMonths)
+    const monthSet = new Set(last6Months)
     const arrMap = new Map<string, Map<string, number>>()
     const countMap = new Map<string, Map<string, number>>()
     const RENEWED = 'Renewed'
@@ -183,7 +183,7 @@ export default function Renewals() {
         cMap.set(OPEN, (cMap.get(OPEN) ?? 0) + 1)
       }
     }
-    const months = chartMonths.filter((m) => arrMap.has(m)).reverse()
+    const months = last6Months.filter((m) => arrMap.has(m)).reverse()
     const stages = [RENEWED, LOST, OPEN]
     const stageColors: Record<string, string> = {
       [RENEWED]: '#10b981',
@@ -191,7 +191,7 @@ export default function Renewals() {
       [OPEN]: '#94a3b8',
     }
     return { months, stages, arrMap, countMap, stageColors }
-  }, [rows, chartMonths])
+  }, [rows, last6Months])
 
   const PLOT_HEIGHT = 180
   const ARR_Y_MAX = 400_000 // $400K
@@ -389,6 +389,11 @@ export default function Renewals() {
       <p style={{ fontSize: '0.9rem', color: 'var(--text-muted)', marginBottom: '1rem' }}>
         Open and closed renewal opportunities. Shown by renewal date (close date). ARR from product line items (excl. iVerify/Kipu).
       </p>
+      {data?.renewal_date_used === false && (
+        <p style={{ fontSize: '0.85rem', color: 'var(--warning)', marginBottom: '1rem', padding: '0.5rem 0.75rem', background: 'var(--bg)', border: '1px solid var(--border)', borderRadius: 6 }}>
+          Months are based on <strong>close date</strong>. To bucket by renewal date (e.g. so opps like Innovative Billing Solutions appear in the correct month), set <code>SALESFORCE_RENEWAL_DATE_FIELD</code> in the backend (e.g. <code>Renewal_Date__c</code>) and run Sync from Salesforce.
+        </p>
+      )}
 
       <p style={{ marginBottom: '1rem', display: 'flex', alignItems: 'center', gap: '0.75rem', flexWrap: 'wrap' }}>
         <button

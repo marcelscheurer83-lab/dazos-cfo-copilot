@@ -2243,6 +2243,10 @@ async def get_renewals_overview(
         od = date.fromisoformat(rdd).toordinal() if rdd else (date.max.toordinal() + 1)
         return (-od, -row["arr"])
     rows.sort(key=_sort_key)
+    # Hint for UI: if no opp has renewal_date set, we're bucketing by close date (set SALESFORCE_RENEWAL_DATE_FIELD and sync for correct months)
+    any_renewal_date_set = any(
+        getattr(o, "renewal_date", None) and o.renewal_date for o in renewal_opps_all
+    )
     out = {
         "rows": rows,
         "grand_total": round(grand_total, 2),
@@ -2250,6 +2254,7 @@ async def get_renewals_overview(
         "segments": sorted(segments_set),
         "stages": sorted(stages_set),
         "record_types": sorted(record_types_set),
+        "renewal_date_used": any_renewal_date_set,
     }
     base = os.getenv("SALESFORCE_BASE_URL", "").strip().rstrip("/")
     if base and ("salesforce.com" in base or "lightning.force.com" in base):

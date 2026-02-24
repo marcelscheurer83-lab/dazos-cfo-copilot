@@ -265,6 +265,13 @@ async def copilot(body: CopilotRequest, db: AsyncSession = Depends(get_db)):
             payload = json.loads(snap.data_json)
             data_prev = _arr_from_snapshot_payload(payload)
             prev_arr = data_prev.get("grand_total") or 0
+            prev_rows = len(data_prev.get("rows") or [])
+            # Snapshot may show $0 if it was taken before sync (e.g. manual run or first deploy)
+            if prev_arr == 0 and prev_rows == 0 and current_arr > 1000:
+                return CopilotResponse(
+                    answer=f"**Total CARR** today is **${current_arr:,.0f}**. The EOD snapshot for {snap.snapshot_date.isoformat()} shows **$0** with no accounts—it was likely taken before data was synced (e.g. right after deploy). For accurate day-over-day comparison, ensure the daily snapshot runs at **23:59 EST** after the hourly sync, or trigger **Sync from Salesforce** then **Take EOD snapshot** so future snapshots have data.",
+                    sources=["Customer overview (open renewals)", f"EOD snapshot ({snap.snapshot_date.isoformat()})"],
+                )
             delta = round(current_arr - prev_arr, 2)
             pct = round((delta / prev_arr * 100), 1) if prev_arr else None
             if delta > 0:

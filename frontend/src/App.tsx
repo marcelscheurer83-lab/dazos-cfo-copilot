@@ -9,6 +9,7 @@ import Closed from './views/Closed'
 import Copilot from './views/Copilot'
 import Placeholder from './views/Placeholder'
 import Renewals from './views/Renewals'
+import Admin from './views/Admin'
 
 class ErrorBoundary extends Component<{ children: ReactNode }, { error: Error | null; key: number }> {
   state = { error: null as Error | null, key: 0 }
@@ -67,6 +68,7 @@ export default function App() {
         <Route path="closed-data" element={<Navigate to="/bookings" replace />} />
         <Route path="financials" element={<Placeholder title="Financials" />} />
         <Route path="copilot" element={<Copilot />} />
+        <Route path="admin" element={<Admin />} />
       </Route>
       <Route path="*" element={<Navigate to="/dashboard" replace />} />
     </Routes>

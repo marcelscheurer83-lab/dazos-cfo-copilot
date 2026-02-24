@@ -361,6 +361,23 @@ export async function syncSalesforce(): Promise<{
   return data as { ok: boolean; error?: string; synced_opportunities?: number; synced_line_items?: number; renewal_opportunities_count?: number; message?: string; renewal_date_field_used?: boolean; renewal_date_field_configured?: boolean }
 }
 
+export async function getEodSnapshots(): Promise<{
+  count: number
+  snapshots: Array<{ snapshot_date: string; snapshot_utc: string | null }>
+  message?: string
+}> {
+  const r = await apiFetch('/salesforce/eod-snapshots')
+  if (!r.ok) throw new Error('Failed to fetch EOD snapshots')
+  return r.json()
+}
+
+export async function takeEodSnapshotNow(): Promise<{ ok: boolean; message?: string; error?: string }> {
+  const r = await apiFetch('/salesforce/eod-snapshots/take', { method: 'POST' })
+  const data = await r.json().catch(() => ({}))
+  if (!r.ok) return { ok: false, error: data.detail ?? data.error ?? 'Failed to take snapshot' }
+  return { ok: true, message: data.message }
+}
+
 export async function getKPI(asOf?: string): Promise<KPISummary> {
   const path = asOf ? `/kpi?as_of=${asOf}` : '/kpi'
   const r = await apiFetch(path)

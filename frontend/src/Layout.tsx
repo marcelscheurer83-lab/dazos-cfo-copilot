@@ -22,6 +22,7 @@ const nav: NavItem[] = [
   },
   { to: '/financials', label: 'Financials' },
   { to: '/copilot', label: 'Copilot' },
+  { to: '/admin', label: 'Admin' },
 ]
 
 const topLevelFontSize = '0.875rem'

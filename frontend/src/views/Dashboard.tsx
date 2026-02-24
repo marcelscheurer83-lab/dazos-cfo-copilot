@@ -12,10 +12,6 @@ import {
 
 const ARR_2026P_RANGE = 'ARR_Calculations_2026P!A1:ZZ1000'
 
-function fmtMoney(n: number) {
-  return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 }).format(n)
-}
-
 /** Format as $XK (thousands) for dashboard. */
 function fmtK(n: number): string {
   return `$${Math.round(n / 1000)}K`

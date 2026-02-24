@@ -87,7 +87,6 @@ export default function Renewals() {
   }
 
   const rows = Array.isArray(data?.rows) ? data.rows : []
-  const grand_total = data?.grand_total ?? 0
   const salesforce_base_url =
     data?.salesforce_base_url &&
     (data.salesforce_base_url.includes('salesforce.com') || data.salesforce_base_url.includes('lightning.force.com'))

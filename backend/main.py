@@ -1093,7 +1093,7 @@ async def _scheduled_salesforce_jobs() -> None:
             now_est = datetime.now(EST)
             today_est = now_est.date()
             run_hourly = now_est.minute == 59 and now_est.second >= 59
-            run_eod = now_est.hour == 23 and now_est.minute == 59 and now_est.second >= 59
+            run_eod = now_est.hour == 23 and now_est.minute == 59
 
             if run_hourly and (last_sync_hour is None or last_sync_hour != (today_est, now_est.hour)):
                 async with AsyncSessionLocal() as session:
@@ -1110,8 +1110,12 @@ async def _scheduled_salesforce_jobs() -> None:
                         await _take_salesforce_eod_snapshot(session)
                         await session.commit()
                         last_eod_date = today_est
-                    except Exception:
+                        import logging
+                        logging.getLogger(__name__).info("EOD snapshot taken for %s", today_est.isoformat())
+                    except Exception as e:
                         await session.rollback()
+                        import logging
+                        logging.getLogger(__name__).exception("EOD snapshot failed for %s: %s", today_est.isoformat(), e)
 
         except asyncio.CancelledError:
             raise

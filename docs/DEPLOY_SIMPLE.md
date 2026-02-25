@@ -185,6 +185,8 @@ You don’t sign up for anything. In Part 1 we’ll add a **Railway volume** and
 | CORS            | Railway env: `CORS_ORIGINS` = your Vercel URL (e.g. `https://dazos-cfo-copilot.vercel.app`) |
 | Sync / snapshot | Run automatically by the backend (EST)      |
 
+**EOD snapshot backup:** If the backend might be asleep at 23:59 EST, use an [external cron](EOD_CRON_BACKUP.md) to call `POST /api/salesforce/eod-snapshots/take` daily at 23:59 EST (e.g. [cron-job.org](https://cron-job.org) or the `scripts/take-eod-snapshot.sh` script).
+
 ---
 
 ## If the Railway build fails

@@ -131,7 +131,7 @@ export default function Dashboard() {
         {/* Block 1: Bookings */}
         <div style={{ ...blockStyle, gridColumn: '1 / -1' }}>
           <div style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text)', marginBottom: '0.5rem' }}>
-            Bookings
+            Bookings (ARR)
           </div>
           {bookingsErr && (
             <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>{bookingsErr}</p>
@@ -147,7 +147,7 @@ export default function Dashboard() {
         {/* Block 2: Renewals */}
         <div style={{ ...blockStyle, gridColumn: '1 / -1' }}>
           <div style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text)', marginBottom: '0.5rem' }}>
-            Renewals
+            Renewals (ARR)
           </div>
           {renewalsErr && (
             <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>{renewalsErr}</p>

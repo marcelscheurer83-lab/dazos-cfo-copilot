@@ -552,6 +552,36 @@ def _match_arr_product(sf_product_name: str | None) -> str | None:
 CLOSED_STAGES = frozenset({"Closed Won", "Closed Lost"})
 
 
+def _canonical_stage_name(raw: Optional[str]) -> str:
+    """Normalize stage name so chart grouping is consistent (e.g. Feb vs Mar). Returns canonical display name."""
+    if not raw or not isinstance(raw, str):
+        return "—"
+    s = raw.strip()
+    if not s:
+        return "—"
+    # Collapse all whitespace and normalize "and" / "&"
+    s = re.sub(r"[\s\u00A0\u2000-\u200A\u202F\u205F\u3000]+", " ", s)
+    s = re.sub(r"\s+and\s+", " & ", s, flags=re.IGNORECASE)
+    s = re.sub(r"\s*&\s*", " & ", s)
+    s = s.strip()
+    # Key = letters only (lowercase) for matching variants
+    key = re.sub(r"[^a-z]", "", s.lower())
+    KEY_TO_CANONICAL = {
+        "pricingnegotiation": "Pricing & Negotiation",
+        "contractclose": "Contract & Close",
+        "demosolutioning": "Demo & Solutioning",
+        "discoveryapplicationoverview": "Discovery & Application Overview",
+        "qualification": "Qualification",
+        "qualif": "Qualification",
+        "proposal": "Proposal",
+        "internal": "Internal",
+    }
+    if key in KEY_TO_CANONICAL:
+        return KEY_TO_CANONICAL[key]
+    # Fallback: title-case normalized string
+    return s or "—"
+
+
 def _line_item_effective_total(li) -> float:
     """Use total_price for ARR; when 0 or null, use unit_price * quantity (e.g. closed-opp line items from SF)."""
     total = float(li.total_price or 0)
@@ -2251,7 +2281,7 @@ def _pipeline_from_snapshot_payload(
     for o in open_opps_all:
         seg = account_segment.get(o.get("account_id")) if o.get("account_id") else DEFAULT_SEGMENT
         segments_set.add(seg)
-        stages_set.add(o.get("stage_name") or "—")
+        stages_set.add(_canonical_stage_name(o.get("stage_name")))
         record_types_set.add(o.get("record_type_name") or "—")
     def _norm(s: str) -> str:
         return (s or "").strip().lower()
@@ -2263,7 +2293,8 @@ def _pipeline_from_snapshot_payload(
         seg = account_segment.get(o.get("account_id")) if o.get("account_id") else DEFAULT_SEGMENT
         if filter_segments and _norm(seg) not in filter_segments:
             return False
-        if filter_stages and _norm(o.get("stage_name") or "") not in filter_stages:
+        canonical_stage = _canonical_stage_name(o.get("stage_name"))
+        if filter_stages and _norm(canonical_stage) not in filter_stages:
             return False
         if filter_record_types and _norm(o.get("record_type_name") or "") not in filter_record_types:
             return False
@@ -2298,7 +2329,7 @@ def _pipeline_from_snapshot_payload(
             "segment": seg,
             "opportunity_sf_id": o["sf_id"],
             "opportunity_name": o.get("name") or "—",
-            "stage_name": o.get("stage_name") or "—",
+            "stage_name": _canonical_stage_name(o.get("stage_name")),
             "record_type_name": o.get("record_type_name") or "—",
             "close_date": o.get("close_date"),
             "arr": arr,
@@ -2377,7 +2408,7 @@ async def get_pipeline_overview(
     for o in open_opps_all:
         seg = account_segment.get(o.account_id) if o.account_id else DEFAULT_SEGMENT
         segments_set.add(seg)
-        stages_set.add(o.stage_name or "—")
+        stages_set.add(_canonical_stage_name(o.stage_name))
         record_types_set.add(o.record_type_name or "—")
     # Apply filters (case-insensitive match)
     def _norm(s: str) -> str:
@@ -2391,7 +2422,8 @@ async def get_pipeline_overview(
         seg = account_segment.get(o.account_id) if o.account_id else DEFAULT_SEGMENT
         if filter_segments and _norm(seg) not in filter_segments:
             return False
-        if filter_stages and _norm(o.stage_name or "") not in filter_stages:
+        canonical_stage = _canonical_stage_name(o.stage_name or "")
+        if filter_stages and _norm(canonical_stage) not in filter_stages:
             return False
         if filter_record_types and _norm(o.record_type_name or "") not in filter_record_types:
             return False
@@ -2429,7 +2461,7 @@ async def get_pipeline_overview(
             "segment": seg,
             "opportunity_sf_id": o.sf_id,
             "opportunity_name": o.name or "—",
-            "stage_name": o.stage_name or "—",
+            "stage_name": _canonical_stage_name(o.stage_name),
             "record_type_name": o.record_type_name or "—",
             "close_date": o.close_date.isoformat() if o.close_date else None,
             "arr": arr,

@@ -97,20 +97,31 @@ export default function Pipeline() {
   const rows = Array.isArray(data?.rows) ? data.rows : []
   const grand_total = data?.grand_total ?? 0
 
-  // Aggregate by close month and segment (current month onwards only): ARR and count
+  /** Normalize close_date to YYYY-MM so all February rows land in one bucket (handles 2026-2 vs 2026-02). */
+  const toMonthKey = (closeDate: string | null): string | null => {
+    if (!closeDate || typeof closeDate !== 'string') return null
+    const s = closeDate.trim().slice(0, 10)
+    const match = s.match(/^(\d{4})-(\d{1,2})/)
+    if (!match) return null
+    const y = match[1]
+    const m = String(parseInt(match[2], 10)).padStart(2, '0')
+    return `${y}-${m}`
+  }
+
+  // Aggregate by close month and segment (current month onwards only)
   const chartData = useMemo(() => {
     const now = new Date()
     const currentMonth = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`
     const arrMap = new Map<string, Map<string, number>>()
     const countMap = new Map<string, Map<string, number>>()
     for (const r of rows) {
-      const month = r.close_date ? r.close_date.slice(0, 7) : null
+      const month = toMonthKey(r.close_date ?? null)
       if (!month || month < currentMonth) continue
       if (!arrMap.has(month)) {
         arrMap.set(month, new Map())
         countMap.set(month, new Map())
       }
-      const seg = r.segment || '—'
+      const seg = (r.segment || '—').replace(/\s+/g, ' ').trim() || '—'
       const arrSeg = arrMap.get(month)!
       const countSeg = countMap.get(month)!
       arrSeg.set(seg, (arrSeg.get(seg) ?? 0) + r.arr)
@@ -128,28 +139,81 @@ export default function Pipeline() {
     return { months, segments, arrMap, countMap, segmentColors, maxArr, maxCount }
   }, [rows])
 
-  // Aggregate by close month and stage (current month onwards only): ARR and count
+  // Aggregate by close month and stage (current month onwards only)
   const chartDataByStage = useMemo(() => {
     const now = new Date()
     const currentMonth = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`
     const arrMap = new Map<string, Map<string, number>>()
     const countMap = new Map<string, Map<string, number>>()
+    // Key = only letters (lowercase); any variant of a stage name maps to same key so Feb/Mar match
+    const stageToKey = (s: string) => (s || '').toLowerCase().replace(/[^a-z]/g, '')
+    const KEY_TO_CANONICAL: Record<string, string> = {
+      pricingnegotiation: 'Pricing & Negotiation',
+      contractclose: 'Contract & Close',
+      demosolutioning: 'Demo & Solutioning',
+      discoveryapplicationoverview: 'Discovery & Application Overview',
+      qualification: 'Qualification',
+      qualif: 'Qualification',
+      proposal: 'Proposal',
+      internal: 'Internal',
+    }
+    const normalizeStage = (s: string) => {
+      if (!s || typeof s !== 'string') return '—'
+      let t = s.replace(/[\u200B-\u200D\uFEFF\u2060\u00AD]/g, '').trim()
+      t = t.replace(/[\s\u00A0\u2000-\u200A\u202F\u205F\u3000]+/g, ' ')
+      t = t.replace(/\s+and\s+/gi, ' & ')
+      t = t.replace(/\s*[&\uFF06\u214B]\s*/g, ' & ')
+      t = t.replace(/\s+/g, ' ').trim()
+      const key = stageToKey(t)
+      if (KEY_TO_CANONICAL[key]) return KEY_TO_CANONICAL[key]
+      const canonical: Record<string, string> = {
+        'pricing & negotiation': 'Pricing & Negotiation',
+        'contract & close': 'Contract & Close',
+        'demo & solutioning': 'Demo & Solutioning',
+        'discovery & application overview': 'Discovery & Application Overview',
+      }
+      const lower = t.toLowerCase()
+      return (canonical[lower] ?? t) || '—'
+    }
     for (const r of rows) {
-      const month = r.close_date ? r.close_date.slice(0, 7) : null
+      const month = toMonthKey(r.close_date ?? null)
       if (!month || month < currentMonth) continue
       if (!arrMap.has(month)) {
         arrMap.set(month, new Map())
         countMap.set(month, new Map())
       }
-      const stage = r.stage_name || '—'
+      const stage = normalizeStage(r.stage_name || '—')
       const arrStage = arrMap.get(month)!
       const countStage = countMap.get(month)!
       arrStage.set(stage, (arrStage.get(stage) ?? 0) + r.arr)
       countStage.set(stage, (countStage.get(stage) ?? 0) + 1)
     }
+    // Merge any remaining variant keys into canonical (e.g. "Qualif" -> "Qualification")
+    const canonicalList = ['Pricing & Negotiation', 'Contract & Close', 'Demo & Solutioning', 'Discovery & Application Overview', 'Qualification', 'Proposal', 'Internal']
+    for (const month of countMap.keys()) {
+      const countStage = countMap.get(month)!
+      for (const key of Array.from(countStage.keys())) {
+        const canonical = canonicalList.find((c) => c.toLowerCase() === key.toLowerCase() || normalizeStage(key) === c)
+        if (canonical && canonical !== key) {
+          countStage.set(canonical, (countStage.get(canonical) ?? 0) + (countStage.get(key) ?? 0))
+          countStage.delete(key)
+        }
+      }
+    }
+    for (const month of arrMap.keys()) {
+      const arrStage = arrMap.get(month)!
+      for (const key of Array.from(arrStage.keys())) {
+        const canonical = canonicalList.find((c) => c.toLowerCase() === key.toLowerCase() || normalizeStage(key) === c)
+        if (canonical && canonical !== key) {
+          arrStage.set(canonical, (arrStage.get(canonical) ?? 0) + (arrStage.get(key) ?? 0))
+          arrStage.delete(key)
+        }
+      }
+    }
     const months = Array.from(arrMap.keys()).sort()
     const stagesSet = new Set<string>()
     arrMap.forEach((stageMap) => stageMap.forEach((_, stage) => stagesSet.add(stage)))
+    countMap.forEach((stageMap) => stageMap.forEach((_, stage) => stagesSet.add(stage)))
     const stages = Array.from(stagesSet).sort()
     const stageColors: Record<string, string> = {}
     const palette = ['#3b82f6', '#10b981', '#f59e0b', '#8b5cf6', '#ec4899', '#06b6d4', '#84cc16', '#f97316']
@@ -180,9 +244,9 @@ export default function Pipeline() {
   }
 
   const PLOT_HEIGHT = 180
-  const ARR_Y_TICKS = [0, 1, 2, 3] // 0 = $0, 1 = $1M, 2 = $2M, 3 = $3M
-  const formatArrTick = (tick: number) => (tick === 0 ? '$0' : `$${tick}M`)
-  const COUNT_Y_TICKS = [0, 30, 60, 90, 120]
+  const ARR_Y_TICKS = [0, 0.5, 1, 1.5, 2, 2.5, 3, 3.5] // gridlines every $0.5M, max $3.5M
+  const formatArrTick = (tick: number) => (tick === 0 ? '$0.0M' : `$${Number(tick).toFixed(1)}M`)
+  const COUNT_Y_TICKS = [0, 30, 60, 90, 120, 150]
 
   const salesforce_base_url =
     data?.salesforce_base_url &&
@@ -216,13 +280,16 @@ export default function Pipeline() {
   }, [rows, sortKey, sortDir])
 
   const closeDateOptions = useMemo(() => {
-    const months = [...new Set(rows.map((r) => r.close_date?.slice(0, 7)).filter(Boolean))] as string[]
+    const months = [...new Set(rows.map((r) => toMonthKey(r.close_date ?? null)).filter(Boolean))] as string[]
     return months.sort().reverse()
   }, [rows])
 
   const displayRows = useMemo(() => {
     if (filterCloseDate.length === 0) return sortedRows
-    return sortedRows.filter((r) => r.close_date && filterCloseDate.includes(r.close_date.slice(0, 7)))
+    return sortedRows.filter((r) => {
+      const m = toMonthKey(r.close_date ?? null)
+      return m != null && filterCloseDate.includes(m)
+    })
   }, [sortedRows, filterCloseDate])
 
   const grandTotalDisplay =
@@ -436,7 +503,7 @@ export default function Pipeline() {
                       {chartData.months.map((month) => {
                         const segMap = chartData.arrMap.get(month)!
                         const total = Array.from(segMap.values()).reduce((a, b) => a + b, 0)
-                        const arrMax = 3e6
+                        const arrMax = 3.5e6
                         const barHeightPct = total > 0 ? Math.min(100, (total / arrMax) * 100) : 0
                         const barHeight = (barHeightPct / 100) * PLOT_HEIGHT
                         return (
@@ -531,8 +598,9 @@ export default function Pipeline() {
                     <div style={{ height: '100%', display: 'flex', alignItems: 'flex-end', gap: '0.25rem', position: 'relative', zIndex: 1 }}>
                       {chartData.months.map((month) => {
                         const countSegMap = chartData.countMap.get(month)!
-                        const totalCount = Array.from(countSegMap.values()).reduce((a, b) => a + b, 0)
-                        const countMax = 120
+                        const segmentsThisMonth = Array.from(countSegMap.keys()).sort()
+                        const totalCount = segmentsThisMonth.reduce((sum, seg) => sum + (countSegMap.get(seg) ?? 0), 0)
+                        const countMax = 150
                         const barHeightPct = totalCount > 0 ? Math.min(100, (totalCount / countMax) * 100) : 0
                         const barHeight = (barHeightPct / 100) * PLOT_HEIGHT
                         return (
@@ -542,17 +610,18 @@ export default function Pipeline() {
                               {totalCount}
                             </div>
                             <div style={{ width: '100%', maxWidth: 36, height: totalCount > 0 ? barHeight : 0, minHeight: 0, display: 'flex', flexDirection: 'column-reverse', overflow: 'hidden', borderRadius: '2px 2px 0 0' }}>
-                              {chartData.segments.map((seg) => {
+                              {segmentsThisMonth.map((seg) => {
                                 const count = countSegMap.get(seg) ?? 0
                                 if (count <= 0) return null
                                 const segPct = totalCount > 0 ? (count / totalCount) * 100 : 0
+                                const color = chartData.segmentColors[seg] ?? '#94a3b8'
                                 return (
                                   <div
                                     key={seg}
                                     style={{
                                       height: `${segPct}%`,
                                       minHeight: count >= 1 ? 20 : 0,
-                                      background: chartData.segmentColors[seg],
+                                      background: color,
                                       display: 'flex',
                                       alignItems: 'center',
                                       justifyContent: 'center',
@@ -628,7 +697,7 @@ export default function Pipeline() {
                           {chartDataByStage.months.map((month) => {
                             const stageMap = chartDataByStage.arrMap.get(month)!
                             const total = Array.from(stageMap.values()).reduce((a, b) => a + b, 0)
-                            const arrMax = 3e6
+                            const arrMax = 3.5e6
                             const barHeightPct = total > 0 ? Math.min(100, (total / arrMax) * 100) : 0
                             const barHeight = (barHeightPct / 100) * PLOT_HEIGHT
                             return (
@@ -721,8 +790,11 @@ export default function Pipeline() {
                         <div style={{ height: '100%', display: 'flex', alignItems: 'flex-end', gap: '0.25rem', position: 'relative', zIndex: 1 }}>
                           {chartDataByStage.months.map((month) => {
                             const countStageMap = chartDataByStage.countMap.get(month)!
-                            const totalCount = Array.from(countStageMap.values()).reduce((a, b) => a + b, 0)
-                            const countMax = 120
+                            const totalCount = chartDataByStage.stages.reduce(
+                              (sum, stage) => sum + (countStageMap.get(stage) ?? 0),
+                              0
+                            )
+                            const countMax = 150
                             const barHeightPct = totalCount > 0 ? Math.min(100, (totalCount / countMax) * 100) : 0
                             const barHeight = (barHeightPct / 100) * PLOT_HEIGHT
                             return (
@@ -736,24 +808,28 @@ export default function Pipeline() {
                                     const count = countStageMap.get(stage) ?? 0
                                     if (count <= 0) return null
                                     const stagePct = totalCount > 0 ? (count / totalCount) * 100 : 0
+                                    const color = chartDataByStage.stageColors[stage] ?? '#94a3b8'
+                                    const segmentHeightPx = totalCount > 0 && barHeight > 0 ? (count / totalCount) * barHeight : 0
+                                    const showLabel = segmentHeightPx >= 14
                                     return (
                                       <div
                                         key={stage}
                                         style={{
-                                          height: `${stagePct}%`,
-                                          minHeight: count >= 1 ? 20 : 0,
-                                          background: chartDataByStage.stageColors[stage],
+                                          flex: `${stagePct} 0 0`,
+                                          minHeight: 0,
+                                          background: color,
                                           display: 'flex',
                                           alignItems: 'center',
                                           justifyContent: 'center',
                                           color: '#fff',
                                           fontWeight: 600,
                                           fontSize: '0.7rem',
+                                          lineHeight: 1,
                                           textShadow: '0 0 1px rgba(0,0,0,0.5)',
                                         }}
                                         title={`${stage}: ${count} opps`}
                                       >
-                                        {count >= 1 ? count : ''}
+                                        {showLabel ? count : ''}
                                       </div>
                                     )
                                   })}
@@ -770,13 +846,16 @@ export default function Pipeline() {
                       </div>
                     </div>
                   </div>
-                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.5rem 1rem', marginTop: '0.75rem', fontSize: '0.7rem', color: 'var(--text-muted)' }}>
-                    {chartDataByStage.stages.map((stage) => (
-                      <span key={stage} style={{ display: 'inline-flex', alignItems: 'center', gap: '0.35rem' }}>
-                        <span style={{ width: 8, height: 8, borderRadius: 2, background: chartDataByStage.stageColors[stage] }} />
-                        {stage}
-                      </span>
-                    ))}
+                  <div style={{ marginTop: '0.75rem', paddingTop: '0.5rem', borderTop: '1px solid var(--border)' }}>
+                    <div style={{ fontSize: '0.65rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '0.35rem', textTransform: 'uppercase' }}>Stages</div>
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.5rem 1rem', fontSize: '0.7rem', color: 'var(--text-muted)' }}>
+                      {chartDataByStage.stages.map((stage) => (
+                        <span key={stage} style={{ display: 'inline-flex', alignItems: 'center', gap: '0.35rem' }}>
+                          <span style={{ width: 8, height: 8, borderRadius: 2, background: chartDataByStage.stageColors[stage], flexShrink: 0 }} />
+                          {stage}
+                        </span>
+                      ))}
+                    </div>
                   </div>
                 </div>
               </div>

@@ -83,6 +83,7 @@ To have them run constantly (including when your computer is off):
    - Use a **persistent volume** for the SQLite file if the host supports it (e.g. Fly.io volumes).
 
 3. **Secrets:** Put all `backend/.env` values (Salesforce credentials, Google credentials, etc.) into the host’s **environment variables** or secrets (no `.env` file in the repo).
+4. **Contracted ARR / term field:** For Contracted ARR to match local, set **SALESFORCE_LINE_ITEM_TERM_FIELD** on the host to the same value as in your local `backend/.env` (e.g. `Term__c`). Without it, line-item term is not synced and ARR is computed without period weighting, so totals can differ. After adding or changing it, run **Sync from Salesforce** in the deployed app.
 
 4. **No code changes needed** — the scheduler is already in the app; once the backend is running 24/7 on a host, sync and EOD snapshot will run on schedule in EST.
 

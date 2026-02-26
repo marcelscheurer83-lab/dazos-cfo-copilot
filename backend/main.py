@@ -88,10 +88,10 @@ async def _ensure_active_arr_overrides():
 # Load .env from backend directory so GOOGLE_SHEET_ID etc. are available so GOOGLE_SHEET_ID etc. are available
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
-# App password: read from .env file only (ignore system env) so local dev isn't affected by stray APP_PASSWORD
+# App password: read from .env file first; if not set there, use system env (for deployed hosts that set APP_PASSWORD in the environment).
 _env_path = Path(__file__).resolve().parent / ".env"
 _env_dict = dotenv_values(str(_env_path)) if _env_path.exists() else {}
-_app_password_raw = _env_dict.get("APP_PASSWORD")
+_app_password_raw = _env_dict.get("APP_PASSWORD") or os.getenv("APP_PASSWORD")
 APP_PASSWORD = (_app_password_raw or "").strip().strip('"').strip("'") or None
 
 EST = ZoneInfo("America/New_York")
@@ -3845,7 +3845,7 @@ async def debug_routes():
         "paths": sorted(p for p in paths if p),
         "dashboard_routes": [p for p in paths if p and "dashboard" in p],
         "app_password_required": bool(APP_PASSWORD),
-        "source": "backend/.env (APP_PASSWORD); if unset or missing there, no password required",
+        "source": "backend/.env or APP_PASSWORD env var; if both unset, no password required",
     }
 
 
@@ -3857,7 +3857,7 @@ async def debug_app_password_status():
     """
     return {
         "app_password_required": bool(APP_PASSWORD),
-        "source": "backend/.env (APP_PASSWORD); if unset or missing there, no password required",
+        "source": "backend/.env or APP_PASSWORD env var; if both unset, no password required",
     }
 
 

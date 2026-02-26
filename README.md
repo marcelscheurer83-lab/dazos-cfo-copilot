@@ -140,6 +140,16 @@ To sync P&L, Balance Sheet, and Cash Flow from QuickBooks:
    - `QB_REFRESH_TOKEN` — from the OAuth exchange (step 2)
 4. **Sync:** `POST http://localhost:8000/api/sync/quickbooks`. Then `GET http://localhost:8000/api/quickbooks/reports/pl` (or `balance_sheet`, `cash_flow`) to read the latest report snapshot.
 
+### Chargebee connector (billing reconciliation)
+
+Chargebee is the billing engine; **ARR remains sourced from Salesforce**. This connector is for billing reconciliation (subscriptions and invoices).
+
+1. In **Chargebee**: Settings → API Keys — create or copy an API key. Your **site** is the subdomain in `https://<site>.chargebee.com`.
+2. In `backend/.env` set:
+   - `CHARGEBEE_SITE` — your site name (e.g. `dazos-test`)
+   - `CHARGEBEE_API_KEY` — your Chargebee API key
+3. **Sync:** `POST http://localhost:8000/api/sync/chargebee`. Then `GET http://localhost:8000/api/chargebee/subscriptions` or `GET http://localhost:8000/api/chargebee/invoices` to read the latest snapshot.
+
 ## Extending the Copilot
 
 - The **Copilot** tab uses rule-based answers from your KPI and P&L data. You can plug in OpenAI or another LLM by reading `COPILOT_API_KEY` in `backend/main.py` and sending the user question plus a context summary (e.g. latest KPI, recent P&L) to the API.

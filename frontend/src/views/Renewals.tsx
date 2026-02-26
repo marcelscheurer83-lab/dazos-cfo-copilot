@@ -487,12 +487,14 @@ export default function Renewals() {
                                 if (arr <= 0) return null
                                 const pct = total > 0 ? (arr / total) * 100 : 0
                                 const arrK = Math.round(arr / 1000)
+                                const segmentHeightPx = total > 0 && barHeight > 0 ? (arr / total) * barHeight : 0
+                                const showLabel = segmentHeightPx >= 14
                                 return (
                                   <div
                                     key={stage}
                                     style={{
-                                      height: `${pct}%`,
-                                      minHeight: arrK >= 50 ? 20 : 0,
+                                      flex: `${pct} 0 0`,
+                                      minHeight: 0,
                                       background: chartDataByStage.stageColors[stage],
                                       display: 'flex',
                                       alignItems: 'center',
@@ -504,7 +506,7 @@ export default function Renewals() {
                                     }}
                                     title={`${stage}: ${fmtMoney(arr)}`}
                                   >
-                                    {arrK >= 50 ? `$${arrK}K` : ''}
+                                    {showLabel ? `$${arrK}K` : ''}
                                   </div>
                                 )
                               })}
@@ -586,12 +588,14 @@ export default function Renewals() {
                                 const count = countStageMap.get(stage) ?? 0
                                 if (count <= 0) return null
                                 const segPct = totalCount > 0 ? (count / totalCount) * 100 : 0
+                                const segmentHeightPx = totalCount > 0 && barHeight > 0 ? (count / totalCount) * barHeight : 0
+                                const showLabel = segmentHeightPx >= 14
                                 return (
                                   <div
                                     key={stage}
                                     style={{
-                                      height: `${segPct}%`,
-                                      minHeight: count >= 1 ? 20 : 0,
+                                      flex: `${segPct} 0 0`,
+                                      minHeight: 0,
                                       background: chartDataByStageCount.stageColors[stage],
                                       display: 'flex',
                                       alignItems: 'center',
@@ -603,7 +607,7 @@ export default function Renewals() {
                                     }}
                                     title={`${stage}: ${count} opps`}
                                   >
-                                    {count >= 1 ? count : ''}
+                                    {showLabel ? count : ''}
                                   </div>
                                 )
                               })}

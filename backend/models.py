@@ -93,6 +93,15 @@ class QuickBooksReportSnapshot(Base):
     data_json = Column(Text, nullable=False)  # Full report JSON from QB API
 
 
+class ChargebeeSnapshot(Base):
+    """Stored snapshot of Chargebee list API response for billing reconciliation."""
+    __tablename__ = "chargebee_snapshots"
+    id = Column(Integer, primary_key=True)
+    report_type = Column(String(32), nullable=False)  # subscriptions, invoices
+    as_of = Column(DateTime, server_default=func.now())
+    data_json = Column(Text, nullable=False)  # Full list response: { "list": [...], "next_offset": "..." }
+
+
 class Opportunity(Base):
     """Synced from Salesforce (Phase 1b) for ARR and pipeline."""
     __tablename__ = "opportunities"

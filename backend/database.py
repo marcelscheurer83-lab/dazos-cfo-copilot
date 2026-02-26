@@ -5,7 +5,12 @@ import os
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./cfo.db")
 
-engine = create_async_engine(DATABASE_URL, echo=False)
+# Timeout (seconds) for SQLite when DB is locked; reduces "database is locked" on concurrent sheet sync + dashboard reads
+_connect_args = {}
+if DATABASE_URL.startswith("sqlite"):
+    _connect_args["timeout"] = 15
+
+engine = create_async_engine(DATABASE_URL, echo=False, connect_args=_connect_args)
 AsyncSessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 Base = declarative_base()
 

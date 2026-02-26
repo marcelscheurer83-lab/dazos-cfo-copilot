@@ -5,13 +5,14 @@ All scheduled times (hourly sync, EOD snapshot) use America/New_York (EST/EDT).
 """
 import asyncio
 import json
+import logging
 import os
 import re
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, Depends, HTTPException, Query
@@ -35,6 +36,7 @@ from models import (
     OpportunityLineItem,
     OpportunityRecordTypeOverride,
     QuickBooksReportSnapshot,
+    ChargebeeSnapshot,
     SalesforceEODSnapshot,
 )
 from schemas import (
@@ -49,6 +51,8 @@ from schemas import (
     BookingsMTDRow,
     BookingsPeriod,
     RenewalsMTDResponse,
+    CashMTDResponse,
+    CashPeriod,
     RenewalsMTDPeriod,
 )
 from seed_data import seed
@@ -123,6 +127,26 @@ class RequireAppPasswordMiddleware(BaseHTTPMiddleware):
 
 
 app.add_middleware(RequireAppPasswordMiddleware)
+
+# Ensure dashboard MTD endpoints never return 500/non-JSON (e.g. if get_db or any dependency fails)
+_DASHBOARD_MTD_PATHS = frozenset({"/api/dashboard/renewals-mtd", "/api/dashboard/cash-mtd", "/api/dashboard/bookings-mtd"})
+_logger = logging.getLogger(__name__)
+
+
+@app.exception_handler(Exception)
+async def _dashboard_mtd_exception_handler(request: Request, exc: Exception):
+    """Catch any unhandled exception for dashboard MTD endpoints and return 200 + JSON so frontend never sees 500/non-JSON."""
+    if request.url.path not in _DASHBOARD_MTD_PATHS:
+        raise exc
+    _logger.exception("Dashboard MTD error for %s: %s", request.url.path, exc)
+    msg = f"{type(exc).__name__}: {str(exc)[:120]}"
+    if request.url.path == "/api/dashboard/renewals-mtd":
+        return JSONResponse(status_code=200, content=_safe_renewals_fallback(msg))
+    if request.url.path == "/api/dashboard/cash-mtd":
+        return JSONResponse(status_code=200, content=_safe_cash_fallback(msg))
+    if request.url.path == "/api/dashboard/bookings-mtd":
+        return JSONResponse(status_code=200, content=_safe_bookings_fallback(msg))
+    raise exc
 
 
 def _runway_months(cash: float, burn: float) -> Optional[float]:
@@ -1477,7 +1501,15 @@ async def get_dashboard_bookings_mtd(db: AsyncSession = Depends(get_db)):
     Previous month, current month MTD, and current quarter-to-date Closed Won bookings (New Business + Expansion) vs plan.
     ARR from product line items only (excl. iVerify/Kipu), consistent with ARR overview.
     Plan from sheet ARR_Calculations_2026P: row 11 = new business, row 12 = expansion; columns BU..CF = Jan..Dec.
+    On any failure returns 200 + JSON so frontend never sees 500/non-JSON.
     """
+    try:
+        return await _get_dashboard_bookings_mtd_impl(db)
+    except Exception as e:
+        return JSONResponse(status_code=200, content=_safe_bookings_fallback(f"Error loading bookings: {str(e)[:100]}"))
+
+
+async def _get_dashboard_bookings_mtd_impl(db: AsyncSession) -> BookingsMTDResponse:
     now_est = datetime.now(EST)
     year, month = now_est.year, now_est.month
     today = now_est.date()
@@ -1642,12 +1674,62 @@ ARR_2026P_ROW_CONTRACTION_RATE = 53  # 0-based row 54 = contraction rate %
 ARR_2026P_QUARTER_RR_COLUMNS = ("X", "Y", "Z", "AA")  # Q1..Q4 renewal rate and contraction rate in row 52 / 54
 
 
+def _safe_renewals_fallback(plan_message: str) -> dict:
+    """Minimal valid renewals JSON so frontend never gets 500/non-JSON."""
+    now_est = datetime.now(EST)
+    y, m = now_est.year, now_est.month
+    prev = datetime(y - 1, 12, 1).strftime("%b %y") if m == 1 else datetime(y, m - 1, 1).strftime("%b %y")
+    cur = now_est.strftime("%b %y") + " MTD"
+    qm = ((m - 1) // 3) * 3 + 1
+    qtd = f"Q{(qm - 1) // 3 + 1} {str(y)[2:]} QTD"
+    row = {"mtd": 0.0, "plan": None, "achievement_pct": None, "delta_k": None}
+    per = lambda label: {"period_label": label, "total": row, "renewed": row, "open": row, "churn": row, "contraction": row, "renewal_rate": row}
+    return {"previous_month": per(prev), "current_mtd": per(cur), "qtd": per(qtd), "plan_source": None, "plan_message": plan_message}
+
+
+def _safe_cash_fallback(plan_message: str) -> dict:
+    """Minimal valid cash JSON for exception handler so frontend never gets 500/non-JSON."""
+    now_est = datetime.now(EST)
+    y, m = now_est.year, now_est.month
+    prev = datetime(y - 1, 12, 1).strftime("%b %y") if m == 1 else datetime(y, m - 1, 1).strftime("%b %y")
+    cur = now_est.strftime("%b %y") + " MTD"
+    qm = ((m - 1) // 3) * 3 + 1
+    qtd = f"Q{(qm - 1) // 3 + 1} {str(y)[2:]} QTD"
+    empty = {"period_label": "", "billings_plan": None, "collections_plan": None, "billings_actual": None, "collections_actual": None, "billings_achievement_pct": None, "billings_delta_k": None, "collections_achievement_pct": None, "collections_delta_k": None}
+    return {
+        "previous_month": {**empty, "period_label": prev},
+        "current_mtd": {**empty, "period_label": cur},
+        "qtd": {**empty, "period_label": qtd},
+        "plan_source": None,
+        "plan_message": plan_message,
+        "chargebee_message": None,
+    }
+
+
+def _safe_bookings_fallback(plan_message: str) -> dict:
+    """Minimal valid bookings JSON for exception handler so frontend never gets 500/non-JSON."""
+    now_est = datetime.now(EST)
+    y, m = now_est.year, now_est.month
+    prev = datetime(y - 1, 12, 1).strftime("%b %y") if m == 1 else datetime(y, m - 1, 1).strftime("%b %y")
+    cur = now_est.strftime("%b %y") + " MTD"
+    qm = ((m - 1) // 3) * 3 + 1
+    qtd = f"Q{(qm - 1) // 3 + 1} {str(y)[2:]} QTD"
+    row = {"mtd": 0.0, "plan": None, "achievement_pct": None, "delta_k": None}
+    per = lambda label: {"period_label": label, "total": row, "new_business": row, "expansion": row}
+    return {"previous_month": per(prev), "current_mtd": per(cur), "qtd": per(qtd), "plan_source": None, "plan_message": plan_message}
+
+
 @app.get("/api/dashboard/renewals-mtd", response_model=RenewalsMTDResponse)
 async def get_dashboard_renewals_mtd(db: AsyncSession = Depends(get_db)):
-    """
-    Renewals metrics: previous month, current MTD, QTD. Total, Renewed, Open, Churn, Contraction, Renewal rate (ARR-based).
-    Plan from sheet: row 52 = renewal rate %, row 54 = contraction rate % (Jan..Dec = BU..CF; Q1..Q4 = X,Y,Z,AA). Churn plan = up for renewal - renewed plan - contraction plan.
-    """
+    """Renewals metrics: previous month, MTD, QTD. On failure returns 200 + JSON so frontend never sees 500."""
+    try:
+        return await _get_dashboard_renewals_mtd_impl(db)
+    except Exception as e:
+        return JSONResponse(status_code=200, content=_safe_renewals_fallback(f"Error loading renewals: {str(e)[:100]}"))
+
+
+async def _get_dashboard_renewals_mtd_impl(db: AsyncSession) -> RenewalsMTDResponse:
+    """Renewals metrics: previous month, current MTD, QTD. Plan from sheet row 52/54."""
     now_est = datetime.now(EST)
     year, month = now_est.year, now_est.month
     today = now_est.date()
@@ -1768,6 +1850,269 @@ async def get_dashboard_renewals_mtd(db: AsyncSession = Depends(get_db)):
         qtd=period(qtd_label, qtd_t, qtd_r, qtd_o, qtd_ch, qtd_cont, qtd_rr, q_cont_rate, q_rr_plan if q_rr_plan else None),
         plan_source=plan_source,
         plan_message=plan_message,
+    )
+
+
+# BS_2026P: Billings row 45 (index 44); Collections = sum rows 64,65,66 (indices 63,64,65). Same month columns as ARR (BU..CF = Jan..Dec).
+BS_2026P_BILLINGS_ROW = 44
+BS_2026P_COLLECTIONS_ROWS = (63, 64, 65)
+
+
+@app.get("/api/dashboard/cash-mtd", response_model=CashMTDResponse)
+async def get_dashboard_cash_mtd(db: AsyncSession = Depends(get_db)):
+    """
+    Cash KPIs: Billings and Collections. Same layout as Bookings: previous month, MTD, QTD.
+    Plan from sheet BS_2026P: row 45 = Billings by month (BU..CF = Jan..Dec), rows 64–66 sum = Collections by month.
+    Actuals from Chargebee (invoices = billings, payments = collections).
+    On any failure returns 200 + JSON with plan_message set so the frontend never sees 500 or non-JSON.
+    """
+    def _empty_period(label: str) -> CashPeriod:
+        return CashPeriod(
+            period_label=label,
+            billings_plan=None,
+            collections_plan=None,
+            billings_actual=None,
+            collections_actual=None,
+            billings_achievement_pct=None,
+            billings_delta_k=None,
+            collections_achievement_pct=None,
+            collections_delta_k=None,
+        )
+
+    def _safe_cash_body(plan_message: Optional[str]) -> dict:
+        now_est = datetime.now(EST)
+        year, month = now_est.year, now_est.month
+        if month == 1:
+            prev_label = datetime(year - 1, 12, 1).strftime("%b %y")
+        else:
+            prev_label = datetime(year, month - 1, 1).strftime("%b %y")
+        current_label = now_est.strftime("%b %y") + " MTD"
+        quarter_month = ((month - 1) // 3) * 3 + 1
+        qtd_label = f"Q{(quarter_month - 1) // 3 + 1} {str(year)[2:]} QTD"
+        p = _empty_period(prev_label)
+        c = _empty_period(current_label)
+        q = _empty_period(qtd_label)
+        return {
+            "previous_month": p.model_dump(),
+            "current_mtd": c.model_dump(),
+            "qtd": q.model_dump(),
+            "plan_source": None,
+            "plan_message": plan_message,
+            "chargebee_message": None,
+        }
+
+    try:
+        return await _get_dashboard_cash_mtd_impl(db)
+    except Exception as e:
+        err_msg = str(e)[:120]
+        try:
+            body = _safe_cash_body(f"Error loading cash data: {err_msg}")
+            return JSONResponse(status_code=200, content=body)
+        except Exception:
+            # Fallback: minimal dict so frontend always gets valid JSON
+            now_est = datetime.now(EST)
+            y, m = now_est.year, now_est.month
+            prev = datetime(y - 1, 12, 1).strftime("%b %y") if m == 1 else datetime(y, m - 1, 1).strftime("%b %y")
+            cur = now_est.strftime("%b %y") + " MTD"
+            qm = ((m - 1) // 3) * 3 + 1
+            qtd = f"Q{(qm - 1) // 3 + 1} {str(y)[2:]} QTD"
+            empty = {"period_label": "", "billings_plan": None, "collections_plan": None, "billings_actual": None, "collections_actual": None, "billings_achievement_pct": None, "billings_delta_k": None, "collections_achievement_pct": None, "collections_delta_k": None}
+            return JSONResponse(status_code=200, content={
+                "previous_month": {**empty, "period_label": prev},
+                "current_mtd": {**empty, "period_label": cur},
+                "qtd": {**empty, "period_label": qtd},
+                "plan_source": None,
+                "plan_message": "Error loading cash data.",
+                "chargebee_message": None,
+            })
+
+
+async def _get_dashboard_cash_mtd_impl(db: AsyncSession) -> CashMTDResponse:
+    now_est = datetime.now(EST)
+    year, month = now_est.year, now_est.month
+    if month == 1:
+        prev_label = datetime(year - 1, 12, 1).strftime("%b %y")
+    else:
+        prev_label = datetime(year, month - 1, 1).strftime("%b %y")
+    current_label = now_est.strftime("%b %y") + " MTD"
+    quarter_month = ((month - 1) // 3) * 3 + 1
+    qtd_label = f"Q{(quarter_month - 1) // 3 + 1} {str(year)[2:]} QTD"
+
+    sheet_range = "BS_2026P!A1:ZZ1000"
+    plan_source: Optional[str] = None
+    plan_message: Optional[str] = None
+    billings_by_month: list[Optional[float]] = [None] * 12
+    collections_by_month: list[Optional[float]] = [None] * 12
+
+    r_snap = await db.execute(
+        select(SheetSnapshot).where(SheetSnapshot.range_name == sheet_range).order_by(SheetSnapshot.as_of.desc()).limit(1)
+    )
+    snap = r_snap.scalar_one_or_none()
+    if snap and snap.data_json:
+        data = json.loads(snap.data_json)
+        try:
+            row_billings = data[BS_2026P_BILLINGS_ROW] if len(data) > BS_2026P_BILLINGS_ROW else []
+            for m in range(12):
+                col_idx = _a1_col_to_index(ARR_2026P_MONTH_COLUMNS[m])
+                v = row_billings[col_idx] if col_idx < len(row_billings) else None
+                billings_by_month[m] = _to_float_sheet(v)
+            for m in range(12):
+                col_idx = _a1_col_to_index(ARR_2026P_MONTH_COLUMNS[m])
+                coll = 0.0
+                for ri in BS_2026P_COLLECTIONS_ROWS:
+                    if len(data) > ri:
+                        row = data[ri]
+                        if col_idx < len(row):
+                            v = _to_float_sheet(row[col_idx])
+                            if v is not None:
+                                coll += v
+                collections_by_month[m] = coll if coll else None
+            plan_source = "BS_2026P"
+        except (TypeError, ValueError, IndexError):
+            plan_message = "Could not read Cash plan from sheet."
+    else:
+        plan_message = "No sheet snapshot. Sync BS_2026P first."
+
+    prev_m = (month - 2 + 12) % 12
+    c_m = month - 1
+    prev_b = billings_by_month[prev_m]
+    prev_c = collections_by_month[prev_m]
+    curr_b = billings_by_month[c_m]
+    curr_c = collections_by_month[c_m]
+    q_b = sum(billings_by_month[i] or 0 for i in range(quarter_month - 1, min(quarter_month + 2, 12)))
+    q_c = sum(collections_by_month[i] or 0 for i in range(quarter_month - 1, min(quarter_month + 2, 12)))
+
+    # Actuals from Chargebee: billings = invoice total by invoice date; collections = payment transactions by date (matches Total Payments export)
+    prev_billings_act: Optional[float] = None
+    prev_coll_act: Optional[float] = None
+    mtd_billings_act: Optional[float] = None
+    mtd_coll_act: Optional[float] = None
+    qtd_billings_act: Optional[float] = None
+    qtd_coll_act: Optional[float] = None
+    if month == 1:
+        prev_first = datetime(year - 1, 12, 1, 0, 0, 0, tzinfo=EST)
+        prev_last = datetime(year - 1, 12, 31, 23, 59, 59, tzinfo=EST)
+    else:
+        prev_first = datetime(year, month - 1, 1, 0, 0, 0, tzinfo=EST)
+        next_month_first = (prev_first + timedelta(days=32)).replace(day=1)
+        prev_last = next_month_first - timedelta(seconds=1)
+    curr_first = datetime(year, month, 1, 0, 0, 0, tzinfo=EST)
+    curr_last = now_est
+    qtd_first_dt = datetime(year, quarter_month, 1, 0, 0, 0, tzinfo=EST)
+    prev_start_ts = int(prev_first.timestamp())
+    prev_end_ts = int(prev_last.timestamp())
+    curr_start_ts = int(curr_first.timestamp())
+    curr_end_ts = int(curr_last.timestamp())
+    qtd_start_ts = int(qtd_first_dt.timestamp())
+
+    from connectors.chargebee import ChargebeeConnector
+    connector = ChargebeeConnector()
+    chargebee_message: Optional[str] = None
+    if connector.is_configured():
+        def _in_range(ts: Optional[int], start: int, end: int) -> bool:
+            if ts is None:
+                return False
+            return start <= ts <= end
+
+        invoices: list[Any] = []
+        payments: list[Any] = []
+
+        # Billings: from invoices by invoice date (unchanged)
+        try:
+            invoices = await asyncio.to_thread(
+                connector.fetch_invoices_in_date_range,
+                prev_start_ts,
+                curr_end_ts + 86400,
+            )
+        except Exception as e:
+            chargebee_message = f"Chargebee: {str(e)[:80]}"
+
+        for inv in invoices:
+            inv_date = inv.get("date")
+            try:
+                inv_ts = int(inv_date) if inv_date is not None else None
+            except (TypeError, ValueError):
+                inv_ts = None
+            total = inv.get("total")
+            try:
+                total_f = float(total) if total is not None else 0.0
+            except (TypeError, ValueError):
+                total_f = 0.0
+            total_f = total_f / 100.0  # cents to dollars
+            if inv_ts is not None:
+                if _in_range(inv_ts, prev_start_ts, prev_end_ts):
+                    prev_billings_act = (prev_billings_act or 0) + total_f
+                if _in_range(inv_ts, curr_start_ts, curr_end_ts):
+                    mtd_billings_act = (mtd_billings_act or 0) + total_f
+                if inv_ts >= qtd_start_ts and inv_ts <= curr_end_ts:
+                    qtd_billings_act = (qtd_billings_act or 0) + total_f
+
+        # Collections: from payment transactions by transaction date (matches Chargebee Total Payments export)
+        try:
+            payments = await asyncio.to_thread(
+                connector.fetch_payments_in_date_range,
+                prev_start_ts,
+                curr_end_ts + 86400,
+            )
+        except Exception as e:
+            if not chargebee_message:
+                chargebee_message = f"Chargebee payments: {str(e)[:80]}"
+
+        for txn in payments:
+            txn_date = txn.get("date")
+            try:
+                txn_ts = int(txn_date) if txn_date is not None else None
+            except (TypeError, ValueError):
+                txn_ts = None
+            amount = txn.get("amount")
+            try:
+                amount_f = float(amount) if amount is not None else 0.0
+            except (TypeError, ValueError):
+                amount_f = 0.0
+            amount_f = amount_f / 100.0  # cents to dollars
+            if txn_ts is not None and amount_f:
+                if _in_range(txn_ts, prev_start_ts, prev_end_ts):
+                    prev_coll_act = (prev_coll_act or 0) + amount_f
+                if _in_range(txn_ts, curr_start_ts, curr_end_ts):
+                    mtd_coll_act = (mtd_coll_act or 0) + amount_f
+                if txn_ts >= qtd_start_ts and txn_ts <= curr_end_ts:
+                    qtd_coll_act = (qtd_coll_act or 0) + amount_f
+
+        if not chargebee_message and not invoices and not payments:
+            chargebee_message = "Chargebee: no invoices or payments in date range (check site/timezone)."
+    else:
+        chargebee_message = "Chargebee not configured (set CHARGEBEE_SITE and CHARGEBEE_API_KEY)."
+
+    def _cash_period(
+        label: str,
+        plan_b: Optional[float],
+        plan_c: Optional[float],
+        act_b: Optional[float],
+        act_c: Optional[float],
+    ) -> CashPeriod:
+        ach_b = (act_b / plan_b * 100) if plan_b and plan_b != 0 and act_b is not None else None
+        d_b = (act_b - plan_b) / 1000.0 if plan_b is not None and act_b is not None else None
+        ach_c = (act_c / plan_c * 100) if plan_c and plan_c != 0 and act_c is not None else None
+        d_c = (act_c - plan_c) / 1000.0 if plan_c is not None and act_c is not None else None
+        return CashPeriod(
+            period_label=label,
+            billings_plan=plan_b,
+            collections_plan=plan_c,
+            billings_actual=act_b,
+            collections_actual=act_c,
+            billings_achievement_pct=ach_b,
+            billings_delta_k=d_b,
+            collections_achievement_pct=ach_c,
+            collections_delta_k=d_c,
+        )
+
+    return CashMTDResponse(
+        previous_month=_cash_period(prev_label, prev_b, prev_c, prev_billings_act, prev_coll_act),
+        current_mtd=_cash_period(current_label, curr_b, curr_c, mtd_billings_act, mtd_coll_act),
+        qtd=_cash_period(qtd_label, q_b if q_b else None, q_c if q_c else None, qtd_billings_act, qtd_coll_act),
+        plan_source=plan_source,
+        plan_message=plan_message,
+        chargebee_message=chargebee_message,
     )
 
 
@@ -2869,6 +3214,13 @@ async def delete_manual_overwrite(
     return {"ok": True, "opportunity_sf_id": opportunity_sf_id}
 
 
+@app.get("/api/debug/routes")
+async def debug_routes():
+    """Return list of registered route paths (for debugging 404s)."""
+    paths = [getattr(r, "path", None) for r in app.routes if hasattr(r, "path") and getattr(r, "path", None)]
+    return {"paths": sorted(p for p in paths if p), "dashboard_routes": [p for p in paths if p and "dashboard" in p]}
+
+
 @app.get("/api/debug/renewal-date-config")
 async def debug_renewal_date_config(db: AsyncSession = Depends(get_db)):
     """
@@ -3032,5 +3384,71 @@ async def get_quickbooks_report(
     row = r.scalar_one_or_none()
     if not row:
         return {"report_type": report_type, "as_of": None, "data": None, "message": "No snapshot yet. Run POST /api/sync/quickbooks first."}
+    data = json.loads(row.data_json) if row.data_json else None
+    return {"report_type": report_type, "as_of": row.as_of.isoformat() if row.as_of else None, "data": data}
+
+
+# ----- Chargebee sync (billing reconciliation) -----
+
+CHARGEBEE_REPORT_TYPES = ["subscriptions", "invoices"]
+
+
+@app.post("/api/sync/chargebee")
+async def sync_chargebee(db: AsyncSession = Depends(get_db)):
+    """
+    Sync subscriptions and invoices from Chargebee into the app.
+    Requires CHARGEBEE_SITE and CHARGEBEE_API_KEY in .env.
+    """
+    from connectors.chargebee import ChargebeeConnector
+
+    connector = ChargebeeConnector()
+    if not connector.is_configured():
+        return {
+            "ok": False,
+            "error": "Chargebee not configured. Set CHARGEBEE_SITE and CHARGEBEE_API_KEY in backend/.env.",
+        }
+    synced = {}
+    for report_type in CHARGEBEE_REPORT_TYPES:
+        try:
+            if report_type == "subscriptions":
+                data = await asyncio.to_thread(connector.list_subscriptions, limit=100)
+            else:
+                data = await asyncio.to_thread(connector.list_invoices, limit=100)
+        except Exception as e:
+            return {"ok": False, "error": f"Chargebee {report_type} failed: {e}"}
+        snapshot = ChargebeeSnapshot(report_type=report_type, data_json=json.dumps(data))
+        db.add(snapshot)
+        count = len(data.get("list") or [])
+        synced[report_type] = count
+    await db.commit()
+    return {
+        "ok": True,
+        "synced": synced,
+        "message": "Chargebee subscriptions and invoices synced (first page each).",
+    }
+
+
+@app.get("/api/chargebee/{report_type}")
+async def get_chargebee_snapshot(
+    report_type: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """Return the latest Chargebee snapshot. report_type: subscriptions or invoices."""
+    if report_type not in CHARGEBEE_REPORT_TYPES:
+        return {"error": f"report_type must be one of: {', '.join(CHARGEBEE_REPORT_TYPES)}"}
+    r = await db.execute(
+        select(ChargebeeSnapshot)
+        .where(ChargebeeSnapshot.report_type == report_type)
+        .order_by(ChargebeeSnapshot.as_of.desc())
+        .limit(1)
+    )
+    row = r.scalar_one_or_none()
+    if not row:
+        return {
+            "report_type": report_type,
+            "as_of": None,
+            "data": None,
+            "message": "No snapshot yet. Run POST /api/sync/chargebee first.",
+        }
     data = json.loads(row.data_json) if row.data_json else None
     return {"report_type": report_type, "as_of": row.as_of.isoformat() if row.as_of else None, "data": data}

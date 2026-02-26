@@ -13,6 +13,7 @@ This roadmap turns the [vision in CONTEXT.md](CONTEXT.md) into a phased build. E
 | **1a** Connectors layer + Google Sheets | ✅ Done | Connectors layer + full model sync; plan data kept in background for summaries/analyses; dashboard shows KPI cards + “Refresh from sheet” only. |
 | **1b** Salesforce connector (ARR + GTM) | ✅ Done | Connector + Opportunity sync; POST /api/sync/salesforce, GET /api/opportunities. |
 | **1c** QuickBooks connector (financials) | ✅ Done | OAuth + Reports API; POST /api/sync/quickbooks, GET /api/quickbooks/reports/{pl,balance_sheet,cash_flow}. **Sandbox only for now** — production OAuth/keys later. |
+| **Chargebee** connector (billing reconciliation) | ✅ Done | CHARGEBEE_SITE + CHARGEBEE_API_KEY; POST /api/sync/chargebee, GET /api/chargebee/{subscriptions,invoices}. ARR stays from Salesforce. |
 | **2** Live exec dashboard | 🔲 Not started | KPIs from Sheets + Salesforce + QuickBooks. |
 | **3** ARR schedule (Salesforce) | 🔲 Not started | ARR schedule maintained from Salesforce; view in app. |
 | **4** Monthly & quarterly reports | 🔲 Not started | Draft reports from app data. |

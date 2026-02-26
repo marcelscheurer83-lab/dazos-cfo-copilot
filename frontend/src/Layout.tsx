@@ -17,9 +17,9 @@ const nav: NavItem[] = [
       { to: '/bookings', label: 'Bookings' },
       { to: '/gtm/renewals', label: 'Renewals' },
       { to: '/pipeline-overview', label: 'Pipeline' },
-      { to: '/customer-overview', label: 'Customer base' },
     ],
   },
+  { to: '/customer-overview', label: 'ARR schedule' },
   { to: '/financials', label: 'Financials' },
   { to: '/copilot', label: 'Copilot' },
   { to: '/admin', label: 'Admin' },
@@ -45,7 +45,7 @@ const subLinkStyle = (isActive: boolean) => ({
   fontSize: subLevelFontSize,
 })
 
-const GTM_PATHS = ['/bookings', '/gtm/renewals', '/pipeline-overview', '/customer-overview']
+const GTM_PATHS = ['/bookings', '/gtm/renewals', '/pipeline-overview']
 
 export default function Layout() {
   const location = useLocation()

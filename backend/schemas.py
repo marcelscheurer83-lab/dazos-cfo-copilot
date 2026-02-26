@@ -61,6 +61,29 @@ class RenewalsMTDResponse(BaseModel):
     plan_message: Optional[str] = None
 
 
+class CashPeriod(BaseModel):
+    """One period: Billings and Collections plan and actuals (actuals from Chargebee). % and delta vs plan."""
+    period_label: str
+    billings_plan: Optional[float] = None
+    collections_plan: Optional[float] = None
+    billings_actual: Optional[float] = None
+    collections_actual: Optional[float] = None
+    billings_achievement_pct: Optional[float] = None
+    billings_delta_k: Optional[float] = None  # (actual - plan) / 1000
+    collections_achievement_pct: Optional[float] = None
+    collections_delta_k: Optional[float] = None
+
+
+class CashMTDResponse(BaseModel):
+    """Cash KPIs: Billings and Collections. Plan from BS_2026P. Same period layout as Bookings (previous month, MTD, QTD)."""
+    previous_month: CashPeriod
+    current_mtd: CashPeriod
+    qtd: CashPeriod
+    plan_source: Optional[str] = None
+    plan_message: Optional[str] = None
+    chargebee_message: Optional[str] = None  # e.g. error or "No invoices in range"
+
+
 class KPISummary(BaseModel):
     as_of_date: date
     cash_balance: float

@@ -427,12 +427,14 @@ export default function Closed() {
                                 if (arr <= 0) return null
                                 const segPct = total > 0 ? (arr / total) * 100 : 0
                                 const arrK = Math.round(arr / 1000)
+                                const segmentHeightPx = total > 0 && barHeight > 0 ? (arr / total) * barHeight : 0
+                                const showLabel = segmentHeightPx >= 14
                                 return (
                                   <div
                                     key={seg}
                                     style={{
-                                      height: `${segPct}%`,
-                                      minHeight: arrK >= 50 ? 20 : 0,
+                                      flex: `${segPct} 0 0`,
+                                      minHeight: 0,
                                       background: chartData.segmentColors[seg],
                                       display: 'flex',
                                       alignItems: 'center',
@@ -444,7 +446,7 @@ export default function Closed() {
                                     }}
                                     title={`${seg}: ${fmtMoney(arr)}`}
                                   >
-                                    {arrK >= 50 ? `$${arrK}K` : ''}
+                                    {showLabel ? `$${arrK}K` : ''}
                                   </div>
                                 )
                               })}
@@ -505,12 +507,14 @@ export default function Closed() {
                                 const count = countSegMap.get(seg) ?? 0
                                 if (count <= 0) return null
                                 const segPct = totalCount > 0 ? (count / totalCount) * 100 : 0
+                                const segmentHeightPx = totalCount > 0 && barHeight > 0 ? (count / totalCount) * barHeight : 0
+                                const showLabel = segmentHeightPx >= 14
                                 return (
                                   <div
                                     key={seg}
                                     style={{
-                                      height: `${segPct}%`,
-                                      minHeight: count >= 1 ? 20 : 0,
+                                      flex: `${segPct} 0 0`,
+                                      minHeight: 0,
                                       background: chartData.segmentColors[seg],
                                       display: 'flex',
                                       alignItems: 'center',
@@ -522,7 +526,7 @@ export default function Closed() {
                                     }}
                                     title={`${seg}: ${count} opps`}
                                   >
-                                    {count >= 1 ? count : ''}
+                                    {showLabel ? count : ''}
                                   </div>
                                 )
                               })}
@@ -590,12 +594,14 @@ export default function Closed() {
                                   if (arr <= 0) return null
                                   const segPct = total > 0 ? (arr / total) * 100 : 0
                                   const arrK = Math.round(arr / 1000)
+                                  const segmentHeightPx = total > 0 && barHeight > 0 ? (arr / total) * barHeight : 0
+                                  const showLabel = segmentHeightPx >= 14
                                   return (
                                     <div
                                       key={rt}
                                       style={{
-                                        height: `${segPct}%`,
-                                        minHeight: arrK >= 50 ? 20 : 0,
+                                        flex: `${segPct} 0 0`,
+                                        minHeight: 0,
                                         background: chartDataByRecordType.recordTypeColors[rt],
                                         display: 'flex',
                                         alignItems: 'center',
@@ -607,7 +613,7 @@ export default function Closed() {
                                       }}
                                       title={`${rt}: ${fmtMoney(arr)}`}
                                     >
-                                      {arrK >= 50 ? `$${arrK}K` : ''}
+                                      {showLabel ? `$${arrK}K` : ''}
                                     </div>
                                   )
                                 })}
@@ -665,12 +671,14 @@ export default function Closed() {
                                   const count = countRtMap.get(rt) ?? 0
                                   if (count <= 0) return null
                                   const segPct = totalCount > 0 ? (count / totalCount) * 100 : 0
+                                  const segmentHeightPx = totalCount > 0 && barHeight > 0 ? (count / totalCount) * barHeight : 0
+                                  const showLabel = segmentHeightPx >= 14
                                   return (
                                     <div
                                       key={rt}
                                       style={{
-                                        height: `${segPct}%`,
-                                        minHeight: count >= 1 ? 20 : 0,
+                                        flex: `${segPct} 0 0`,
+                                        minHeight: 0,
                                         background: chartDataByRecordType.recordTypeColors[rt],
                                         display: 'flex',
                                         alignItems: 'center',
@@ -682,7 +690,7 @@ export default function Closed() {
                                       }}
                                       title={`${rt}: ${count} opps`}
                                     >
-                                      {count >= 1 ? count : ''}
+                                      {showLabel ? count : ''}
                                     </div>
                                   )
                                 })}

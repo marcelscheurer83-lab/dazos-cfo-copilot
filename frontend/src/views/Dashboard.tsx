@@ -3,6 +3,7 @@ import {
   getDashboardKPI,
   getDashboardBookingsMTD,
   getDashboardRenewalsMTD,
+  getDashboardCashMTD,
   syncSalesforce,
   syncGoogleSheet,
   type DashboardKPI,
@@ -11,9 +12,11 @@ import {
   type BookingsPeriod,
   type RenewalsMTDResponse,
   type RenewalsMTDPeriod,
+  type CashMTDResponse,
 } from '../api'
 
 const ARR_2026P_RANGE = 'ARR_Calculations_2026P!A1:ZZ1000'
+const BS_2026P_RANGE = 'BS_2026P!A1:ZZ1000'
 
 /** Format as $XK (thousands) for dashboard; use comma when >= 1000 (e.g. $1,235K). */
 function fmtK(n: number): string {
@@ -40,6 +43,27 @@ const hasAutoSyncedThisSession = { current: false }
 const hasSyncedSheetThisSession = { current: false }
 const hasRetriedPlanRefetch = { current: false }
 
+/** Never show raw JSON parse or server errors. Replace with a friendly message. */
+function normalizeFetchError(message: string, context: string): string {
+  const s = String(message)
+  if (/Unexpected token|not valid JSON|JSON\.parse|SyntaxError|Internal S|"Internal S/i.test(s)) return `${context} — server returned invalid data. Check that the backend is running and try again.`
+  if (/token.*JSON|JSON.*token/i.test(s)) return `${context} — server returned invalid data. Check that the backend is running and try again.`
+  return s
+}
+
+/** Use for any user-facing message that might be a raw parse/server error (e.g. plan_message). */
+function sanitizePlanMessage(msg: string | null | undefined): string | null {
+  if (msg == null || msg === '') return null
+  const s = String(msg)
+  if (/Unexpected token|not valid JSON|Internal S|token.*JSON/i.test(s)) return 'Server returned invalid data. Check that the backend is running and try again.'
+  return s
+}
+
+/** Alias for Cash block (plan_message + chargebee_message). */
+function sanitizeCashMessage(msg: string | null | undefined): string | null {
+  return sanitizePlanMessage(msg)
+}
+
 const blockStyle: React.CSSProperties = {
   background: 'var(--surface)',
   border: '1px solid var(--border)',
@@ -51,26 +75,36 @@ export default function Dashboard() {
   const [kpi, setKpi] = useState<DashboardKPI | null>(null)
   const [bookingsMTD, setBookingsMTD] = useState<BookingsMTDResponse | null>(null)
   const [renewalsMTD, setRenewalsMTD] = useState<RenewalsMTDResponse | null>(null)
+  const [cashMTD, setCashMTD] = useState<CashMTDResponse | null>(null)
   const [err, setErr] = useState<string | null>(null)
   const [bookingsErr, setBookingsErr] = useState<string | null>(null)
   const [renewalsErr, setRenewalsErr] = useState<string | null>(null)
+  const [cashErr, setCashErr] = useState<string | null>(null)
   const [sheetSyncError, setSheetSyncError] = useState<string | null>(null)
 
   useEffect(() => {
-    const fetchKpi = () => getDashboardKPI().then(setKpi).catch((e) => setErr(e.message))
+    const fetchKpi = () =>
+      getDashboardKPI()
+        .then(setKpi)
+        .catch((e) => setErr(normalizeFetchError(e instanceof Error ? e.message : String(e), 'Dashboard')))
     const fetchBookings = () =>
       getDashboardBookingsMTD()
         .then(setBookingsMTD)
-        .catch((e) => setBookingsErr(e.message))
+        .catch((e) => setBookingsErr(normalizeFetchError(e instanceof Error ? e.message : String(e), 'Bookings')))
     const fetchRenewals = () =>
       getDashboardRenewalsMTD()
         .then(setRenewalsMTD)
-        .catch((e) => setRenewalsErr(e.message))
+        .catch((e) => setRenewalsErr(normalizeFetchError(e instanceof Error ? e.message : String(e), 'Renewals')))
+    const fetchCash = () =>
+      getDashboardCashMTD()
+        .then(setCashMTD)
+        .catch((e) => setCashErr(normalizeFetchError(e instanceof Error ? e.message : String(e), 'Cash')))
 
     const runSyncAndFetch = () => {
       fetchKpi()
       fetchBookings()
       fetchRenewals()
+      fetchCash()
     }
 
     const runInitialLoad = async () => {
@@ -79,10 +113,11 @@ export default function Dashboard() {
         syncSalesforce().catch(() => {})
         if (!hasSyncedSheetThisSession.current) {
           hasSyncedSheetThisSession.current = true
-          // Sync plan sheet first so plan numbers load automatically on first open
+          // Sync plan sheets so plan numbers load automatically on first open
           try {
-            const res = await syncGoogleSheet(ARR_2026P_RANGE)
-            if (!res.ok && res.error) setSheetSyncError(res.error)
+            await syncGoogleSheet(ARR_2026P_RANGE)
+            const resBs = await syncGoogleSheet(BS_2026P_RANGE)
+            if (!resBs.ok && resBs.error) setSheetSyncError(resBs.error)
           } catch (e) {
             setSheetSyncError((e as Error)?.message || 'Sheet sync failed')
           }
@@ -98,21 +133,40 @@ export default function Dashboard() {
   useEffect(() => {
     if (hasRetriedPlanRefetch.current) return
     const needsPlan = (renewalsMTD?.plan_message && /no snapshot|sync.*first/i.test(renewalsMTD.plan_message)) ||
-      (bookingsMTD?.plan_message && /no snapshot|sync.*first/i.test(bookingsMTD.plan_message))
+      (bookingsMTD?.plan_message && /no snapshot|sync.*first/i.test(bookingsMTD.plan_message)) ||
+      (cashMTD?.plan_message && /no snapshot|sync.*first/i.test(cashMTD.plan_message))
     if (!needsPlan) return
     hasRetriedPlanRefetch.current = true
     const t = setTimeout(() => {
       syncGoogleSheet(ARR_2026P_RANGE)
         .then((res) => {
           if (res.ok) {
-            getDashboardBookingsMTD().then(setBookingsMTD).catch(() => {})
-            getDashboardRenewalsMTD().then(setRenewalsMTD).catch(() => {})
+            // Delay refetch so backend can finish sync and release DB; avoids "invalid data" on first open
+            setTimeout(() => {
+              getDashboardBookingsMTD()
+                .then((d) => { setBookingsMTD(d); setBookingsErr(null) })
+                .catch((e) => setBookingsErr(normalizeFetchError(e instanceof Error ? e.message : String(e), 'Bookings')))
+              getDashboardRenewalsMTD()
+                .then((d) => { setRenewalsMTD(d); setRenewalsErr(null) })
+                .catch((e) => setRenewalsErr(normalizeFetchError(e instanceof Error ? e.message : String(e), 'Renewals')))
+            }, 600)
+          }
+        })
+        .catch(() => {})
+      syncGoogleSheet(BS_2026P_RANGE)
+        .then((res) => {
+          if (res.ok) {
+            setTimeout(() => {
+              getDashboardCashMTD()
+                .then((d) => { setCashMTD(d); setCashErr(null) })
+                .catch((e) => setCashErr(normalizeFetchError(e instanceof Error ? e.message : String(e), 'Cash')))
+            }, 600)
           }
         })
         .catch(() => {})
     }, 800)
     return () => clearTimeout(t)
-  }, [renewalsMTD?.plan_message, bookingsMTD?.plan_message])
+  }, [renewalsMTD?.plan_message, bookingsMTD?.plan_message, cashMTD?.plan_message])
 
   if (err) return <p style={{ color: 'var(--negative)' }}>{err}</p>
   if (!kpi) return <p style={{ color: 'var(--text-muted)' }}>Loading…</p>
@@ -134,7 +188,7 @@ export default function Dashboard() {
             Bookings (ARR)
           </div>
           {bookingsErr && (
-            <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>{bookingsErr}</p>
+            <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>{normalizeFetchError(bookingsErr, 'Bookings')}</p>
           )}
           {!bookingsErr && bookingsMTD && (
             <BookingsMTDBlock data={bookingsMTD} sheetSyncError={sheetSyncError} />
@@ -150,7 +204,7 @@ export default function Dashboard() {
             Renewals (ARR)
           </div>
           {renewalsErr && (
-            <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>{renewalsErr}</p>
+            <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>{normalizeFetchError(renewalsErr, 'Renewals')}</p>
           )}
           {!renewalsErr && renewalsMTD && (
             <RenewalsMTDBlock data={renewalsMTD} sheetSyncError={sheetSyncError} />
@@ -160,21 +214,22 @@ export default function Dashboard() {
           )}
         </div>
 
-        {/* Block 3: Open pipeline */}
-        <div style={blockStyle}>
+        {/* Block 3: Cash */}
+        <div style={{ ...blockStyle, gridColumn: '1 / -1' }}>
           <div style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text)', marginBottom: '0.5rem' }}>
-            Open pipeline
+            Cash
           </div>
-          <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>Coming soon</p>
+          {cashErr && (
+            <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>{normalizeFetchError(cashErr, 'Cash')}</p>
+          )}
+          {!cashErr && cashMTD && (
+            <CashMTDBlock data={cashMTD} sheetSyncError={sheetSyncError} />
+          )}
+          {!cashErr && !cashMTD && (
+            <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>Loading…</p>
+          )}
         </div>
 
-        {/* Block 4: Pipeline generation — placeholder */}
-        <div style={blockStyle}>
-          <div style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text)', marginBottom: '0.5rem' }}>
-            Pipeline generation
-          </div>
-          <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>Coming soon</p>
-        </div>
       </div>
     </>
   )
@@ -191,7 +246,7 @@ function periodValueColumnLabel(periodLabel: string | undefined): string {
 function BookingsMTDBlock({ data, sheetSyncError }: { data: BookingsMTDResponse; sheetSyncError?: string | null }) {
   const { previous_month, current_mtd, qtd, plan_message } = data
   const periods: BookingsPeriod[] = [previous_month, current_mtd, qtd]
-  const planNote = sheetSyncError || plan_message
+  const planNote = sanitizePlanMessage(sheetSyncError) || sanitizePlanMessage(plan_message)
   const needsGoogleConfig =
     planNote && /GOOGLE_SHEET_ID|not configured|credentials/i.test(planNote)
   return (
@@ -247,6 +302,74 @@ function BookingsMTDBlock({ data, sheetSyncError }: { data: BookingsMTDResponse;
             </table>
           </div>
         )})}
+      </div>
+    </>
+  )
+}
+
+function CashMTDBlock({ data, sheetSyncError }: { data: CashMTDResponse; sheetSyncError?: string | null }) {
+  const { previous_month, current_mtd, qtd, plan_message, chargebee_message } = data
+  const periods = [previous_month, current_mtd, qtd]
+  const planNote = sanitizeCashMessage(sheetSyncError) || sanitizeCashMessage(plan_message)
+  const needsGoogleConfig = planNote && /GOOGLE_SHEET_ID|not configured|credentials/i.test(planNote)
+  return (
+    <>
+      {planNote && (
+        <p style={{ fontSize: '0.75rem', color: 'var(--text-muted)', marginBottom: '0.5rem' }}>
+          {planNote}
+          {needsGoogleConfig && (
+            <> — Set <strong>GOOGLE_SHEET_ID</strong> (and credentials) in the backend environment.</>
+          )}
+        </p>
+      )}
+      {chargebee_message && (
+        <p style={{ fontSize: '0.75rem', color: 'var(--text-muted)', marginBottom: '0.5rem' }}>
+          {sanitizeCashMessage(chargebee_message) || chargebee_message}
+        </p>
+      )}
+      <div style={{ display: 'grid', gridTemplateColumns: `repeat(${periods.length}, 1fr)`, gap: '1.5rem', minWidth: 0 }}>
+        {periods.map((period) => (
+          <div key={period.period_label}>
+            <div style={{ fontSize: '0.75rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '0.5rem' }}>
+              {period.period_label}
+            </div>
+            <table style={{ width: '100%', fontSize: '0.8rem', borderCollapse: 'collapse' }}>
+              <thead>
+                <tr style={{ borderBottom: '1px solid var(--border)' }}>
+                  <th style={{ textAlign: 'left', padding: '0.25rem 0.5rem 0.25rem 0', fontWeight: 500, color: 'var(--text-muted)' }} />
+                  <th style={{ textAlign: 'right', padding: '0.25rem 0.5rem', fontWeight: 500, color: 'var(--text-muted)' }}>{periodValueColumnLabel(period.period_label)}</th>
+                  <th style={{ textAlign: 'right', padding: '0.25rem 0.5rem', fontWeight: 500, color: 'var(--text-muted)' }}>Plan</th>
+                  <th style={{ textAlign: 'right', padding: '0.25rem 0.5rem', fontWeight: 500, color: 'var(--text-muted)' }}>%</th>
+                  <th style={{ textAlign: 'right', padding: '0.25rem 0', fontWeight: 500, color: 'var(--text-muted)' }}>Δ</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr style={{ borderBottom: '1px solid var(--border)' }}>
+                  <td style={{ padding: '0.35rem 0.5rem 0.35rem 0', color: 'var(--text)' }}>Billings</td>
+                  <td style={{ textAlign: 'right', padding: '0.35rem 0.5rem', color: 'var(--text)' }}>
+                    {period.billings_actual != null ? fmtK(period.billings_actual) : '—'}
+                  </td>
+                  <td style={{ textAlign: 'right', padding: '0.35rem 0.5rem', color: 'var(--text-muted)' }}>
+                    {period.billings_plan != null ? fmtK(period.billings_plan) : '—'}
+                  </td>
+                  <td style={{ textAlign: 'right', padding: '0.35rem 0.5rem', color: 'var(--text)' }}>{fmtPct(period.billings_achievement_pct)}</td>
+                  <td style={{ textAlign: 'right', padding: '0.35rem 0', color: period.billings_delta_k != null ? (period.billings_delta_k >= 0 ? 'var(--positive)' : 'var(--negative)') : 'var(--text-muted)' }}>{fmtDeltaK(period.billings_delta_k)}</td>
+                </tr>
+                <tr style={{ borderBottom: '1px solid var(--border)' }}>
+                  <td style={{ padding: '0.35rem 0.5rem 0.35rem 0', color: 'var(--text)' }}>Collections</td>
+                  <td style={{ textAlign: 'right', padding: '0.35rem 0.5rem', color: 'var(--text)' }}>
+                    {period.collections_actual != null ? fmtK(period.collections_actual) : '—'}
+                  </td>
+                  <td style={{ textAlign: 'right', padding: '0.35rem 0.5rem', color: 'var(--text-muted)' }}>
+                    {period.collections_plan != null ? fmtK(period.collections_plan) : '—'}
+                  </td>
+                  <td style={{ textAlign: 'right', padding: '0.35rem 0.5rem', color: 'var(--text)' }}>{fmtPct(period.collections_achievement_pct)}</td>
+                  <td style={{ textAlign: 'right', padding: '0.35rem 0', color: period.collections_delta_k != null ? (period.collections_delta_k >= 0 ? 'var(--positive)' : 'var(--negative)') : 'var(--text-muted)' }}>{fmtDeltaK(period.collections_delta_k)}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        ))}
       </div>
     </>
   )
@@ -360,7 +483,7 @@ function RenewalsMTDBlock({
 }) {
   const { previous_month, current_mtd, qtd, plan_message } = data
   const periods: RenewalsMTDPeriod[] = [previous_month, current_mtd, qtd]
-  const planNote = sheetSyncError || plan_message
+  const planNote = sanitizePlanMessage(sheetSyncError) || sanitizePlanMessage(plan_message)
   const needsGoogleConfig = planNote && /GOOGLE_SHEET_ID|not configured|credentials/i.test(planNote)
   return (
     <>

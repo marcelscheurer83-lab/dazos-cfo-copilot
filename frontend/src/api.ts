@@ -159,11 +159,22 @@ export type ARRExamplesResponse = {
 
 export async function getDashboardKPI(): Promise<DashboardKPI> {
   const r = await apiFetch('/dashboard-kpi')
+  const text = await r.text()
   if (!r.ok) {
     const msg = r.status === 401 ? 'Unauthorized — sign in again.' : `Dashboard error ${r.status}. Check backend is up.`
-    throw new Error(msg)
+    try {
+      const j = JSON.parse(text)
+      throw new Error(j.detail || j.error || msg)
+    } catch (e) {
+      if (e instanceof SyntaxError) throw new Error(msg)
+      throw e
+    }
   }
-  return r.json()
+  try {
+    return JSON.parse(text) as DashboardKPI
+  } catch {
+    throw new Error('Invalid response from server')
+  }
 }
 
 export type BookingsMTDRow = {
@@ -199,9 +210,32 @@ export type BookingsMTDResponse = {
 }
 
 export async function getDashboardBookingsMTD(): Promise<BookingsMTDResponse> {
-  const r = await apiFetch('/dashboard/bookings-mtd')
-  if (!r.ok) throw new Error('Failed to fetch bookings MTD')
-  return r.json()
+  const BOOKINGS_ERR = 'Bookings — server returned invalid data. Check that the backend is running and try again.'
+  let text: string
+  try {
+    const r = await apiFetch('/dashboard/bookings-mtd')
+    text = await r.text()
+    if (!r.ok) {
+      try {
+        const j = JSON.parse(text)
+        throw new Error(j.detail || j.error || `Failed to fetch bookings MTD (${r.status})`)
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : ''
+        if (/Unexpected token|not valid JSON|SyntaxError|Internal S/i.test(msg)) throw new Error(BOOKINGS_ERR)
+        if (e instanceof Error && /detail|error|Failed to fetch/.test(msg)) throw e
+        throw new Error(text?.slice(0, 80) || `Bookings endpoint error (${r.status})`)
+      }
+    }
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e)
+    if (/Unexpected token|not valid JSON|JSON\.parse|SyntaxError|Internal S/i.test(msg)) throw new Error(BOOKINGS_ERR)
+    throw e
+  }
+  try {
+    return JSON.parse(text) as BookingsMTDResponse
+  } catch {
+    throw new Error(BOOKINGS_ERR)
+  }
 }
 
 export type RenewalsMTDPeriod = {
@@ -222,10 +256,86 @@ export type RenewalsMTDResponse = {
   plan_message: string | null
 }
 
+export type CashPeriod = {
+  period_label: string
+  billings_plan: number | null
+  collections_plan: number | null
+  billings_actual: number | null
+  collections_actual: number | null
+  billings_achievement_pct: number | null
+  billings_delta_k: number | null
+  collections_achievement_pct: number | null
+  collections_delta_k: number | null
+}
+
+export type CashMTDResponse = {
+  previous_month: CashPeriod
+  current_mtd: CashPeriod
+  qtd: CashPeriod
+  plan_source: string | null
+  plan_message: string | null
+  chargebee_message?: string | null
+}
+
 export async function getDashboardRenewalsMTD(): Promise<RenewalsMTDResponse> {
-  const r = await apiFetch('/dashboard/renewals-mtd')
-  if (!r.ok) throw new Error('Failed to fetch renewals MTD')
-  return r.json()
+  const RENEWALS_ERR = 'Renewals — server returned invalid data. Check that the backend is running and try again.'
+  let text: string
+  try {
+    const r = await apiFetch('/dashboard/renewals-mtd')
+    text = await r.text()
+    if (!r.ok) {
+      try {
+        const j = JSON.parse(text)
+        throw new Error(j.detail || j.error || `Failed to fetch renewals MTD (${r.status})`)
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : ''
+        if (/Unexpected token|not valid JSON|SyntaxError|Internal S/i.test(msg)) throw new Error(RENEWALS_ERR)
+        if (e instanceof Error && /detail|error|Failed to fetch/.test(msg)) throw e
+        throw new Error(text?.slice(0, 80) || `Renewals endpoint error (${r.status})`)
+      }
+    }
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e)
+    if (/Unexpected token|not valid JSON|JSON\.parse|SyntaxError|Internal S/i.test(msg)) throw new Error(RENEWALS_ERR)
+    throw e
+  }
+  try {
+    return JSON.parse(text) as RenewalsMTDResponse
+  } catch {
+    throw new Error(RENEWALS_ERR)
+  }
+}
+
+const CASH_ERR = 'Cash — server returned invalid data. Check that the backend is running and try again.'
+
+export async function getDashboardCashMTD(): Promise<CashMTDResponse> {
+  let text: string
+  try {
+    const r = await apiFetch('/dashboard/cash-mtd')
+    text = await r.text()
+    if (!r.ok) {
+      try {
+        const j = JSON.parse(text)
+        throw new Error(j.detail || j.error || `Failed to fetch cash MTD (${r.status})`)
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : ''
+        if (/Unexpected token|not valid JSON|SyntaxError/i.test(msg))
+          throw new Error(CASH_ERR)
+        if (e instanceof Error && /detail|error|Failed to fetch/.test(msg)) throw e
+        throw new Error(text?.slice(0, 80) || `Cash endpoint error (${r.status})`)
+      }
+    }
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e)
+    if (/Unexpected token|not valid JSON|JSON\.parse|SyntaxError|Internal S/i.test(msg))
+      throw new Error(CASH_ERR)
+    throw e
+  }
+  try {
+    return JSON.parse(text) as CashMTDResponse
+  } catch {
+    throw new Error(CASH_ERR)
+  }
 }
 
 export async function getARRExamples(limit = 10): Promise<ARRExamplesResponse> {

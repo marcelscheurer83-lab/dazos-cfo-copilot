@@ -464,12 +464,12 @@ export default function Pipeline() {
         Open opportunities: New Business and Expansion only (not Closed Won / Closed Lost). One row per opportunity. ARR = MRR × 12 from Opportunity Finance Details.
       </p>
       {chartData.months.length > 0 && (
-        <div style={{ marginBottom: '1.5rem', maxWidth: '100%', display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '2rem' }}>
+        <div style={{ marginBottom: '1.5rem', maxWidth: '100%', display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '2rem', alignItems: 'stretch' }}>
           {/* Row 1: by segment */}
           {/* Open pipeline by close month and segment (ARR) */}
-          <div style={{ minWidth: 0 }}>
+          <div style={{ minWidth: 0, display: 'flex', flexDirection: 'column' }}>
             <div style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text)', marginBottom: '0.5rem' }}>Open pipeline by close month and segment (ARR)</div>
-            <div style={{ background: 'var(--bg)', padding: '0.75rem 1rem', borderRadius: 6 }}>
+            <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', background: 'var(--bg)', padding: '0.75rem 1rem', borderRadius: 6 }}>
               <div style={{ display: 'flex', gap: 0, fontSize: '0.75rem' }}>
                 <div style={{ width: 36, flexShrink: 0, height: PLOT_HEIGHT, position: 'relative', color: 'var(--text-muted)', fontSize: '0.7rem', paddingRight: 8 }}>
                   {ARR_Y_TICKS.slice().reverse().map((tick, i) => {
@@ -518,12 +518,14 @@ export default function Pipeline() {
                                 if (arr <= 0) return null
                                 const segPct = total > 0 ? (arr / total) * 100 : 0
                                 const millions = arr / 1e6
+                                const segmentHeightPx = total > 0 && barHeight > 0 ? (arr / total) * barHeight : 0
+                                const showLabel = segmentHeightPx >= 14
                                 return (
                                   <div
                                     key={seg}
                                     style={{
-                                      height: `${segPct}%`,
-                                      minHeight: millions >= 0.05 ? 20 : 0,
+                                      flex: `${segPct} 0 0`,
+                                      minHeight: 0,
                                       background: chartData.segmentColors[seg],
                                       display: 'flex',
                                       alignItems: 'center',
@@ -535,7 +537,7 @@ export default function Pipeline() {
                                     }}
                                     title={`${seg}: ${fmtMoney(arr)}`}
                                   >
-                                    {millions >= 0.05 ? `$${millions.toFixed(1)}M` : ''}
+                                    {showLabel ? `$${millions.toFixed(1)}M` : ''}
                                   </div>
                                 )
                               })}
@@ -564,9 +566,9 @@ export default function Pipeline() {
             </div>
           </div>
           {/* Open pipeline by close month and segment (# opportunities) */}
-          <div style={{ minWidth: 0 }}>
+          <div style={{ minWidth: 0, display: 'flex', flexDirection: 'column' }}>
             <div style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text)', marginBottom: '0.5rem' }}>Open pipeline by close month and segment (# opportunities)</div>
-            <div style={{ background: 'var(--bg)', padding: '0.75rem 1rem', borderRadius: 6 }}>
+            <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', background: 'var(--bg)', padding: '0.75rem 1rem', borderRadius: 6 }}>
               <div style={{ display: 'flex', gap: 0, fontSize: '0.75rem' }}>
                 <div style={{ width: 36, flexShrink: 0, height: PLOT_HEIGHT, position: 'relative', color: 'var(--text-muted)', fontSize: '0.7rem', paddingRight: 8 }}>
                   {COUNT_Y_TICKS.slice().reverse().map((tick, i) => {
@@ -615,12 +617,14 @@ export default function Pipeline() {
                                 if (count <= 0) return null
                                 const segPct = totalCount > 0 ? (count / totalCount) * 100 : 0
                                 const color = chartData.segmentColors[seg] ?? '#94a3b8'
+                                const segmentHeightPx = totalCount > 0 && barHeight > 0 ? (count / totalCount) * barHeight : 0
+                                const showLabel = segmentHeightPx >= 14
                                 return (
                                   <div
                                     key={seg}
                                     style={{
-                                      height: `${segPct}%`,
-                                      minHeight: count >= 1 ? 20 : 0,
+                                      flex: `${segPct} 0 0`,
+                                      minHeight: 0,
                                       background: color,
                                       display: 'flex',
                                       alignItems: 'center',
@@ -632,7 +636,7 @@ export default function Pipeline() {
                                     }}
                                     title={`${seg}: ${count} opps`}
                                   >
-                                    {count >= 1 ? count : ''}
+                                    {showLabel ? count : ''}
                                   </div>
                                 )
                               })}
@@ -662,9 +666,9 @@ export default function Pipeline() {
           {/* Row 2: by stage */}
           {chartDataByStage.months.length > 0 && (
             <>
-              <div style={{ minWidth: 0 }}>
+              <div style={{ minWidth: 0, display: 'flex', flexDirection: 'column' }}>
                 <div style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text)', marginBottom: '0.5rem' }}>Open pipeline by close month and stage (ARR)</div>
-                <div style={{ background: 'var(--bg)', padding: '0.75rem 1rem', borderRadius: 6 }}>
+                <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', background: 'var(--bg)', padding: '0.75rem 1rem', borderRadius: 6 }}>
                   <div style={{ display: 'flex', gap: 0, fontSize: '0.75rem' }}>
                     <div style={{ width: 36, flexShrink: 0, height: PLOT_HEIGHT, position: 'relative', color: 'var(--text-muted)', fontSize: '0.7rem', paddingRight: 8 }}>
                       {ARR_Y_TICKS.slice().reverse().map((tick, i) => {
@@ -712,12 +716,14 @@ export default function Pipeline() {
                                     if (arr <= 0) return null
                                     const stagePct = total > 0 ? (arr / total) * 100 : 0
                                     const millions = arr / 1e6
+                                    const segmentHeightPx = total > 0 && barHeight > 0 ? (arr / total) * barHeight : 0
+                                    const showLabel = segmentHeightPx >= 14
                                     return (
                                       <div
                                         key={stage}
                                         style={{
-                                          height: `${stagePct}%`,
-                                          minHeight: millions >= 0.05 ? 20 : 0,
+                                          flex: `${stagePct} 0 0`,
+                                          minHeight: 0,
                                           background: chartDataByStage.stageColors[stage],
                                           display: 'flex',
                                           alignItems: 'center',
@@ -729,7 +735,7 @@ export default function Pipeline() {
                                         }}
                                         title={`${stage}: ${fmtMoney(arr)}`}
                                       >
-                                        {millions >= 0.05 ? `$${millions.toFixed(1)}M` : ''}
+                                        {showLabel ? `$${millions.toFixed(1)}M` : ''}
                                       </div>
                                     )
                                   })}
@@ -756,9 +762,9 @@ export default function Pipeline() {
                   </div>
                 </div>
               </div>
-              <div style={{ minWidth: 0 }}>
+              <div style={{ minWidth: 0, display: 'flex', flexDirection: 'column' }}>
                 <div style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text)', marginBottom: '0.5rem' }}>Open pipeline by close month and stage (# opportunities)</div>
-                <div style={{ background: 'var(--bg)', padding: '0.75rem 1rem', borderRadius: 6 }}>
+                <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', background: 'var(--bg)', padding: '0.75rem 1rem', borderRadius: 6 }}>
                   <div style={{ display: 'flex', gap: 0, fontSize: '0.75rem' }}>
                     <div style={{ width: 36, flexShrink: 0, height: PLOT_HEIGHT, position: 'relative', color: 'var(--text-muted)', fontSize: '0.7rem', paddingRight: 8 }}>
                       {COUNT_Y_TICKS.slice().reverse().map((tick, i) => {

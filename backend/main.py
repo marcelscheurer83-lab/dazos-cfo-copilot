@@ -76,6 +76,45 @@ async def _remove_ascension_ascend_overrides():
             await db.rollback()
 
 
+def _is_ascension_or_ascend_account(account_name: Optional[str]) -> bool:
+    n = (account_name or "").strip().lower()
+    return n == "ascension recovery services" or "ascend" in n
+
+
+async def _remove_ascension_ascend_record_type_overrides():
+    """Remove record-type overrides (e.g. Amendment) for opportunities belonging to Ascension or Ascend so dashboard matches."""
+    async with AsyncSessionLocal() as db:
+        try:
+            q = select(OpportunityRecordTypeOverride)
+            r = await db.execute(q)
+            overrides = r.scalars().all()
+            opp_sf_ids = list({(o.opportunity_sf_id or "").strip() for o in overrides if (o.opportunity_sf_id or "").strip()})
+            expand = []
+            for i in opp_sf_ids:
+                expand.append(i)
+                if len(i) == 18:
+                    expand.append(i[:15])
+            opp_sf_ids = list(set(expand))
+            if not opp_sf_ids:
+                return
+            q_opps = select(Opportunity).where(Opportunity.sf_id.in_(opp_sf_ids))
+            r_opps = await db.execute(q_opps)
+            opps = {}
+            for o in r_opps.scalars().all():
+                k = (o.sf_id or "").strip()
+                opps[k] = o
+                if len(k) == 18:
+                    opps[k[:15]] = o
+            for row in overrides:
+                sf_id = (row.opportunity_sf_id or "").strip()
+                opp = opps.get(sf_id)
+                if opp and _is_ascension_or_ascend_account(opp.account_name):
+                    await db.delete(row)
+            await db.commit()
+        except Exception:
+            await db.rollback()
+
+
 # Load .env from backend directory so GOOGLE_SHEET_ID etc. are available so GOOGLE_SHEET_ID etc. are available
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
@@ -92,6 +131,7 @@ EST = ZoneInfo("America/New_York")
 async def lifespan(app: FastAPI):
     await seed()
     await _remove_ascension_ascend_overrides()
+    await _remove_ascension_ascend_record_type_overrides()
     # Background task: hourly Salesforce sync at :59 EST (ARR + pipeline); daily EOD snapshot at 23:59 EST (for historical ARR + pipeline)
     task = asyncio.create_task(_scheduled_salesforce_jobs())
     yield
@@ -3855,19 +3895,49 @@ async def debug_app_password_status():
 @app.post("/api/debug/remove-ascension-ascend-overrides")
 async def debug_remove_ascension_ascend_overrides(db: AsyncSession = Depends(get_db)):
     """
-    Run the same cleanup as on startup: remove Ascension and Ascend Active ARR overrides from the DB.
-    Use this on the deployed backend to clear overrides without restarting (so Contracted ARR matches local).
+    Run the same cleanup as on startup: remove Ascension and Ascend Active ARR overrides and record-type (Amendment) overrides from the DB.
+    Use this on the deployed backend to clear overrides without restarting (so Contracted ARR and dashboard match local).
     """
     r = await db.execute(select(ActiveARRAccountOverride))
     rows = r.scalars().all()
-    removed = 0
+    removed_arr = 0
     for row in rows:
         name_lower = (row.account_name or "").strip().lower()
         if name_lower == "ascension recovery services" or "ascend" in name_lower:
             await db.delete(row)
-            removed += 1
+            removed_arr += 1
+    # Record-type overrides (e.g. Amendment) for Ascension/Ascend opportunities
+    q = select(OpportunityRecordTypeOverride)
+    r = await db.execute(q)
+    overrides = r.scalars().all()
+    opp_sf_ids = list({(o.opportunity_sf_id or "").strip() for o in overrides if (o.opportunity_sf_id or "").strip()})
+    expand = []
+    for i in opp_sf_ids:
+        expand.append(i)
+        if len(i) == 18:
+            expand.append(i[:15])
+    opp_sf_ids = list(set(expand))
+    removed_rt = 0
+    if opp_sf_ids:
+        q_opps = select(Opportunity).where(Opportunity.sf_id.in_(opp_sf_ids))
+        r_opps = await db.execute(q_opps)
+        opps = {}
+        for o in r_opps.scalars().all():
+            k = (o.sf_id or "").strip()
+            opps[k] = o
+            if len(k) == 18:
+                opps[k[:15]] = o
+        for row in overrides:
+            sf_id = (row.opportunity_sf_id or "").strip()
+            opp = opps.get(sf_id)
+            if opp and _is_ascension_or_ascend_account(opp.account_name):
+                await db.delete(row)
+                removed_rt += 1
     await db.commit()
-    return {"ok": True, "removed": removed}
+    return {"ok": True, "removed_active_arr_overrides": removed_arr, "removed_record_type_overrides": removed_rt}
+
+
+@app.get("/api/debug/renewal-date-config")
 async def debug_renewal_date_config(db: AsyncSession = Depends(get_db)):
     """
     Debug: check if SALESFORCE_RENEWAL_DATE_FIELD is set and how many opportunities have renewal_date populated.

@@ -435,6 +435,28 @@ export default function ARRScheduleActiveArrView() {
         >
           {syncStatus === 'loading' ? 'Syncing…' : 'Sync from Salesforce'}
         </button>
+        {hasActiveFilter && (
+          <button
+            type="button"
+            onClick={() => {
+              setFilterSegment([])
+              setFilterStatus([])
+              setOpenFilter(null)
+            }}
+            style={{
+              marginLeft: '0.5rem',
+              padding: '0.5rem 1rem',
+              fontSize: '0.9rem',
+              cursor: 'pointer',
+              background: 'var(--surface)',
+              color: 'var(--text-muted)',
+              border: '1px solid var(--border)',
+              borderRadius: 6,
+            }}
+          >
+            Clear filter
+          </button>
+        )}
         {syncStatus === 'ok' && syncMessage && (
           <span style={{ marginLeft: '0.75rem', fontSize: '0.9rem', color: 'var(--positive)' }}>{syncMessage}</span>
         )}

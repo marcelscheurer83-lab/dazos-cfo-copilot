@@ -82,33 +82,32 @@ def _is_ascension_or_ascend_account(account_name: Optional[str]) -> bool:
 
 
 async def _remove_ascension_ascend_record_type_overrides():
-    """Remove record-type overrides (e.g. Amendment) for opportunities belonging to Ascension or Ascend so dashboard matches."""
+    """Remove record-type overrides (e.g. Amendment) for opportunities belonging to Ascension or Ascend.
+    Find opps by account_name containing 'ascension' or 'ascend' so we don't miss due to name variants."""
     async with AsyncSessionLocal() as db:
         try:
+            # Find all opportunity sf_ids for accounts whose name contains ascension or ascend
+            q_opps = select(Opportunity.sf_id).where(
+                or_(
+                    func.lower(Opportunity.account_name).like("%ascension%"),
+                    func.lower(Opportunity.account_name).like("%ascend%"),
+                )
+            )
+            r_opps = await db.execute(q_opps)
+            target_sf_ids = set((row[0] or "").strip() for row in r_opps.all() if (row[0] or "").strip())
+            # Also 15-char form for matching
+            expand = set(target_sf_ids)
+            for i in target_sf_ids:
+                if len(i) == 18:
+                    expand.add(i[:15])
+            target_sf_ids = expand
+            if not target_sf_ids:
+                return
             q = select(OpportunityRecordTypeOverride)
             r = await db.execute(q)
-            overrides = r.scalars().all()
-            opp_sf_ids = list({(o.opportunity_sf_id or "").strip() for o in overrides if (o.opportunity_sf_id or "").strip()})
-            expand = []
-            for i in opp_sf_ids:
-                expand.append(i)
-                if len(i) == 18:
-                    expand.append(i[:15])
-            opp_sf_ids = list(set(expand))
-            if not opp_sf_ids:
-                return
-            q_opps = select(Opportunity).where(Opportunity.sf_id.in_(opp_sf_ids))
-            r_opps = await db.execute(q_opps)
-            opps = {}
-            for o in r_opps.scalars().all():
-                k = (o.sf_id or "").strip()
-                opps[k] = o
-                if len(k) == 18:
-                    opps[k[:15]] = o
-            for row in overrides:
+            for row in r.scalars().all():
                 sf_id = (row.opportunity_sf_id or "").strip()
-                opp = opps.get(sf_id)
-                if opp and _is_ascension_or_ascend_account(opp.account_name):
+                if sf_id in target_sf_ids or (len(sf_id) == 18 and sf_id[:15] in target_sf_ids):
                     await db.delete(row)
             await db.commit()
         except Exception:
@@ -3914,31 +3913,27 @@ async def debug_remove_ascension_ascend_overrides(db: AsyncSession = Depends(get
         if name_lower == "ascension recovery services" or "ascend" in name_lower:
             await db.delete(row)
             removed_arr += 1
-    # Record-type overrides (e.g. Amendment) for Ascension/Ascend opportunities
-    q = select(OpportunityRecordTypeOverride)
-    r = await db.execute(q)
-    overrides = r.scalars().all()
-    opp_sf_ids = list({(o.opportunity_sf_id or "").strip() for o in overrides if (o.opportunity_sf_id or "").strip()})
-    expand = []
-    for i in opp_sf_ids:
-        expand.append(i)
+    # Record-type: find opps by account name pattern (ascension/ascend), then delete overrides for those sf_ids
+    q_opps = select(Opportunity.sf_id).where(
+        or_(
+            func.lower(Opportunity.account_name).like("%ascension%"),
+            func.lower(Opportunity.account_name).like("%ascend%"),
+        )
+    )
+    r_opps = await db.execute(q_opps)
+    target_sf_ids = set((row[0] or "").strip() for row in r_opps.all() if (row[0] or "").strip())
+    expand = set(target_sf_ids)
+    for i in target_sf_ids:
         if len(i) == 18:
-            expand.append(i[:15])
-    opp_sf_ids = list(set(expand))
+            expand.add(i[:15])
+    target_sf_ids = expand
     removed_rt = 0
-    if opp_sf_ids:
-        q_opps = select(Opportunity).where(Opportunity.sf_id.in_(opp_sf_ids))
-        r_opps = await db.execute(q_opps)
-        opps = {}
-        for o in r_opps.scalars().all():
-            k = (o.sf_id or "").strip()
-            opps[k] = o
-            if len(k) == 18:
-                opps[k[:15]] = o
-        for row in overrides:
+    if target_sf_ids:
+        q_rt = select(OpportunityRecordTypeOverride)
+        r_rt = await db.execute(q_rt)
+        for row in r_rt.scalars().all():
             sf_id = (row.opportunity_sf_id or "").strip()
-            opp = opps.get(sf_id)
-            if opp and _is_ascension_or_ascend_account(opp.account_name):
+            if sf_id in target_sf_ids or (len(sf_id) == 18 and sf_id[:15] in target_sf_ids):
                 await db.delete(row)
                 removed_rt += 1
     await db.commit()

@@ -126,6 +126,9 @@ APP_PASSWORD = (_app_password_raw or "").strip().strip('"').strip("'") or None
 
 EST = ZoneInfo("America/New_York")
 
+# One-time cleanup of Ascension/Ascend overrides when active-ARR is first requested (in case lifespan didn't run on deploy).
+_ascension_ascend_cleanup_done = False
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -1277,6 +1280,11 @@ async def get_arr_schedule_active_arr(db: AsyncSession = Depends(get_db)):
       subscription start = null, subscription end = close date of that open renewal.
     Classification: Opportunity Record Type (RecordType.Name → o.record_type_name). Overrides applied. Renewal ARR = open renewal opps only. Delta = Active ARR − Renewal ARR.
     """
+    global _ascension_ascend_cleanup_done
+    if not _ascension_ascend_cleanup_done:
+        await _remove_ascension_ascend_overrides()
+        await _remove_ascension_ascend_record_type_overrides()
+        _ascension_ascend_cleanup_done = True
     overrides = await _get_record_type_overrides(db)
     active_arr_use_open_renewal = await _get_active_arr_account_overrides(db)
 
@@ -3935,6 +3943,44 @@ async def debug_remove_ascension_ascend_overrides(db: AsyncSession = Depends(get
                 removed_rt += 1
     await db.commit()
     return {"ok": True, "removed_active_arr_overrides": removed_arr, "removed_record_type_overrides": removed_rt}
+
+
+@app.get("/api/debug/ascension-ascend-override-status")
+async def debug_ascension_ascend_override_status(db: AsyncSession = Depends(get_db)):
+    """
+    No auth. Shows whether any Ascension or Ascend overrides still exist (Active ARR or record-type).
+    Use on deployed backend to verify cleanup ran. If you see any listed, call POST /api/debug/remove-ascension-ascend-overrides.
+    """
+    r_arr = await db.execute(select(ActiveARRAccountOverride))
+    arr_rows = [row for row in r_arr.scalars().all() if _is_ascension_or_ascend_account(row.account_name)]
+    q_rt = select(OpportunityRecordTypeOverride)
+    r_rt = await db.execute(q_rt)
+    rt_all = r_rt.scalars().all()
+    opp_sf_ids = list({(o.opportunity_sf_id or "").strip() for o in rt_all if (o.opportunity_sf_id or "").strip()})
+    expand = list(opp_sf_ids)
+    for i in opp_sf_ids:
+        if len(i) == 18:
+            expand.append(i[:15])
+    opps = {}
+    if expand:
+        q_opps = select(Opportunity).where(Opportunity.sf_id.in_(set(expand)))
+        r_opps = await db.execute(q_opps)
+        for o in r_opps.scalars().all():
+            k = (o.sf_id or "").strip()
+            opps[k] = o
+            if len(k) == 18:
+                opps[k[:15]] = o
+    rt_rows = []
+    for row in rt_all:
+        sf_id = (row.opportunity_sf_id or "").strip()
+        opp = opps.get(sf_id)
+        if opp and _is_ascension_or_ascend_account(opp.account_name):
+            rt_rows.append({"opportunity_sf_id": sf_id, "account_name": opp.account_name, "record_type_name": row.record_type_name})
+    return {
+        "active_arr_overrides": [{"account_name": r.account_name} for r in arr_rows],
+        "record_type_overrides": rt_rows,
+        "message": "Empty lists mean cleanup has run. If not empty, call POST /api/debug/remove-ascension-ascend-overrides (with X-App-Password).",
+    }
 
 
 @app.get("/api/debug/renewal-date-config")

@@ -3852,7 +3852,22 @@ async def debug_app_password_status():
     }
 
 
-@app.get("/api/debug/renewal-date-config")
+@app.post("/api/debug/remove-ascension-ascend-overrides")
+async def debug_remove_ascension_ascend_overrides(db: AsyncSession = Depends(get_db)):
+    """
+    Run the same cleanup as on startup: remove Ascension and Ascend Active ARR overrides from the DB.
+    Use this on the deployed backend to clear overrides without restarting (so Contracted ARR matches local).
+    """
+    r = await db.execute(select(ActiveARRAccountOverride))
+    rows = r.scalars().all()
+    removed = 0
+    for row in rows:
+        name_lower = (row.account_name or "").strip().lower()
+        if name_lower == "ascension recovery services" or "ascend" in name_lower:
+            await db.delete(row)
+            removed += 1
+    await db.commit()
+    return {"ok": True, "removed": removed}
 async def debug_renewal_date_config(db: AsyncSession = Depends(get_db)):
     """
     Debug: check if SALESFORCE_RENEWAL_DATE_FIELD is set and how many opportunities have renewal_date populated.

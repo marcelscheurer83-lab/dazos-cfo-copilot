@@ -60,27 +60,18 @@ from schemas import (
 )
 from seed_data import seed
 
-# Default Active ARR account overrides (manual override log); ensured on startup
-ACTIVE_ARR_OVERRIDE_ASCENSION = ("Ascension Recovery Services", "Closed won renewal ARR set to current open renewal ARR")
 
-
-async def _ensure_active_arr_overrides():
-    """Ensure default Active ARR account overrides exist (e.g. Ascension Recovery Service)."""
+async def _remove_ascension_ascend_overrides():
+    """Remove Ascension and Ascend Active ARR overrides so local and deployed stay in sync (no hardcoded overrides)."""
     async with AsyncSessionLocal() as db:
         try:
-            account_name, note = ACTIVE_ARR_OVERRIDE_ASCENSION
-            r = await db.execute(
-                select(ActiveARRAccountOverride).where(
-                    func.lower(ActiveARRAccountOverride.account_name) == account_name.lower()
-                )
-            )
-            if r.scalar_one_or_none() is None:
-                db.add(ActiveARRAccountOverride(
-                    account_name=account_name,
-                    use_open_renewal_arr=1,
-                    note=note,
-                ))
-                await db.commit()
+            r = await db.execute(select(ActiveARRAccountOverride))
+            rows = r.scalars().all()
+            for row in rows:
+                name_lower = (row.account_name or "").strip().lower()
+                if name_lower == "ascension recovery services" or "ascend" in name_lower:
+                    await db.delete(row)
+            await db.commit()
         except Exception:
             await db.rollback()
 
@@ -100,7 +91,7 @@ EST = ZoneInfo("America/New_York")
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await seed()
-    await _ensure_active_arr_overrides()
+    await _remove_ascension_ascend_overrides()
     # Background task: hourly Salesforce sync at :59 EST (ARR + pipeline); daily EOD snapshot at 23:59 EST (for historical ARR + pipeline)
     task = asyncio.create_task(_scheduled_salesforce_jobs())
     yield
@@ -152,7 +143,7 @@ class RequireAppPasswordMiddleware(BaseHTTPMiddleware):
             "/api/manual-overwrites",
         ):
             return await call_next(request)
-        # Allow DELETE on active-arr-overrides so you can remove overrides without the password (e.g. Ascension)
+        # Allow DELETE on active-arr-overrides so you can remove overrides without the password
         if request.method == "DELETE" and request.url.path.startswith("/api/arr-schedule/active-arr-overrides/"):
             return await call_next(request)
         # Allow DELETE on manual-overwrites (record type overrides) so you can remove them without the password
@@ -1402,7 +1393,7 @@ async def get_arr_schedule_active_arr(db: AsyncSession = Depends(get_db)):
         by_product_arr = {p: round(by_product.get(p, 0), 2) for p in products}
         total_arr = round(sum(by_product_arr.values()), 2)
         renewal_arr_val = round(renewal_arr_by_account.get((aid, aname), 0.0), 2)
-        # Manual override: for listed accounts, Active ARR = open renewal ARR (e.g. Ascension Recovery Service)
+        # Manual override: for listed accounts, Active ARR = open renewal ARR
         if (aname or "").strip().lower() in active_arr_use_open_renewal:
             total_arr = renewal_arr_val
             by_product_arr = {p: 0.0 for p in products}
@@ -3792,7 +3783,7 @@ async def list_active_arr_overrides(db: AsyncSession = Depends(get_db)):
 @app.post("/api/arr-schedule/active-arr-overrides")
 async def create_active_arr_override(
     db: AsyncSession = Depends(get_db),
-    account_name: str = Query(..., description="Account name (e.g. Ascension Recovery Service)"),
+    account_name: str = Query(..., description="Account name"),
     note: Optional[str] = Query(None, description="Optional note for the log"),
 ):
     """Add or update an Active ARR account override: for this account, Active ARR = open renewal ARR."""
@@ -4035,7 +4026,7 @@ async def debug_renewal_arr_for_account(
 @app.get("/api/debug/opportunities-for-account")
 async def debug_opportunities_for_account(
     db: AsyncSession = Depends(get_db),
-    account_name: str = Query(..., description="Account name (e.g. Ascend Recovery Center)"),
+    account_name: str = Query(..., description="Account name"),
 ):
     """
     List all synced opportunities for an account (name contains, case-insensitive).

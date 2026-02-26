@@ -14,8 +14,8 @@ This roadmap turns the [vision in CONTEXT.md](CONTEXT.md) into a phased build. E
 | **1b** Salesforce connector (ARR + GTM) | ✅ Done | Connector + Opportunity sync; POST /api/sync/salesforce, GET /api/opportunities. |
 | **1c** QuickBooks connector (financials) | ✅ Done | OAuth + Reports API; POST /api/sync/quickbooks, GET /api/quickbooks/reports/{pl,balance_sheet,cash_flow}. **Sandbox only for now** — production OAuth/keys later. |
 | **Chargebee** connector (billing reconciliation) | ✅ Done | CHARGEBEE_SITE + CHARGEBEE_API_KEY; POST /api/sync/chargebee, GET /api/chargebee/{subscriptions,invoices}. ARR stays from Salesforce. |
-| **2** Live exec dashboard | 🔲 Not started | KPIs from Sheets + Salesforce + QuickBooks. |
-| **3** ARR schedule (Salesforce) | 🔲 Not started | ARR schedule maintained from Salesforce; view in app. |
+| **2** Live exec dashboard | ⏸️ Later | Dashboard is usable (Bookings, Renewals, Cash, pipeline, etc.); formal KPI list and polish later. |
+| **3** ARR schedule (Salesforce) | ▶ Next | Recurring revenue view: cohorts, churn, expansion; schedule table/charts in app. (Customer CARR-by-account view already exists at ARR schedule.) |
 | **4** Monthly & quarterly reports | 🔲 Not started | Draft reports from app data. |
 | **5** Full data + analyst Copilot | 🔲 Not started | Justworks if needed; LLM; proactive analyst. |
 
@@ -26,21 +26,19 @@ This roadmap turns the [vision in CONTEXT.md](CONTEXT.md) into a phased build. E
 - **Backend & frontend** — Run with `uvicorn main:app --reload --port 8000` (backend) and `npm run dev` (frontend). App at http://localhost:5173, API at http://localhost:8000.
 - **Production** — Backend on **Railway** (24/7), frontend on **Vercel**. DB on Railway volume at `/data/cfo.db` so EOD snapshots and synced data persist. Hourly Salesforce sync at :59 EST; daily EOD snapshot at 23:59 EST. GET `/api/salesforce/eod-snapshots` (public); POST `/api/salesforce/eod-snapshots/take` for manual snapshot test. Optional `APP_PASSWORD`.
 - **Google Sheets (Phase 1a)** — Done. Service account set up; full financial model syncs via “Refresh from sheet” on the dashboard (all tabs in `frontend/src/api.ts` → `MODEL_SHEET_RANGES`). Plan data is stored in the backend (table `sheet_snapshots`) and used in the background for future summaries/analyses; dashboard shows only KPI cards + “Plan data available… Last synced: …” and the Refresh button.
-- **Dashboard** — Shows seed-data KPIs (cash, burn, runway, revenue, etc.). No raw sheet table; plan data is background-only.
+- **Dashboard** — Usable: KPI card, Bookings (ARR), Renewals (ARR), Cash (plan vs actual from Sheets + Salesforce + Chargebee), pipeline/renewals/closed overviews. Live exec dashboard polish (formal KPI list, labels) deferred.
 - **Salesforce (Phase 1b)** — Done. SALESFORCE_* in `.env`; hourly sync + EOD snapshot on Railway. POST /api/sync/salesforce; GET /api/opportunities; GET /api/salesforce/eod-snapshots; POST /api/salesforce/eod-snapshots/take.
 - **QuickBooks (Phase 1c)** — Done. Set QB_* in `.env` and **QB_SANDBOX=true** (sandbox only for now; production later). POST /api/sync/quickbooks; GET /api/quickbooks/reports/pl (or balance_sheet, cash_flow).
 - **Copilot** — CARR-only (contracted ARR); uses live data or EOD snapshots (e.g. “How did CARR change today?”). No LLM yet.
-- **Next step** — **Phase 2: Live exec dashboard** (wire KPIs from Sheets + Salesforce + QuickBooks), then **Phase 3: ARR schedule**. Later: encrypt stored data (see Security / hardening).
+- **Next step** — **Phase 3: ARR schedule** — recurring revenue view (cohorts, churn, expansion) maintained from Salesforce; schedule table and optional charts in app. The existing **ARR schedule** page (nav → ARR schedule) is the *customer* view (CARR by account/product); Phase 3 adds the *schedule* view (ARR/MRR by cohort/segment, churn, expansion) for board/internal use.
 
 ---
 
 ## Where we are today
 
-- **App runs** — Backend (FastAPI) and frontend (React). Dashboard, P&L, cash flow, budget vs actuals, Copilot tab.
-- **Data** — **Google Sheets** connected; full model syncs and is stored for summaries/analyses. **KPI / P&L / cash / budget** still from seed data until Salesforce and QuickBooks are connected.
-- **Copilot** — Rule-based answers from seed KPI data; no LLM yet.
-
-Goal: add Salesforce (ARR/GTM) and QuickBooks (financials), then live dashboard, ARR schedule, reports, and analyst Copilot.
+- **App runs** — Backend (FastAPI) and frontend (React). Dashboard (Bookings, Renewals, Cash, plan vs actual), pipeline/renewals/closed overviews, ARR by account (customer view), P&L, cash flow, budget vs actuals, Copilot tab.
+- **Data** — **Google Sheets**, **Salesforce**, **QuickBooks** (sandbox), **Chargebee** connected; dashboard and ARR customer view use live data.
+- **Next** — Phase 3: ARR *schedule* (recurring revenue by cohort/segment, churn, expansion) for board/internal use.
 
 ---
 

@@ -1,30 +1,64 @@
 """Seed database with sample Dazos financial data."""
 from datetime import date, timedelta
-from sqlalchemy import select, text
+from sqlalchemy import select, text, Date, DateTime, Integer, Float, String, Text, Boolean
 from sqlalchemy.exc import OperationalError
 from database import engine, AsyncSessionLocal
 from models import Base, Company, KPI, PnLLine, CashFlowLine, BudgetLine
 
 
-async def create_tables():
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    # Add columns/tables added after initial schema
-    async with engine.begin() as conn:
-        for stmt in [
-            "ALTER TABLE accounts ADD COLUMN status VARCHAR(128)",
-            "ALTER TABLE accounts ADD COLUMN segment VARCHAR(128)",
-            "ALTER TABLE opportunities ADD COLUMN record_type_name VARCHAR(128)",
-            "ALTER TABLE opportunity_line_items ADD COLUMN product_name VARCHAR(255)",
-            "ALTER TABLE opportunities ADD COLUMN mrr FLOAT",
-            "ALTER TABLE opportunities ADD COLUMN renewal_date DATE",
-            "ALTER TABLE opportunities ADD COLUMN original_acv FLOAT",
-        ]:
+def _sqlite_type(typ):
+    """Map SQLAlchemy type to SQLite type name for ALTER TABLE ADD COLUMN."""
+    if isinstance(typ, Date):
+        return "DATE"
+    if isinstance(typ, DateTime):
+        return "DATETIME"
+    if isinstance(typ, Integer):
+        return "INTEGER"
+    if isinstance(typ, Float):
+        return "FLOAT"
+    if isinstance(typ, String):
+        return f"VARCHAR({typ.length or 255})"
+    if isinstance(typ, Text):
+        return "TEXT"
+    if isinstance(typ, Boolean):
+        return "INTEGER"
+    return "TEXT"
+
+
+def _add_missing_columns_sqlite(sync_conn):
+    """
+    For each table that exists in the DB, add any columns that exist in our
+    models but not in the table. Ensures new columns added to models.py are
+    applied on startup without manual migration (SQLite only).
+    """
+    result = sync_conn.execute(text("SELECT name FROM sqlite_master WHERE type='table'"))
+    db_tables = [row[0] for row in result.fetchall()]
+    for table_name in db_tables:
+        if table_name not in Base.metadata.tables:
+            continue
+        table = Base.metadata.tables[table_name]
+        result = sync_conn.execute(text(f"PRAGMA table_info({table_name!r})"))
+        existing_cols = {row[1] for row in result.fetchall()}
+        for col in table.c:
+            if col.name in existing_cols:
+                continue
+            type_str = _sqlite_type(col.type)
+            # Use double quotes for identifiers (SQLite); single quotes would be string literals
+            stmt = text(f'ALTER TABLE "{table_name}" ADD COLUMN "{col.name}" {type_str}')
             try:
-                await conn.execute(text(stmt))
+                sync_conn.execute(stmt)
             except OperationalError as e:
                 if "duplicate column name" not in str(e).lower():
                     raise
+
+
+async def create_tables():
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    # SQLite: add any columns that exist in models but not in the DB (e.g. after pulling new code)
+    if "sqlite" in str(engine.url):
+        async with engine.begin() as conn:
+            await conn.run_sync(_add_missing_columns_sqlite)
 
 
 async def seed():

@@ -8,6 +8,20 @@ type SnapshotContents = {
   carr_summary: { grand_total: number; accounts_with_arr: number }
 } | null
 
+/** Format UTC snapshot time as Eastern so "last night" is obvious (23:59 EST = 04:59 UTC next day). */
+function formatSnapshotTimeEst(utcIso: string | null): string | null {
+  if (!utcIso) return null
+  try {
+    const d = new Date(utcIso)
+    if (Number.isNaN(d.getTime())) return null
+    const est = d.toLocaleString('en-US', { timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit', hour12: false, month: 'short', day: 'numeric', year: '2-digit' })
+    const tz = Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York', timeZoneName: 'short' }).formatToParts(d).find((p) => p.type === 'timeZoneName')?.value ?? 'ET'
+    return `${est} ${tz}`
+  } catch {
+    return null
+  }
+}
+
 export default function Admin() {
   const [snapshots, setSnapshots] = useState<Array<{ snapshot_date: string; snapshot_utc: string | null }> | null>(null)
   const [snapshotsErr, setSnapshotsErr] = useState<string | null>(null)
@@ -100,7 +114,9 @@ export default function Admin() {
             <li key={i} style={{ marginBottom: '0.25rem', display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
               <strong>{s.snapshot_date}</strong>
               {s.snapshot_utc && (
-                <span style={{ color: 'var(--text-muted)' }}>({s.snapshot_utc} UTC)</span>
+                <span style={{ color: 'var(--text-muted)' }} title={s.snapshot_utc + ' UTC'}>
+                  (taken {formatSnapshotTimeEst(s.snapshot_utc) ?? s.snapshot_utc})
+                </span>
               )}
               <button
                 type="button"

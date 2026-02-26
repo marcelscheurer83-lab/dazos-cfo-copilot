@@ -9,6 +9,17 @@ export default defineConfig({
   },
   server: {
     port: 5173,
-    proxy: { '/api': { target: 'http://localhost:8000', changeOrigin: true } },
+    proxy: {
+      '/api': {
+        target: 'http://localhost:8000',
+        changeOrigin: true,
+        configure(proxy) {
+          proxy.on('proxyReq', (proxyReq, req) => {
+            const p = req.headers['x-app-password']
+            if (p !== undefined) proxyReq.setHeader('X-App-Password', p)
+          })
+        },
+      },
+    },
   },
 })

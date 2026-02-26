@@ -61,6 +61,11 @@ Open **http://localhost:5173**. API runs at **http://localhost:8000**.
 
 3. **Summary:** Set `VITE_API_URL` at frontend build time to your backend URL; set `CORS_ORIGINS` on the backend to your frontend origin(s). All scheduled times (Salesforce sync, EOD snapshot) use **America/New_York (EST/EDT)**.
 
+### Deploying to GitHub (and later to production)
+
+- **Secrets:** `backend/.env` and `*.db` are in `.gitignore` and are not committed. Use `backend/.env.example` as a template; set real values in `.env` locally and in your host’s environment variables when you deploy. Never commit `.env` or credentials.
+- **Database:** On first run (local or after deploy), the backend creates tables and adds any missing columns from `models.py`, so a fresh clone or new environment gets the correct schema without extra steps. For production, set `DATABASE_URL` to a hosted DB (e.g. Postgres) if the host has an ephemeral filesystem.
+
 ### Running the backend 24/7 (scheduled sync & snapshot)
 
 The **hourly Salesforce sync** (:59:59 EST) and **daily EOD snapshot** (23:59:59 EST) run only while the backend process is running. If your machine is off or you stop the server, they won’t run.
@@ -98,6 +103,8 @@ dazos-cfo-copilot/
 
 - Copy `backend/.env.example` to `backend/.env` and set any API keys (e.g. for future AI provider).
 - Defaults work with SQLite and seed data.
+
+**Database (SQLite):** The backend creates and updates the database automatically on startup: it creates any missing tables and adds any missing columns to existing tables (when you add new fields to `models.py` or pull changes that do). No manual migration step is required. For production, use a persistent database (e.g. Postgres) and set `DATABASE_URL`; the same models apply.
 
 ### Google Sheets connector (Phase 1a)
 

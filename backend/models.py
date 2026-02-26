@@ -1,5 +1,5 @@
 """Financial data models for Dazos CFO Copilot."""
-from sqlalchemy import Column, Integer, String, Float, Date, DateTime, Text
+from sqlalchemy import Column, Integer, String, Float, Date, DateTime, Text, UniqueConstraint
 from sqlalchemy.sql import func
 from database import Base
 
@@ -118,6 +118,8 @@ class Opportunity(Base):
     account_id = Column(String(18), nullable=True)
     account_name = Column(String(255), nullable=True)
     mrr = Column(Float, nullable=True)  # MRR from Opportunity Finance Details (e.g. MRR__c); ARR = mrr * 12
+    contract_start_date = Column(Date, nullable=True)  # Optional; from SF e.g. Contract_Start_Date__c (New Business)
+    contract_end_date = Column(Date, nullable=True)  # Optional; from SF e.g. Contract_End_Date__c (New Business)
     created_date = Column(DateTime, nullable=True)
     synced_at = Column(DateTime, server_default=func.now())
 
@@ -132,6 +134,16 @@ class OpportunityRecordTypeOverride(Base):
     created_at = Column(DateTime, server_default=func.now())
 
 
+class ActiveARRAccountOverride(Base):
+    """Manual override for Active ARR by account (e.g. use open renewal ARR as Active ARR). Logged with note."""
+    __tablename__ = "active_arr_account_overrides"
+    id = Column(Integer, primary_key=True)
+    account_name = Column(String(255), nullable=False)  # Match by account name (case-insensitive)
+    use_open_renewal_arr = Column(Integer, default=1)   # 1 = use open renewal ARR as Active ARR for this account
+    note = Column(String(512), nullable=True)
+    created_at = Column(DateTime, server_default=func.now())
+
+
 class SalesforceEODSnapshot(Base):
     """End-of-day snapshot of all Salesforce data (accounts, opportunities, opportunity_line_items) at 23:59:59 EST for historical analysis."""
     __tablename__ = "salesforce_eod_snapshots"
@@ -141,13 +153,56 @@ class SalesforceEODSnapshot(Base):
     data_json = Column(Text, nullable=False)  # JSON: { "accounts": [...], "opportunities": [...], "opportunity_line_items": [...] }
 
 
+class ARRScheduleDaily(Base):
+    """
+    Materialized ARR by account, by day. One row = ARR active at end of snapshot_date for one account.
+    Populated from EOD snapshots (same logic as customer ARR view). Enables ARR bridge, retention, NRR, renewal rates.
+    """
+    __tablename__ = "arr_schedule_daily"
+    __table_args__ = (UniqueConstraint("snapshot_date", "account_id", "account_name", name="uq_arr_schedule_daily_date_account"),)
+    id = Column(Integer, primary_key=True)
+    snapshot_date = Column(Date, nullable=False)  # As-of date (EOD); ARR active at end of this day
+    account_id = Column(String(18), nullable=True)  # Salesforce account ID
+    account_name = Column(String(255), nullable=False)
+    segment = Column(String(128), nullable=True)
+    subscription_end_date = Column(Date, nullable=True)  # Latest renewal close_date for this account
+    total_arr = Column(Float, nullable=False, default=0)
+    by_product_json = Column(Text, nullable=True)  # JSON: {"IQ Platform": 12000, "Add. MR/IQ": 5000, ...}
+
+
+class ARRSchedulePeriod(Base):
+    """
+    Editable ARR schedule: one row = one account's active subscription period (start/end + ARR).
+    Source of truth for historical ARR; can be corrected when a closed opportunity is updated in SF.
+    'ARR as of date D' = sum of total_arr for periods where period_start <= D <= period_end.
+    Aligns with the financial model sheet (ARR schedule from row 185): list of accounts with
+    subscription start, subscription end, and ARR active during that period.
+    """
+    __tablename__ = "arr_schedule_periods"
+    id = Column(Integer, primary_key=True)
+    account_id = Column(String(18), nullable=True)  # Salesforce account ID
+    account_name = Column(String(255), nullable=False)
+    segment = Column(String(128), nullable=True)
+    period_start = Column(Date, nullable=False)  # First day this ARR is active
+    period_end = Column(Date, nullable=False)  # Last day (inclusive); use same as period_start for single-day
+    total_arr = Column(Float, nullable=False, default=0)
+    by_product_json = Column(Text, nullable=True)  # JSON: {"IQ Platform": 12000, ...}
+    source = Column(String(32), nullable=True)  # 'salesforce' | 'manual' | 'backfill'
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+
 class OpportunityLineItem(Base):
-    """Synced from Salesforce — product lines on opportunities. total_price = MRR (monthly); ARR = total_price * 12."""
+    """Synced from Salesforce — product lines on opportunities. total_price = MRR (monthly); ARR = total_price * 12.
+    When same product has multiple segments (different term/price), ARR = (sum(term_months_i * price_i) / sum(term_months_i)) * 12."""
     __tablename__ = "opportunity_line_items"
     id = Column(Integer, primary_key=True)
     opportunity_sf_id = Column(String(18), nullable=False)  # Opportunity.Id in Salesforce
     product_name = Column(String(255), nullable=True)  # Product2.Name
     quantity = Column(Float, default=0)
     unit_price = Column(Float, default=0)
-    total_price = Column(Float, default=0)  # MRR (monthly); ARR = total_price * 12
+    total_price = Column(Float, default=0)  # MRR (monthly) for that segment
+    term_months = Column(Float, nullable=True)  # Term in months for this segment (enables period-weighted ARR)
+    service_start_date = Column(Date, nullable=True)  # Optional; from SF ServiceDate
+    service_end_date = Column(Date, nullable=True)   # Optional; from SF EndDate or custom
     synced_at = Column(DateTime, server_default=func.now())

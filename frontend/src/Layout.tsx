@@ -19,7 +19,12 @@ const nav: NavItem[] = [
       { to: '/pipeline-overview', label: 'Pipeline' },
     ],
   },
-  { to: '/customer-overview', label: 'ARR schedule' },
+  {
+    label: 'ARR schedule',
+    children: [
+      { to: '/arr-schedule/active-arr', label: 'Contracted ARR' },
+    ],
+  },
   { to: '/financials', label: 'Financials' },
   { to: '/copilot', label: 'Copilot' },
   { to: '/admin', label: 'Admin' },
@@ -46,14 +51,21 @@ const subLinkStyle = (isActive: boolean) => ({
 })
 
 const GTM_PATHS = ['/bookings', '/gtm/renewals', '/pipeline-overview']
+const ARR_SCHEDULE_PATHS = ['/arr-schedule/active-arr']
 
 export default function Layout() {
   const location = useLocation()
   const [gtmExpanded, setGtmExpanded] = useState(true)
+  const [arrScheduleExpanded, setArrScheduleExpanded] = useState(true)
 
   useEffect(() => {
     if (GTM_PATHS.some((p) => location.pathname === p || location.pathname.startsWith(p + '/'))) {
       setGtmExpanded(true)
+    }
+  }, [location.pathname])
+  useEffect(() => {
+    if (ARR_SCHEDULE_PATHS.some((p) => location.pathname === p || location.pathname.startsWith(p + '/'))) {
+      setArrScheduleExpanded(true)
     }
   }, [location.pathname])
 
@@ -79,8 +91,18 @@ export default function Layout() {
               const isSectionActive = item.children.some((c) =>
                 location.pathname === c.to || (c.to !== '/dashboard' && location.pathname.startsWith(c.to + '/'))
               )
-              const isExpanded = item.label === 'Go-To-Market' ? gtmExpanded : true
-              const setExpanded = item.label === 'Go-To-Market' ? (v: boolean) => setGtmExpanded(v) : () => {}
+              const isExpanded =
+                item.label === 'Go-To-Market'
+                  ? gtmExpanded
+                  : item.label === 'ARR schedule'
+                    ? arrScheduleExpanded
+                    : true
+              const setExpanded =
+                item.label === 'Go-To-Market'
+                  ? (v: boolean) => setGtmExpanded(v)
+                  : item.label === 'ARR schedule'
+                    ? (v: boolean) => setArrScheduleExpanded(v)
+                    : () => {}
               return (
                 <div key={idx} style={{ marginBottom: '0.25rem' }}>
                   <button

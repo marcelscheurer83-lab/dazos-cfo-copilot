@@ -28,7 +28,7 @@ export async function apiFetch(
 
 /** Call from login screen: verify password and return true if valid. */
 export async function checkAppPassword(password: string): Promise<boolean> {
-  const r = await apiFetch('/dashboard-kpi', {}, password)
+  const r = await apiFetch('/auth/check', {}, password)
   return r.ok
 }
 
@@ -384,6 +384,34 @@ export async function exportARRToGoogleSheet(): Promise<{ ok: boolean; error?: s
   const data = await r.json()
   if (!r.ok) return { ok: false, error: data.error || data.detail?.toString() || 'Export failed' }
   return data
+}
+
+/** Active ARR by account from all Closed Won opportunities. Subscription dates from New Business opp when present. */
+export type ActiveARRRow = {
+  account_id: string | null
+  account_name: string
+  /** Account Status from Salesforce (e.g. Account_Status__c). */
+  status: string | null
+  segment: string | null
+  active_arr: number
+  by_product: Record<string, number>
+  subscription_start_date: string | null
+  subscription_end_date: string | null
+  /** e.g. "Open renewal only; no closed renewal/NB" */
+  note: string | null
+  no_new_business: boolean
+}
+
+export type ActiveARRResponse = {
+  rows: ActiveARRRow[]
+  grand_total: number
+  salesforce_base_url?: string
+}
+
+export async function getARRScheduleActiveArr(): Promise<ActiveARRResponse> {
+  const r = await apiFetch('/arr-schedule/active-arr')
+  if (!r.ok) throw new Error('Failed to fetch Active ARR')
+  return r.json()
 }
 
 /** Pipeline overview: open opportunities (not Closed Won/Lost). One row per opportunity. */

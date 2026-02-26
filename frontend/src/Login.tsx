@@ -11,10 +11,6 @@ export default function Login({ onSuccess }: Props) {
   async function handleSubmit(e: FormEvent) {
     e.preventDefault()
     setError(null)
-    if (!password.trim()) {
-      setError('Enter the app password.')
-      return
-    }
     setLoading(true)
     try {
       const ok = await checkAppPassword(password.trim())

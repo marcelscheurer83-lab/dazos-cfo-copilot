@@ -394,10 +394,14 @@ export type ActiveARRRow = {
   status: string | null
   segment: string | null
   active_arr: number
+  /** ARR from anchor (renewal/NB) only; used for ARR history over time. */
+  anchor_arr?: number
+  /** Expansions after anchor: close_date + arr; used for by-month ARR. */
+  expansions?: Array<{ close_date: string; arr: number }>
   by_product: Record<string, number>
   subscription_start_date: string | null
   subscription_end_date: string | null
-  /** e.g. "Open renewal only; no closed renewal/NB" */
+  /** e.g. "ren only" when only open renewal, no closed renewal/NB */
   note: string | null
   no_new_business: boolean
 }
@@ -411,6 +415,22 @@ export type ActiveARRResponse = {
 export async function getARRScheduleActiveArr(): Promise<ActiveARRResponse> {
   const r = await apiFetch('/arr-schedule/active-arr')
   if (!r.ok) throw new Error('Failed to fetch Active ARR')
+  return r.json()
+}
+
+/** Contracted ARR as of each month-end (Dec 2024–Dec 2026). Row has by_month[YYYY-MM] = ARR when subscription is active that month. */
+export type ActiveARRByMonthRow = ActiveARRRow & { by_month: Record<string, number> }
+
+export type ActiveARRByMonthResponse = {
+  months: string[]
+  totals_by_month: Record<string, number>
+  rows: ActiveARRByMonthRow[]
+  salesforce_base_url?: string
+}
+
+export async function getARRScheduleActiveARRByMonth(): Promise<ActiveARRByMonthResponse> {
+  const r = await apiFetch('/arr-schedule/active-arr-by-month')
+  if (!r.ok) throw new Error('Failed to fetch ARR by month')
   return r.json()
 }
 

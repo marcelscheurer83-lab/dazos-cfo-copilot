@@ -1,23 +1,31 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { getARRScheduleActiveArr, syncSalesforce, type ActiveARRRow } from '../api'
+import { getARRScheduleActiveARRByMonth, syncSalesforce, type ActiveARRByMonthRow } from '../api'
 
 function fmtMoney(n: number) {
   return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 }).format(n)
 }
 
-type SortKey = 'account_name' | 'status' | 'segment' | 'subscription_start_date' | 'subscription_end_date' | 'no_new_business' | 'active_arr'
+function shortMonthLabel(monthKey: string) {
+  const [y, m] = monthKey.split('-').map(Number)
+  const names = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+  return `${names[m - 1]} '${String(y).slice(2)}`
+}
+
+type SortKey = 'account_name' | 'status' | 'segment' | 'subscription_start_date' | 'subscription_end_date' | 'active_arr' | 'total_all_months' | (string & {})
 type SortDir = 'asc' | 'desc'
 type FilterColumn = 'segment' | 'status'
 
 export default function ARRScheduleActiveArrView() {
-  const [rows, setRows] = useState<ActiveARRRow[]>([])
+  const [rows, setRows] = useState<ActiveARRByMonthRow[]>([])
+  const [months, setMonths] = useState<string[]>([])
+  const [totalsByMonth, setTotalsByMonth] = useState<Record<string, number>>({})
   const [grandTotal, setGrandTotal] = useState(0)
   const [salesforceBaseUrl, setSalesforceBaseUrl] = useState<string | undefined>(undefined)
   const [err, setErr] = useState<string | null>(null)
   const [syncStatus, setSyncStatus] = useState<'idle' | 'loading' | 'ok' | 'error'>('idle')
   const [syncMessage, setSyncMessage] = useState<string | null>(null)
-  const [sortKey, setSortKey] = useState<SortKey>('active_arr')
-  const [sortDir, setSortDir] = useState<SortDir>('desc')
+  const [sortKey, setSortKey] = useState<SortKey>('account_name')
+  const [sortDir, setSortDir] = useState<SortDir>('asc')
   const [filterSegment, setFilterSegment] = useState<string[]>([])
   const [filterStatus, setFilterStatus] = useState<string[]>([])
   const [openFilter, setOpenFilter] = useState<FilterColumn | null>(null)
@@ -27,10 +35,12 @@ export default function ARRScheduleActiveArrView() {
   const statusPopoverRef = useRef<HTMLDivElement>(null)
 
   const load = useCallback(() => {
-    getARRScheduleActiveArr()
+    getARRScheduleActiveARRByMonth()
       .then((res) => {
         setRows(res.rows || [])
-        setGrandTotal(res.grand_total ?? 0)
+        setMonths(res.months ?? [])
+        setTotalsByMonth(res.totals_by_month ?? {})
+        setGrandTotal(res.rows?.reduce((s, r) => s + (r.active_arr ?? 0), 0) ?? 0)
         setSalesforceBaseUrl(
           res.salesforce_base_url &&
           (res.salesforce_base_url.includes('salesforce.com') || res.salesforce_base_url.includes('lightning.force.com'))
@@ -87,13 +97,18 @@ export default function ARRScheduleActiveArrView() {
       setSortDir((d) => (d === 'asc' ? 'desc' : 'asc'))
     } else {
       setSortKey(key)
-      setSortDir(key === 'account_name' || key === 'status' || key === 'segment' || key === 'subscription_start_date' || key === 'subscription_end_date' || key === 'no_new_business' ? 'asc' : 'desc')
+      setSortDir(key === 'account_name' || key === 'status' || key === 'segment' || key === 'subscription_start_date' || key === 'subscription_end_date' ? 'asc' : 'desc')
     }
   }
 
   const sortedRows = useMemo(() => {
     const dir = sortDir === 'asc' ? 1 : -1
+    const totalAllMonths = (r: ActiveARRByMonthRow) =>
+      months.reduce((s, m) => s + (r.by_month?.[m] ?? 0), 0)
     return [...rows].sort((a, b) => {
+      if (sortKey === 'total_all_months') {
+        return dir * (totalAllMonths(a) - totalAllMonths(b))
+      }
       if (sortKey === 'account_name') {
         const av = (a.account_name ?? '').toLowerCase()
         const bv = (b.account_name ?? '').toLowerCase()
@@ -119,14 +134,14 @@ export default function ARRScheduleActiveArrView() {
         const bv = b.subscription_end_date ?? ''
         return dir * (av < bv ? -1 : av > bv ? 1 : 0)
       }
-      if (sortKey === 'no_new_business') {
-        const av = a.no_new_business ? 1 : 0
-        const bv = b.no_new_business ? 1 : 0
+      if (months.includes(sortKey)) {
+        const av = a.by_month?.[sortKey] ?? 0
+        const bv = b.by_month?.[sortKey] ?? 0
         return dir * (av - bv)
       }
       return dir * ((a.active_arr ?? 0) - (b.active_arr ?? 0))
     })
-  }, [rows, sortKey, sortDir])
+  }, [rows, sortKey, sortDir, months])
 
   const segmentOptions = useMemo(() => {
     const set = new Set<string>()
@@ -167,7 +182,7 @@ export default function ARRScheduleActiveArrView() {
   const grandTotalDisplay =
     hasActiveFilter ? displayRows.reduce((s, r) => s + (r.active_arr ?? 0), 0) : grandTotal
 
-  const th = (key: SortKey, label: string, align: 'left' | 'right' = 'left') => {
+  const th = (key: SortKey, label: string, align: 'left' | 'right' = 'left', sticky = false) => {
     const isActive = sortKey === key
     return (
       <th
@@ -183,6 +198,16 @@ export default function ARRScheduleActiveArrView() {
           whiteSpace: 'nowrap',
           cursor: 'pointer',
           userSelect: 'none',
+          background: 'var(--surface)',
+          ...(sticky
+            ? {
+                position: 'sticky' as const,
+                left: 0,
+                zIndex: 2,
+                background: 'var(--surface)',
+                borderRight: '1px solid var(--border)',
+              }
+            : {}),
         }}
       >
         {label}
@@ -190,6 +215,14 @@ export default function ARRScheduleActiveArrView() {
       </th>
     )
   }
+
+  const stickyFirstCell = (bg: string): React.CSSProperties => ({
+    position: 'sticky',
+    left: 0,
+    zIndex: 1,
+    background: bg,
+    borderRight: '1px solid var(--border)',
+  })
 
   const popoverStyle: React.CSSProperties = {
     position: 'absolute',
@@ -220,6 +253,7 @@ export default function ARRScheduleActiveArrView() {
           whiteSpace: 'nowrap',
           position: 'relative',
           verticalAlign: 'bottom',
+          background: 'var(--surface)',
         }}
       >
         <span
@@ -322,6 +356,7 @@ export default function ARRScheduleActiveArrView() {
           whiteSpace: 'nowrap',
           position: 'relative',
           verticalAlign: 'bottom',
+          background: 'var(--surface)',
         }}
       >
         <span
@@ -470,7 +505,14 @@ export default function ARRScheduleActiveArrView() {
         <p style={{ fontSize: '0.9rem', color: 'var(--text-muted)' }}>No Closed Won opportunities found.</p>
       )}
       {rows.length > 0 && (
-        <div style={{ overflowX: 'auto' }}>
+        <div
+          style={{
+            overflow: 'auto',
+            maxHeight: 'calc(100vh - 12rem)',
+            border: '1px solid var(--border)',
+            borderRadius: 8,
+          }}
+        >
           <table
             style={{
               width: '100%',
@@ -481,26 +523,66 @@ export default function ARRScheduleActiveArrView() {
             }}
           >
             <thead>
-              <tr style={{ borderBottom: '1px solid var(--border)' }}>
-                {th('account_name', 'Account', 'left')}
+              <tr
+                style={{
+                  borderBottom: '1px solid var(--border)',
+                  position: 'sticky',
+                  top: 0,
+                  zIndex: 3,
+                  background: 'var(--surface)',
+                  boxShadow: '0 1px 2px rgba(0,0,0,0.06)',
+                }}
+              >
+                {th('account_name', 'Account', 'left', true)}
                 {thStatusFilter()}
                 {thSegmentFilter()}
                 {th('subscription_start_date', 'Subscription start')}
                 {th('subscription_end_date', 'Subscription end')}
-                {th('no_new_business', 'Note')}
-                {th('active_arr', 'Contracted ARR', 'right')}
+                {th('total_all_months', 'Contracted ARR', 'right')}
+                {months.map((m) => (
+                  <th
+                    key={m}
+                    role="button"
+                    tabIndex={0}
+                    onClick={() => handleSort(m)}
+                    onKeyDown={(e) => (e.key === 'Enter' || e.key === ' ') && handleSort(m)}
+                    style={{
+                      textAlign: 'right',
+                      padding: '0.5rem 0.75rem',
+                      color: 'var(--text-muted)',
+                      fontWeight: 500,
+                      whiteSpace: 'nowrap',
+                      cursor: 'pointer',
+                      userSelect: 'none',
+                      background: 'var(--surface)',
+                    }}
+                  >
+                    {shortMonthLabel(m)}
+                    {sortKey === m && <span style={{ marginLeft: 4 }}>{sortDir === 'asc' ? '↑' : '↓'}</span>}
+                  </th>
+                ))}
               </tr>
             </thead>
             <tbody>
               <tr style={{ borderBottom: '1px solid var(--border)', fontWeight: 600, background: 'var(--surface)' }}>
-                <td style={{ padding: '0.5rem 0.75rem', color: 'var(--text-muted)' }}>Total</td>
-                <td style={{ padding: '0.5rem 0.75rem' }} />
+                <td style={{ padding: '0.5rem 0.75rem', color: 'var(--text-muted)', ...stickyFirstCell('var(--surface)') }}>Total</td>
                 <td style={{ padding: '0.5rem 0.75rem' }} colSpan={4} />
                 <td style={{ textAlign: 'right', padding: '0.5rem 0.75rem', color: 'var(--text)' }}>{fmtMoney(grandTotalDisplay)}</td>
+                {months.map((m) => (
+                  <td key={m} style={{ textAlign: 'right', padding: '0.5rem 0.75rem', color: 'var(--text)' }}>
+                    {fmtMoney(totalsByMonth[m] ?? 0)}
+                  </td>
+                ))}
               </tr>
               {displayRows.map((row, idx) => (
-                <tr key={row.account_id ?? row.account_name ?? idx} style={{ borderBottom: '1px solid var(--border)' }}>
-                  <td style={{ padding: '0.5rem 0.75rem', color: 'var(--text)' }}>
+                <tr
+                  key={row.account_id ?? row.account_name ?? idx}
+                  style={{
+                    borderBottom: '1px solid var(--border)',
+                    color: row.no_new_business ? 'var(--warning, #b8860b)' : undefined,
+                  }}
+                >
+                  <td style={{ padding: '0.5rem 0.75rem', color: 'var(--text)', ...stickyFirstCell('var(--bg)') }}>
                     {row.account_id && salesforceBaseUrl ? (
                       <a
                         href={
@@ -510,7 +592,7 @@ export default function ARRScheduleActiveArrView() {
                         }
                         target="_blank"
                         rel="noopener noreferrer"
-                        style={{ color: 'var(--accent)', textDecoration: 'none' }}
+                        style={{ color: row.no_new_business ? 'inherit' : 'var(--accent)', textDecoration: 'none' }}
                         title="Open in Salesforce"
                       >
                         {row.account_name}
@@ -527,27 +609,29 @@ export default function ARRScheduleActiveArrView() {
                   </td>
                   <td style={{ padding: '0.5rem 0.75rem', color: 'var(--text)', whiteSpace: 'nowrap' }}>{row.subscription_start_date ?? '—'}</td>
                   <td style={{ padding: '0.5rem 0.75rem', color: 'var(--text)', whiteSpace: 'nowrap' }}>{row.subscription_end_date ?? '—'}</td>
-                  <td style={{ padding: '0.5rem 0.75rem', color: 'var(--text-muted)', fontSize: '0.85rem' }}>
-                    {row.note ? (
-                      <span style={{ color: 'var(--warning, #b8860b)', fontWeight: 500 }}>{row.note}</span>
-                    ) : row.no_new_business ? (
-                      <span style={{ color: 'var(--warning, #b8860b)', fontWeight: 500 }}>Renewals only</span>
-                    ) : (
-                      '—'
-                    )}
-                  </td>
                   <td style={{ textAlign: 'right', padding: '0.5rem 0.75rem', fontWeight: 600, color: 'var(--text)' }}>
                     {fmtMoney(row.active_arr)}
                   </td>
+                  {months.map((m) => (
+                    <td key={m} style={{ textAlign: 'right', padding: '0.5rem 0.75rem', color: 'var(--text-muted)' }}>
+                      {(row.by_month?.[m] ?? 0) > 0 ? fmtMoney(row.by_month[m]) : '—'}
+                    </td>
+                  ))}
                 </tr>
               ))}
             </tbody>
             <tfoot>
               <tr style={{ borderTop: '2px solid var(--border)', fontWeight: 600 }}>
-                <td colSpan={6} style={{ padding: '0.5rem 0.75rem', textAlign: 'right', color: 'var(--text-muted)' }}>
+                <td style={{ padding: '0.5rem 0.75rem', textAlign: 'right', color: 'var(--text-muted)', ...stickyFirstCell('var(--surface)') }}>
                   Total
                 </td>
+                <td style={{ padding: '0.5rem 0.75rem' }} colSpan={4} />
                 <td style={{ textAlign: 'right', padding: '0.5rem 0.75rem', color: 'var(--text)' }}>{fmtMoney(grandTotalDisplay)}</td>
+                {months.map((m) => (
+                  <td key={m} style={{ textAlign: 'right', padding: '0.5rem 0.75rem', color: 'var(--text)' }}>
+                    {fmtMoney(totalsByMonth[m] ?? 0)}
+                  </td>
+                ))}
               </tr>
             </tfoot>
           </table>

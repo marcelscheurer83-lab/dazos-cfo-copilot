@@ -450,7 +450,8 @@ export default function ARRScheduleActiveArrView() {
         Schedule
       </h1>
       <p style={{ fontSize: '0.9rem', color: 'var(--text-muted)', marginBottom: '1rem' }}>
-        <strong>Contracted ARR</strong> = most recent closed-won renewal or new business + expansions after it, by account.
+        <strong>Active ARR as of today</strong> = ARR from the most recent closed-won renewal or new business plus expansions after it,
+        but only when today falls within the subscription start and end dates.
       </p>
 
       <p style={{ marginBottom: '1rem' }}>
@@ -538,7 +539,7 @@ export default function ARRScheduleActiveArrView() {
                 {thSegmentFilter()}
                 {th('subscription_start_date', 'Subscription start')}
                 {th('subscription_end_date', 'Subscription end')}
-                {th('total_all_months', 'Contracted ARR', 'right')}
+                {th('total_all_months', 'Active ARR (today)', 'right')}
                 {months.map((m) => (
                   <th
                     key={m}

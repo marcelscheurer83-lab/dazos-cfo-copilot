@@ -1486,6 +1486,8 @@ async def _compute_active_arr_rows(db: AsyncSession) -> tuple[list[dict], Option
             account_segment[sf_id] = seg
             account_status[sf_id] = st
 
+    today_est = datetime.now(EST).date()
+
     out_rows = []
     for (aid, aname), by_product in by_account_product.items():
         key = (aid, aname)
@@ -1514,18 +1516,30 @@ async def _compute_active_arr_rows(db: AsyncSession) -> tuple[list[dict], Option
         is_churned = status and (status.strip().lower() in CHURNED_ACCOUNT_STATUSES)
         if is_churned:
             # Churned accounts: keep historical ARR (anchor_arr + expansions) for by-month history,
-            # but treat current Contracted ARR and product breakdown as zero.
+            # but treat current Active ARR and product breakdown as zero.
             total_arr = 0.0
             by_product_arr = {p: 0.0 for p in products}
         sub_start = account_sub_start.get(key)
         sub_end = account_sub_end.get(key)
+        # Active ARR as of today (EST): same logic as by-month schedule but for today's date.
+        if sub_start is not None and today_est < sub_start:
+            active_arr_today = 0.0
+        elif sub_end is not None and today_est > sub_end:
+            active_arr_today = 0.0
+        else:
+            expansion_arr_today = sum(
+                exp["arr"]
+                for exp in expansions
+                if exp.get("close_date") and date.fromisoformat(exp["close_date"]) <= today_est
+            )
+            active_arr_today = round(anchor_arr + expansion_arr_today, 2)
         note = account_note.get(key)
         out_rows.append({
             "account_id": aid,
             "account_name": aname or "—",
             "status": status,
             "segment": seg,
-            "active_arr": total_arr,
+            "active_arr": active_arr_today,
             "anchor_arr": anchor_arr,
             "expansions": expansions,
             "by_product": {p: by_product_arr.get(p, 0) for p in products},
@@ -1821,9 +1835,14 @@ def _is_renewal_record_type(name: Optional[str]) -> bool:
 
 
 def _is_new_business_record_type(name: Optional[str]) -> bool:
-    """True if Type/record type is New Business or New Customer (case-insensitive, trimmed)."""
+    """True if Type/record type is New Business, New Customer, or Internal Admin Use (case-insensitive, trimmed)."""
     n = (name or "").strip().lower()
-    return n == "new business" or "new business" in n or "new customer" in n
+    return (
+        n == "new business"
+        or "new business" in n
+        or "new customer" in n
+        or n == "internal admin use"
+    )
 
 
 def _is_amendment_record_type(name: Optional[str]) -> bool:

@@ -272,7 +272,7 @@ export default function ARR() {
 
   return (
     <>
-      <h1 style={{ margin: '0 0 1.5rem', fontSize: '1.5rem', fontWeight: 600, color: 'var(--text)' }}>ARR schedule</h1>
+      <h1 style={{ margin: '0 0 1.5rem', fontSize: '1.5rem', fontWeight: 600, color: 'var(--text)' }}>ARR</h1>
       <p style={{ fontSize: '0.9rem', color: 'var(--text-muted)', marginBottom: '1rem' }}>
         Rows = accounts. Columns = contracted ARR (CARR) by product; includes customers with future start date. Last column = total CARR per account. iVerify Monthly Credits and Kipu API excluded.
       </p>

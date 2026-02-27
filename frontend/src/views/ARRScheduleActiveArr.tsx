@@ -447,7 +447,7 @@ export default function ARRScheduleActiveArrView() {
   return (
     <>
       <h1 style={{ margin: '0 0 1.5rem', fontSize: '1.5rem', fontWeight: 600, color: 'var(--text)' }}>
-        Contracted ARR
+        Schedule
       </h1>
       <p style={{ fontSize: '0.9rem', color: 'var(--text-muted)', marginBottom: '1rem' }}>
         <strong>Contracted ARR</strong> = most recent closed-won renewal or new business + expansions after it, by account.

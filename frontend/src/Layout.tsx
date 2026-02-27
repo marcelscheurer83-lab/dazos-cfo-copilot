@@ -20,9 +20,9 @@ const nav: NavItem[] = [
     ],
   },
   {
-    label: 'ARR schedule',
+    label: 'ARR',
     children: [
-      { to: '/arr-schedule/active-arr', label: 'Contracted ARR' },
+      { to: '/arr-schedule/active-arr', label: 'Schedule' },
     ],
   },
   { to: '/financials', label: 'Financials' },
@@ -94,13 +94,13 @@ export default function Layout() {
               const isExpanded =
                 item.label === 'Go-To-Market'
                   ? gtmExpanded
-                  : item.label === 'ARR schedule'
+                  : item.label === 'ARR'
                     ? arrScheduleExpanded
                     : true
               const setExpanded =
                 item.label === 'Go-To-Market'
                   ? (v: boolean) => setGtmExpanded(v)
-                  : item.label === 'ARR schedule'
+                  : item.label === 'ARR'
                     ? (v: boolean) => setArrScheduleExpanded(v)
                     : () => {}
               return (

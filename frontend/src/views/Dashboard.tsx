@@ -4,6 +4,7 @@ import {
   getDashboardBookingsMTD,
   getDashboardRenewalsMTD,
   getDashboardCashMTD,
+  getARRScheduleActiveArr,
   syncSalesforce,
   syncGoogleSheet,
   type DashboardKPI,
@@ -81,6 +82,8 @@ export default function Dashboard() {
   const [renewalsErr, setRenewalsErr] = useState<string | null>(null)
   const [cashErr, setCashErr] = useState<string | null>(null)
   const [sheetSyncError, setSheetSyncError] = useState<string | null>(null)
+  const [liveArrTotal, setLiveArrTotal] = useState<number | null>(null)
+  const [liveArrErr, setLiveArrErr] = useState<string | null>(null)
 
   useEffect(() => {
     const fetchKpi = () =>
@@ -100,11 +103,20 @@ export default function Dashboard() {
         .then(setCashMTD)
         .catch((e) => setCashErr(normalizeFetchError(e instanceof Error ? e.message : String(e), 'Cash')))
 
+    const fetchLiveArr = () =>
+      getARRScheduleActiveArr()
+        .then((res) => {
+          setLiveArrTotal(res.grand_total)
+          setLiveArrErr(null)
+        })
+        .catch((e) => setLiveArrErr(normalizeFetchError(e instanceof Error ? e.message : String(e), 'Live ARR')))
+
     const runSyncAndFetch = () => {
       fetchKpi()
       fetchBookings()
       fetchRenewals()
       fetchCash()
+      fetchLiveArr()
     }
 
     const runInitialLoad = async () => {
@@ -182,6 +194,24 @@ export default function Dashboard() {
           gap: '1.25rem',
         }}
       >
+        {/* Live ARR (as of today) — total from Schedule */}
+        <div style={{ ...blockStyle, width: 'fit-content' }}>
+          <div style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '0.35rem' }}>
+            Live ARR (as of today)
+          </div>
+          {liveArrErr && (
+            <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>{liveArrErr}</p>
+          )}
+          {!liveArrErr && liveArrTotal != null && (
+            <div style={{ fontSize: '1.75rem', fontWeight: 700, color: 'var(--text)' }}>
+              {new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 }).format(liveArrTotal)}
+            </div>
+          )}
+          {!liveArrErr && liveArrTotal == null && (
+            <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>Loading…</p>
+          )}
+        </div>
+
         {/* Block 1: Bookings */}
         <div style={{ ...blockStyle, gridColumn: '1 / -1' }}>
           <div style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text)', marginBottom: '0.5rem' }}>

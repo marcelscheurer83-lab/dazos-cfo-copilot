@@ -386,7 +386,15 @@ export default function ProductPenetration({ accounts, salesforceBaseUrl, curren
                   <XAxis dataKey="label" axisLine={false} tickLine={false} />
                   <YAxis tick={{ fontSize: 11, fill: 'var(--text-muted)' }} axisLine={false} tickLine={false} tickFormatter={(v) => `$${v >= 1000 ? `${(v / 1000).toFixed(0)}K` : v}`} />
                   <Bar dataKey="avgArr" radius={[4, 4, 0, 0]} cursor="pointer" onClick={(data: any) => setSelectedDepth(data?.depth ?? null)}>
-                    <LabelList dataKey="avgArr" position="top" style={{ fill: 'var(--text)', fontSize: 12, fontWeight: 600 }} />
+                    <LabelList
+                      dataKey="avgArr"
+                      position="top"
+                      formatter={(value: number) => {
+                        if (typeof value !== 'number') return ''
+                        return value >= 1000 ? `$${Math.round(value / 1000)}K` : `$${value}`
+                      }}
+                      style={{ fill: 'var(--text)', fontSize: 12, fontWeight: 600 }}
+                    />
                     {revenueDepthData.map((d) => <Cell key={d.depth} fill={DEPTH_COLORS[d.depth]} />)}
                   </Bar>
                 </BarChart>

@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { getARRScheduleActiveARRByMonth, syncSalesforce, type ActiveARRByMonthRow } from '../api'
+import { getARRScheduleActiveARRByMonth, syncSalesforce, exportCopilotARRScheduleToSheet, type ActiveARRByMonthRow } from '../api'
 
 function fmtMoney(n: number) {
-  return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 }).format(n)
+  return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(n)
 }
 
 function shortMonthLabel(monthKey: string) {
@@ -11,7 +11,7 @@ function shortMonthLabel(monthKey: string) {
   return `${names[m - 1]} '${String(y).slice(2)}`
 }
 
-type SortKey = 'account_name' | 'status' | 'segment' | 'subscription_start_date' | 'subscription_end_date' | 'active_arr' | 'total_all_months' | (string & {})
+type SortKey = 'account_name' | 'account_id' | 'status' | 'segment' | 'subscription_start_date' | 'subscription_end_date' | 'active_arr' | 'total_all_months' | (string & {})
 type SortDir = 'asc' | 'desc'
 type FilterColumn = 'segment' | 'status'
 
@@ -24,6 +24,9 @@ export default function ARRScheduleActiveArrView() {
   const [err, setErr] = useState<string | null>(null)
   const [syncStatus, setSyncStatus] = useState<'idle' | 'loading' | 'ok' | 'error'>('idle')
   const [syncMessage, setSyncMessage] = useState<string | null>(null)
+  const [exportStatus, setExportStatus] = useState<'idle' | 'loading' | 'ok' | 'error'>('idle')
+  const [exportMessage, setExportMessage] = useState<string | null>(null)
+  const [exportSpreadsheetUrl, setExportSpreadsheetUrl] = useState<string | null>(null)
   const [sortKey, setSortKey] = useState<SortKey>('account_name')
   const [sortDir, setSortDir] = useState<SortDir>('asc')
   const [filterSegment, setFilterSegment] = useState<string[]>([])
@@ -75,6 +78,34 @@ export default function ARRScheduleActiveArrView() {
       })
   }, [load])
 
+  const handleExportToSheet = useCallback(() => {
+    setExportStatus('loading')
+    setExportMessage(null)
+    setExportSpreadsheetUrl(null)
+    exportCopilotARRScheduleToSheet()
+      .then((res) => {
+        if (res.ok) {
+          setExportStatus('ok')
+          setExportSpreadsheetUrl(res.spreadsheet_url ?? null)
+          let msg =
+            res.message ?? (res.rows_written != null ? `Exported ${res.rows_written} rows to "Copilot ARR export" sheet.` : 'Exported to "Copilot ARR export" sheet.')
+          if (res.read_back?.length) {
+            const header = (res.read_back[0] ?? []).slice(0, 5).join(' | ')
+            msg += ` Read back: ${header}${(res.read_back[0]?.length ?? 0) > 5 ? '…' : ''}`
+          }
+          if (res.range_used) msg += ` Range: ${res.range_used}`
+          setExportMessage(msg)
+        } else {
+          setExportStatus('error')
+          setExportMessage(res.error ?? 'Export failed')
+        }
+      })
+      .catch((e) => {
+        setExportStatus('error')
+        setExportMessage(e.message ?? 'Export failed')
+      })
+  }, [])
+
   useEffect(() => {
     load()
   }, [load])
@@ -97,7 +128,7 @@ export default function ARRScheduleActiveArrView() {
       setSortDir((d) => (d === 'asc' ? 'desc' : 'asc'))
     } else {
       setSortKey(key)
-      setSortDir(key === 'account_name' || key === 'status' || key === 'segment' || key === 'subscription_start_date' || key === 'subscription_end_date' ? 'asc' : 'desc')
+      setSortDir(key === 'account_name' || key === 'account_id' || key === 'status' || key === 'segment' || key === 'subscription_start_date' || key === 'subscription_end_date' ? 'asc' : 'desc')
     }
   }
 
@@ -112,6 +143,11 @@ export default function ARRScheduleActiveArrView() {
       if (sortKey === 'account_name') {
         const av = (a.account_name ?? '').toLowerCase()
         const bv = (b.account_name ?? '').toLowerCase()
+        return dir * (av < bv ? -1 : av > bv ? 1 : 0)
+      }
+      if (sortKey === 'account_id') {
+        const av = (a.account_id ?? '').toLowerCase()
+        const bv = (b.account_id ?? '').toLowerCase()
         return dir * (av < bv ? -1 : av > bv ? 1 : 0)
       }
       if (sortKey === 'segment') {
@@ -450,8 +486,9 @@ export default function ARRScheduleActiveArrView() {
         Schedule
       </h1>
       <p style={{ fontSize: '0.9rem', color: 'var(--text-muted)', marginBottom: '1rem' }}>
-        <strong>Active ARR as of today</strong> = ARR from the most recent closed-won renewal or new business plus expansions after it,
-        but only when today falls within the subscription start and end dates.
+        <strong>Active ARR as of today</strong> = ARR from the period that contains today. The schedule includes
+        <strong> all closed-won new business and renewal</strong> periods per account (e.g. ex-post-added past NB before a renewal).
+        Subscription start/end = earliest period start to latest period end.
       </p>
 
       <p style={{ marginBottom: '1rem' }}>
@@ -471,6 +508,27 @@ export default function ARRScheduleActiveArrView() {
         >
           {syncStatus === 'loading' ? 'Syncing…' : 'Sync from Salesforce'}
         </button>
+        <button
+          type="button"
+          onClick={handleExportToSheet}
+          disabled={exportStatus === 'loading' || rows.length === 0}
+          style={{
+            marginLeft: '0.5rem',
+            padding: '0.5rem 1rem',
+            fontSize: '0.9rem',
+            cursor: exportStatus === 'loading' || rows.length === 0 ? 'not-allowed' : 'pointer',
+            background: 'var(--surface)',
+            color: 'var(--text)',
+            border: '1px solid var(--border)',
+            borderRadius: 6,
+          }}
+          title={rows.length === 0 ? 'No data to export' : 'Export current schedule to the "Copilot ARR export" sheet in the financial model'}
+        >
+          {exportStatus === 'loading' ? 'Exporting…' : 'Export to Copilot ARR export'}
+        </button>
+        <span style={{ marginLeft: '0.75rem', fontSize: '0.85rem', color: 'var(--text-muted)' }}>
+          Export writes to the &quot;Copilot ARR export&quot; tab in your financial model (create that tab if it doesn’t exist).
+        </span>
         {hasActiveFilter && (
           <button
             type="button"
@@ -498,6 +556,27 @@ export default function ARRScheduleActiveArrView() {
         )}
         {syncStatus === 'error' && syncMessage && (
           <span style={{ marginLeft: '0.75rem', fontSize: '0.9rem', color: 'var(--negative)' }}>{syncMessage}</span>
+        )}
+        {exportStatus === 'ok' && exportMessage && (
+          <span style={{ marginLeft: '0.75rem', fontSize: '0.9rem', color: 'var(--positive)' }}>
+            {exportMessage}
+            {exportSpreadsheetUrl && (
+              <>
+                {' '}
+                <a
+                  href={exportSpreadsheetUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  style={{ color: 'var(--accent)' }}
+                >
+                  Open sheet
+                </a>
+              </>
+            )}
+          </span>
+        )}
+        {exportStatus === 'error' && exportMessage && (
+          <span style={{ marginLeft: '0.75rem', fontSize: '0.9rem', color: 'var(--negative)' }}>{exportMessage}</span>
         )}
       </p>
 
@@ -535,6 +614,7 @@ export default function ARRScheduleActiveArrView() {
                 }}
               >
                 {th('account_name', 'Account', 'left', true)}
+                {th('account_id', '18 Digit SFDC Acct ID', 'left', false)}
                 {thStatusFilter()}
                 {thSegmentFilter()}
                 {th('subscription_start_date', 'Subscription start')}
@@ -567,6 +647,7 @@ export default function ARRScheduleActiveArrView() {
             <tbody>
               <tr style={{ borderBottom: '1px solid var(--border)', fontWeight: 600, background: 'var(--surface)' }}>
                 <td style={{ padding: '0.5rem 0.75rem', color: 'var(--text-muted)', ...stickyFirstCell('var(--surface)') }}>Total</td>
+                <td style={{ padding: '0.5rem 0.75rem' }} />
                 <td style={{ padding: '0.5rem 0.75rem' }} colSpan={4} />
                 <td style={{ textAlign: 'right', padding: '0.5rem 0.75rem', color: 'var(--text)' }}>{fmtMoney(grandTotalDisplay)}</td>
                 {months.map((m) => (
@@ -602,6 +683,9 @@ export default function ARRScheduleActiveArrView() {
                       row.account_name
                     )}
                   </td>
+                  <td style={{ padding: '0.5rem 0.75rem', color: 'var(--text-muted)', fontSize: '0.85em' }} title={row.account_id ?? undefined}>
+                    {row.account_id ?? '—'}
+                  </td>
                   <td style={{ padding: '0.5rem 0.75rem', color: 'var(--text-muted)', whiteSpace: 'nowrap' }}>
                     {row.status?.trim() ? row.status : '—'}
                   </td>
@@ -626,6 +710,7 @@ export default function ARRScheduleActiveArrView() {
                 <td style={{ padding: '0.5rem 0.75rem', textAlign: 'right', color: 'var(--text-muted)', ...stickyFirstCell('var(--surface)') }}>
                   Total
                 </td>
+                <td style={{ padding: '0.5rem 0.75rem' }} />
                 <td style={{ padding: '0.5rem 0.75rem' }} colSpan={4} />
                 <td style={{ textAlign: 'right', padding: '0.5rem 0.75rem', color: 'var(--text)' }}>{fmtMoney(grandTotalDisplay)}</td>
                 {months.map((m) => (

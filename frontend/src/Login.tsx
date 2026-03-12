@@ -1,7 +1,10 @@
 import { useState, FormEvent } from 'react'
-import { checkAppPassword } from './api'
+import { checkAppPassword, checkBackendHealthDetailed } from './api'
 
 type Props = { onSuccess: () => void }
+
+const SERVER_UNREACHABLE_INTRO =
+  'Backend not reachable. Open this app from http://localhost:5173 (same URL as the dev server). Ensure exactly one backend is running on port 8000.'
 
 export default function Login({ onSuccess }: Props) {
   const [password, setPassword] = useState('')
@@ -13,6 +16,12 @@ export default function Login({ onSuccess }: Props) {
     setError(null)
     setLoading(true)
     try {
+      const health = await checkBackendHealthDetailed()
+      if (!health.ok) {
+        setError(`${SERVER_UNREACHABLE_INTRO} — ${health.reason}`)
+        setLoading(false)
+        return
+      }
       const ok = await checkAppPassword(password.trim())
       if (ok) {
         sessionStorage.setItem('app_password', password.trim())
@@ -21,7 +30,7 @@ export default function Login({ onSuccess }: Props) {
         setError('Invalid password.')
       }
     } catch {
-      setError('Could not reach the server. Try again.')
+      setError(SERVER_UNREACHABLE_INTRO)
     } finally {
       setLoading(false)
     }
@@ -56,7 +65,7 @@ export default function Login({ onSuccess }: Props) {
             App password
           </label>
           <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)', marginBottom: '0.5rem' }}>
-            Leave blank if no password is configured.
+            Set APP_PASSWORD in backend/.env; enter it here to sign in.
           </div>
           <input
             type="password"

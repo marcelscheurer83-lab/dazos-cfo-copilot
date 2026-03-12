@@ -121,20 +121,69 @@ class GoogleSheetsConnector:
         self._drive_service = build("drive", "v3", credentials=self._credentials)
         return self._drive_service
 
-    def read_range(self, range_a1: str) -> list[list[Any]]:
+    def read_range(self, range_a1: str, spreadsheet_id: str | None = None) -> list[list[Any]]:
         """
         Read a range from the sheet using A1 notation (e.g. "Plan!A1:Z100").
+        spreadsheet_id: if given, read from this spreadsheet; otherwise use self.sheet_id.
         Returns a list of rows; each row is a list of cell values.
         """
-        if not self.sheet_id:
-            raise ValueError("GOOGLE_SHEET_ID is not set (required for read)")
+        sid = spreadsheet_id or self.sheet_id
+        if not sid:
+            raise ValueError("spreadsheet_id or GOOGLE_SHEET_ID is required for read")
         service = self._get_service()
         sheet = service.spreadsheets()
         result = sheet.values().get(
-            spreadsheetId=self.sheet_id,
+            spreadsheetId=sid,
             range=range_a1,
         ).execute()
         return result.get("values", [])
+
+    def get_sheet_gid_by_title(
+        self,
+        sheet_title: str,
+        spreadsheet_id: str | None = None,
+    ) -> int | None:
+        """
+        Return the sheet (tab) gid for the given title, or None if not found.
+        Use for building a direct link: .../edit#gid={sheetId}
+        """
+        sid = spreadsheet_id or self.sheet_id
+        if not sid:
+            return None
+        service = self._get_service()
+        meta = service.spreadsheets().get(
+            spreadsheetId=sid,
+            fields="sheets(properties(sheetId,title))",
+        ).execute()
+        for sh in meta.get("sheets") or []:
+            props = sh.get("properties") or {}
+            if (props.get("title") or "").strip().lower() == sheet_title.strip().lower():
+                return props.get("sheetId")
+        return None
+
+    def get_sheet_exact_title(
+        self,
+        sheet_title: str,
+        spreadsheet_id: str | None = None,
+    ) -> str | None:
+        """
+        Return the exact title of the sheet as stored in the API (match by case-insensitive name).
+        Use this when building A1 ranges so the name matches exactly.
+        """
+        sid = spreadsheet_id or self.sheet_id
+        if not sid:
+            return None
+        service = self._get_service()
+        meta = service.spreadsheets().get(
+            spreadsheetId=sid,
+            fields="sheets(properties(title))",
+        ).execute()
+        for sh in meta.get("sheets") or []:
+            props = sh.get("properties") or {}
+            title = (props.get("title") or "").strip()
+            if title.lower() == sheet_title.strip().lower():
+                return title
+        return None
 
     def update_range(
         self,
@@ -161,6 +210,38 @@ class GoogleSheetsConnector:
             range=range_a1,
             valueInputOption="USER_ENTERED",
             body=body,
+        ).execute()
+
+    def ensure_sheet_exists(
+        self,
+        sheet_title: str,
+        spreadsheet_id: str | None = None,
+        credentials_override: Any = None,
+    ) -> None:
+        """
+        If the spreadsheet does not have a sheet with the given title, add one.
+        spreadsheet_id: if given, use this spreadsheet; otherwise use self.sheet_id.
+        """
+        sid = spreadsheet_id or self.sheet_id
+        if not sid:
+            raise ValueError("spreadsheet_id or GOOGLE_SHEET_ID is required")
+        if credentials_override is not None:
+            service = build("sheets", "v4", credentials=credentials_override)
+        else:
+            service = self._get_service()
+        meta = service.spreadsheets().get(
+            spreadsheetId=sid,
+            fields="sheets(properties(sheetId,title))",
+        ).execute()
+        sheets = meta.get("sheets") or []
+        for sh in sheets:
+            props = sh.get("properties") or {}
+            if (props.get("title") or "").strip().lower() == sheet_title.strip().lower():
+                return  # already exists
+        # Add new sheet with this title
+        service.spreadsheets().batchUpdate(
+            spreadsheetId=sid,
+            body={"requests": [{"addSheet": {"properties": {"title": sheet_title.strip()}}}]},
         ).execute()
 
     def create_spreadsheet(self, title: str) -> dict:

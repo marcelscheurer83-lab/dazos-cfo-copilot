@@ -120,6 +120,8 @@ class Opportunity(Base):
     mrr = Column(Float, nullable=True)  # MRR from Opportunity Finance Details (e.g. MRR__c); ARR = mrr * 12
     contract_start_date = Column(Date, nullable=True)  # Optional; from SF e.g. Contract_Start_Date__c (New Business)
     contract_end_date = Column(Date, nullable=True)  # Optional; from SF e.g. Contract_End_Date__c (New Business)
+    owner_name = Column(String(255), nullable=True)  # Opportunity Owner (User) name from Salesforce
+    midterm_cancellation = Column(Integer, default=0)  # 1 = Midterm Cancellation true on renewal (subscription ended at this opp's contract_end_date)
     created_date = Column(DateTime, nullable=True)
     synced_at = Column(DateTime, server_default=func.now())
 

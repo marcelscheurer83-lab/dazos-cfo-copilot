@@ -25,6 +25,12 @@ const nav: NavItem[] = [
       { to: '/arr-schedule/active-arr', label: 'Schedule' },
     ],
   },
+  {
+    label: 'Analytics',
+    children: [
+      { to: '/analytics', label: 'Product penetration' },
+    ],
+  },
   { to: '/financials', label: 'Financials' },
   { to: '/copilot', label: 'Copilot' },
   { to: '/admin', label: 'Admin' },
@@ -52,11 +58,13 @@ const subLinkStyle = (isActive: boolean) => ({
 
 const GTM_PATHS = ['/bookings', '/gtm/renewals', '/pipeline-overview']
 const ARR_SCHEDULE_PATHS = ['/arr-schedule/active-arr']
+const ANALYTICS_PATHS = ['/analytics']
 
 export default function Layout() {
   const location = useLocation()
   const [gtmExpanded, setGtmExpanded] = useState(true)
   const [arrScheduleExpanded, setArrScheduleExpanded] = useState(true)
+  const [analyticsExpanded, setAnalyticsExpanded] = useState(true)
 
   useEffect(() => {
     if (GTM_PATHS.some((p) => location.pathname === p || location.pathname.startsWith(p + '/'))) {
@@ -66,6 +74,11 @@ export default function Layout() {
   useEffect(() => {
     if (ARR_SCHEDULE_PATHS.some((p) => location.pathname === p || location.pathname.startsWith(p + '/'))) {
       setArrScheduleExpanded(true)
+    }
+  }, [location.pathname])
+  useEffect(() => {
+    if (ANALYTICS_PATHS.some((p) => location.pathname === p || location.pathname.startsWith(p + '/'))) {
+      setAnalyticsExpanded(true)
     }
   }, [location.pathname])
 
@@ -96,13 +109,17 @@ export default function Layout() {
                   ? gtmExpanded
                   : item.label === 'ARR'
                     ? arrScheduleExpanded
-                    : true
+                    : item.label === 'Analytics'
+                      ? analyticsExpanded
+                      : true
               const setExpanded =
                 item.label === 'Go-To-Market'
                   ? (v: boolean) => setGtmExpanded(v)
                   : item.label === 'ARR'
                     ? (v: boolean) => setArrScheduleExpanded(v)
-                    : () => {}
+                    : item.label === 'Analytics'
+                      ? (v: boolean) => setAnalyticsExpanded(v)
+                      : () => {}
               return (
                 <div key={idx} style={{ marginBottom: '0.25rem' }}>
                   <button

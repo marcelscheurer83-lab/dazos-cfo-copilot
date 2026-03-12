@@ -1,5 +1,6 @@
-/** API base URL: use VITE_API_URL when building for production (e.g. https://api.example.com) so the app can be published and accessed online. */
-const API = import.meta.env.VITE_API_URL ?? '/api'
+/** API base URL: use VITE_API_URL when building for production (e.g. https://api.example.com/api). Must include /api so routes work. */
+const RAW_API = import.meta.env.VITE_API_URL ?? '/api'
+const API = RAW_API.endsWith('/api') ? RAW_API : `${RAW_API.replace(/\/$/, '')}/api`
 
 const AUTH_HEADER = 'X-App-Password'
 
@@ -28,8 +29,40 @@ export async function apiFetch(
 
 /** Call from login screen: verify password and return true if valid. */
 export async function checkAppPassword(password: string): Promise<boolean> {
-  const r = await apiFetch('/auth/check', {}, password)
-  return r.ok
+  const controller = new AbortController()
+  const timeoutId = setTimeout(() => controller.abort(), 15000)
+  try {
+    const r = await apiFetch('/auth/check', { signal: controller.signal }, password)
+    return r.ok
+  } finally {
+    clearTimeout(timeoutId)
+  }
+}
+
+/** Check if backend is reachable (no auth). Use before login to show a clear "server unreachable" vs "invalid password". */
+export async function checkBackendHealth(): Promise<boolean> {
+  const result = await checkBackendHealthDetailed()
+  return result.ok
+}
+
+/** Same as checkBackendHealth but returns a reason when unreachable (for debugging). */
+export async function checkBackendHealthDetailed(): Promise<{ ok: true } | { ok: false; reason: string }> {
+  const url = `${API}/health`
+  const controller = new AbortController()
+  const timeoutId = setTimeout(() => controller.abort(), 8000)
+  try {
+    const r = await fetch(url, { method: 'GET', signal: controller.signal })
+    if (r.ok) return { ok: true }
+    return { ok: false, reason: `HTTP ${r.status}` }
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e)
+    if (msg.includes('abort') || msg.includes('Abort')) return { ok: false, reason: 'Timeout (backend not responding)' }
+    if (msg.includes('Failed to fetch') || msg.includes('NetworkError'))
+      return { ok: false, reason: 'Network error — is the backend running? Open app from http://localhost:5173' }
+    return { ok: false, reason: msg.slice(0, 80) }
+  } finally {
+    clearTimeout(timeoutId)
+  }
 }
 
 /** Dashboard KPI from Salesforce (Phase 2): ARR and Pipeline only. */
@@ -386,6 +419,37 @@ export async function exportARRToGoogleSheet(): Promise<{ ok: boolean; error?: s
   return data
 }
 
+/** Analytics: Active ARR by product group as of a specific date (default = last day of previous month). */
+export type ActiveARRAnalyticsGroup = {
+  label: string
+  arr: number
+  arr_smb_mm?: number
+  arr_enterprise?: number
+}
+
+export type ActiveARRAnalyticsOtherItem = {
+  product: string
+  arr: number
+}
+
+export type ActiveARRAnalyticsResponse = {
+  as_of: string
+  groups: ActiveARRAnalyticsGroup[]
+  by_segment?: ActiveARRAnalyticsGroup[]
+  grand_total: number
+  other_breakdown?: ActiveARRAnalyticsOtherItem[]
+  unmapped_accounts?: { account_id: string | null; account_name: string; arr: number }[]
+  other_accounts?: { account_id: string | null; account_name: string; product: string; arr: number }[]
+  salesforce_base_url?: string
+}
+
+export async function getActiveARRAnalytics(asOf?: string): Promise<ActiveARRAnalyticsResponse> {
+  const qs = asOf ? `?as_of=${encodeURIComponent(asOf)}` : ''
+  const r = await apiFetch(`/analytics/active-arr-by-product${qs}`)
+  if (!r.ok) throw new Error('Failed to fetch Active ARR analytics')
+  return r.json()
+}
+
 /** Active ARR by account from all Closed Won opportunities. Subscription dates from New Business opp when present. */
 export type ActiveARRRow = {
   account_id: string | null
@@ -432,6 +496,37 @@ export async function getARRScheduleActiveARRByMonth(): Promise<ActiveARRByMonth
   const r = await apiFetch('/arr-schedule/active-arr-by-month')
   if (!r.ok) throw new Error('Failed to fetch ARR by month')
   return r.json()
+}
+
+export type ExportCopilotARRScheduleResult = {
+  ok: boolean
+  spreadsheet_url?: string
+  spreadsheet_id?: string
+  rows_written?: number
+  account_count?: number
+  /** First 2 rows × 7 columns read back from sheet after write to verify. */
+  read_back?: string[][]
+  /** Exact A1 range written (for debugging). */
+  range_used?: string
+  message?: string
+  error?: string
+}
+
+export async function exportCopilotARRScheduleToSheet(): Promise<ExportCopilotARRScheduleResult> {
+  const r = await apiFetch('/export/copilot-arr-schedule-to-google-sheet', { method: 'POST' })
+  const data = await r.json()
+  if (!r.ok) return { ok: false, error: data.error ?? data.detail ?? 'Export failed' }
+  return {
+    ok: true,
+    spreadsheet_url: data.spreadsheet_url,
+    spreadsheet_id: data.spreadsheet_id,
+    rows_written: data.rows_written,
+    account_count: data.account_count,
+    read_back: data.read_back,
+    range_used: data.range_used,
+    message: data.message,
+    error: data.error,
+  }
 }
 
 /** Pipeline overview: open opportunities (not Closed Won/Lost). One row per opportunity. */

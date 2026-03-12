@@ -511,7 +511,23 @@ async def sync_google_sheets(
         # Run the blocking Google API call in a thread so we don't block the event loop
         data = await asyncio.to_thread(connector.read_range, range_name)
     except Exception as e:
-        return {"ok": False, "error": str(e)}
+        err_msg = str(e)
+        # Common Google Sheets misconfigurations → turn into actionable guidance instead of raw HttpError
+        if "403" in err_msg or "does not have permission" in err_msg.lower():
+            sa_email = connector.get_service_account_email()
+            err_msg = (
+                "Google Sheets: permission denied. Share your financial model sheet with the service account as **Editor**: "
+                + (sa_email or "see client_email in your JSON key")
+                + "."
+            )
+        elif "404" in err_msg or "Unable to parse range" in err_msg or "not found" in err_msg.lower():
+            err_msg = (
+                "Google Sheets: could not read range "
+                f"\"{range_name}\". Check that the spreadsheet referenced by GOOGLE_SHEET_ID has a tab "
+                "matching the sheet name in the range (e.g. `BS_2026P` for `BS_2026P!A1:ZZ1000`). "
+                "Raw error: " + err_msg[:200]
+            )
+        return {"ok": False, "error": err_msg}
     snapshot = SheetSnapshot(source="google_sheets", range_name=range_name, data_json=json.dumps(data))
     db.add(snapshot)
     await db.commit()

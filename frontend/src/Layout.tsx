@@ -23,12 +23,14 @@ const nav: NavItem[] = [
     label: 'ARR',
     children: [
       { to: '/arr-schedule/active-arr', label: 'Schedule' },
+      { to: '/arr-bridge', label: 'Bridge' },
     ],
   },
   {
     label: 'Analytics',
     children: [
       { to: '/analytics', label: 'Product penetration' },
+      { to: '/analytics/crm-seats', label: 'CRM seats' },
     ],
   },
   { to: '/financials', label: 'Financials' },
@@ -57,8 +59,8 @@ const subLinkStyle = (isActive: boolean) => ({
 })
 
 const GTM_PATHS = ['/bookings', '/gtm/renewals', '/pipeline-overview']
-const ARR_SCHEDULE_PATHS = ['/arr-schedule/active-arr']
-const ANALYTICS_PATHS = ['/analytics']
+const ARR_SCHEDULE_PATHS = ['/arr-schedule/active-arr', '/arr-bridge']
+const ANALYTICS_PATHS = ['/analytics', '/analytics/crm-seats']
 
 export default function Layout() {
   const location = useLocation()
@@ -147,7 +149,12 @@ export default function Layout() {
                   </button>
                   {isExpanded &&
                     item.children.map((child) => (
-                      <NavLink key={child.to} to={child.to} style={({ isActive }) => subLinkStyle(isActive)}>
+                      <NavLink
+                        key={child.to}
+                        to={child.to}
+                        end={child.to === '/analytics'}
+                        style={({ isActive }) => subLinkStyle(isActive)}
+                      >
                         {child.label}
                       </NavLink>
                     ))}

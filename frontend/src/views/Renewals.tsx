@@ -38,15 +38,17 @@ export default function Renewals() {
     return out
   }, [])
 
+  // Load once per session (initial mount) and reuse in-memory; filters are applied client-side.
   const loadData = useCallback(() => {
     getRenewalsOverview({
-      segment: filterSegment.length ? filterSegment : undefined,
-      stage: filterStage.length ? filterStage : undefined,
-      months: filterCloseDate.length ? filterCloseDate : last6Months,
+      months: last6Months,
     })
-      .then(setData)
+      .then((res) => {
+        setData(res)
+        setErr(null)
+      })
       .catch((e) => setErr(e.message))
-  }, [filterSegment, filterStage, filterCloseDate, last6Months])
+  }, [last6Months])
 
   useEffect(() => {
     loadData()
@@ -101,7 +103,30 @@ export default function Renewals() {
       })
   }
 
-  const rows = Array.isArray(data?.rows) ? data.rows : []
+  const allRows = Array.isArray(data?.rows) ? data.rows : []
+
+  // Apply filters client-side using the loaded dataset. When no close-date filter is selected,
+  // default to last 6 months so charts/tables match the backend semantics.
+  const rows = useMemo(() => {
+    let out = allRows
+    if (filterSegment.length) {
+      const segSet = new Set(filterSegment)
+      out = out.filter((r) => segSet.has((r.segment || '').trim()))
+    }
+    if (filterStage.length) {
+      const stageSet = new Set(filterStage)
+      out = out.filter((r) => stageSet.has((r.stage_name || '').trim()))
+    }
+    const dateFilterMonths =
+      filterCloseDate.length > 0 ? new Set(filterCloseDate) : new Set(last6Months)
+    out = out.filter((r) => {
+      const dateStr = r.renewal_date ?? r.close_date
+      if (!dateStr) return false
+      const month = dateStr.slice(0, 7)
+      return dateFilterMonths.has(month)
+    })
+    return out
+  }, [allRows, filterSegment, filterStage, filterCloseDate, last6Months])
   const salesforce_base_url =
     data?.salesforce_base_url &&
     (data.salesforce_base_url.includes('salesforce.com') || data.salesforce_base_url.includes('lightning.force.com'))

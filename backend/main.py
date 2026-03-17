@@ -128,6 +128,8 @@ EST = ZoneInfo("America/New_York")
 
 # One-time cleanup of Ascension/Ascend overrides when active-ARR is first requested (in case lifespan didn't run on deploy).
 _ascension_ascend_cleanup_done = False
+# Cache for ARR-by-account "current" data when EOD snapshot is missing; cleared on Salesforce sync/snapshot.
+_arr_data_current_fallback_cache: Optional[dict] = None
 
 
 @asynccontextmanager
@@ -729,6 +731,34 @@ def _match_arr_product(sf_product_name: str | None) -> str | None:
     return None
 
 
+def _is_additional_crm_seats(product_name: str | None) -> bool:
+    """True if this line item is 'Additional CRM Seats' (quantity = seats)."""
+    if not product_name or not product_name.strip():
+        return False
+    key = _arr_product_key(product_name)
+    if key == "additional crm seats":
+        return True
+    if _match_arr_product(product_name) == "Add. CRM Seats":
+        return True
+    return False
+
+
+def _is_crm_platform_includes_5_seats(product_name: str | None) -> bool:
+    """True if this line item is 'Dazos CRM Platform (Includes 5 Seats)' — count 5 seats once per opp."""
+    if not product_name or not product_name.strip():
+        return False
+    key = _arr_product_key(product_name)
+    return "includes 5 seats" in key and "crm platform" in key
+
+
+def _is_crm_platform_legacy(product_name: str | None) -> bool:
+    """True if this line item is 'Dazos CRM Platform (Legacy)' — include in CRM ARR (no seats)."""
+    if not product_name or not product_name.strip():
+        return False
+    key = _arr_product_key(product_name)
+    return "legacy" in key and "crm platform" in key
+
+
 # Stages that count as "closed" (excluded from pipeline and from renewal ARR).
 CLOSED_STAGES = frozenset({"Closed Won", "Closed Lost"})
 # Active ARR is built only from Closed Won (never from open or Closed Lost).
@@ -1068,6 +1098,7 @@ async def _salesforce_query_with_retry(connector, soql: str, max_attempts: int =
 
 async def _run_salesforce_sync(db: AsyncSession) -> dict:
     """Run full Salesforce sync (accounts, opportunities, opportunity line items). Caller must commit. Uses EST for any timestamps."""
+    _clear_arr_data_current_fallback_cache()
     from connectors.salesforce import SalesforceConnector
 
     connector = SalesforceConnector()
@@ -1679,6 +1710,49 @@ async def _compute_active_arr_rows(db: AsyncSession) -> tuple[list[dict], Option
             by_account_product_active[acc] = {p: 0.0 for p in products}
         by_account_product_active[acc][canonical] = by_account_product_active[acc].get(canonical, 0) + arr
 
+    # CRM seats per account: same opportunity set as active ARR (current period).
+    # Additional CRM Seats → quantity; Dazos CRM Platform (Includes 5 Seats) → 5 once per opp.
+    seats_by_opp: dict[str, int] = {}
+    opp_ids_with_platform_5: set[str] = set()
+    for li in lines:
+        opp_id = (li.opportunity_sf_id or "").strip()
+        if not opp_id:
+            continue
+        if _is_additional_crm_seats(li.product_name):
+            if opp_id not in seats_by_opp:
+                seats_by_opp[opp_id] = 0
+            try:
+                seats_by_opp[opp_id] += int(float(li.quantity or 0))
+            except (TypeError, ValueError):
+                pass
+        elif _is_crm_platform_includes_5_seats(li.product_name):
+            opp_ids_with_platform_5.add(opp_id)
+    for oid in opp_ids_with_platform_5:
+        seats_by_opp[oid] = seats_by_opp.get(oid, 0) + 5
+    crm_seats_by_account: dict[tuple[str | None, str | None], int] = {}
+    for key, opp_ids in current_period_opp_sf_ids.items():
+        crm_seats_by_account[key] = sum(seats_by_opp.get(oid, 0) for oid in opp_ids)
+
+    # ARR from CRM SKUs only: Additional CRM Seats, Dazos CRM Platform (Includes 5 Seats), Dazos CRM Platform (Legacy).
+    crm_arr_by_opp: dict[str, float] = {}
+    crm_sku_groups: dict[tuple[str, str], list] = {}
+    for li in lines:
+        opp_id = (li.opportunity_sf_id or "").strip()
+        if not opp_id:
+            continue
+        if _is_additional_crm_seats(li.product_name):
+            crm_sku_groups.setdefault((opp_id, "additional"), []).append(li)
+        elif _is_crm_platform_includes_5_seats(li.product_name):
+            crm_sku_groups.setdefault((opp_id, "platform_5"), []).append(li)
+        elif _is_crm_platform_legacy(li.product_name):
+            crm_sku_groups.setdefault((opp_id, "platform_legacy"), []).append(li)
+    for (opp_id, _), items in crm_sku_groups.items():
+        arr = _arr_contribution_for_line_group(items)
+        crm_arr_by_opp[opp_id] = crm_arr_by_opp.get(opp_id, 0.0) + arr
+    crm_arr_by_account: dict[tuple[str | None, str | None], float] = {}
+    for key, opp_ids in current_period_opp_sf_ids.items():
+        crm_arr_by_account[key] = round(sum(crm_arr_by_opp.get(oid, 0.0) for oid in opp_ids), 2)
+
     out_rows = []
     for (aid, aname), by_product in by_account_product.items():
         key = (aid, aname)
@@ -1803,6 +1877,8 @@ async def _compute_active_arr_rows(db: AsyncSession) -> tuple[list[dict], Option
             "anchor_arr": anchor_arr,
             "expansions": expansions,
             "by_product": {p: by_product_arr.get(p, 0) for p in products},
+            "crm_seats": crm_seats_by_account.get(key, 0),
+            "crm_arr": crm_arr_by_account.get(key, 0.0),
             "subscription_start_date": sub_start.isoformat() if sub_start else None,
             "subscription_end_date": sub_end.isoformat() if sub_end else None,
             "periods": periods_serialized,
@@ -2150,6 +2226,9 @@ async def get_active_arr_by_product(
     if base_url:
         resp["salesforce_base_url"] = base_url
     return JSONResponse(content=resp)
+
+
+async def _get_active_arr_by_month_data(db: AsyncSession) -> tuple[list[dict], list[str], dict[str, float], Optional[str]]:
     """
     Returns (rows with by_month filled, months list, totals_by_month, base_url) for the ARR schedule.
     Used by active-arr-by-month GET and by the Copilot ARR export to Google Sheet.
@@ -2414,6 +2493,7 @@ async def _take_salesforce_eod_snapshot(db: AsyncSession) -> None:
     )
     db.add(snapshot)
     await _materialize_arr_schedule_daily(db, payload, today_est)
+    _clear_arr_data_current_fallback_cache()
 
 
 async def _scheduled_salesforce_jobs() -> None:
@@ -3802,6 +3882,12 @@ async def _materialize_arr_schedule_daily(db: AsyncSession, payload: dict, snaps
         ))
 
 
+def _clear_arr_data_current_fallback_cache() -> None:
+    """Clear cached 'current' ARR data so next request recomputes (e.g. after Salesforce sync)."""
+    global _arr_data_current_fallback_cache
+    _arr_data_current_fallback_cache = None
+
+
 async def _get_arr_data_for_date(db: AsyncSession, as_of_date: date | None) -> tuple[dict, str]:
     """Get ARR data: live if as_of_date is None, else from latest EOD snapshot on or before that date. Returns (data, source_label)."""
     if as_of_date is None:
@@ -3815,7 +3901,11 @@ async def _get_arr_data_for_date(db: AsyncSession, as_of_date: date | None) -> t
     )
     snap = r.scalar_one_or_none()
     if not snap or not snap.data_json:
+        global _arr_data_current_fallback_cache
+        if _arr_data_current_fallback_cache is not None:
+            return _arr_data_current_fallback_cache, "Customer overview (no snapshot for that date; showing current)"
         data = await _get_arr_by_account_product_data(db)
+        _arr_data_current_fallback_cache = data
         return data, "Customer overview (no snapshot for that date; showing current)"
     payload = json.loads(snap.data_json)
     data = _arr_from_snapshot_payload(payload)

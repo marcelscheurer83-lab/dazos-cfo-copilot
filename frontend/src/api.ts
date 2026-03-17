@@ -463,6 +463,10 @@ export type ActiveARRRow = {
   /** Expansions after anchor: close_date + arr; used for by-month ARR. */
   expansions?: Array<{ close_date: string; arr: number }>
   by_product: Record<string, number>
+  /** CRM seats (Additional CRM Seats quantity + 5 per Dazos CRM Platform (Includes 5 Seats) once per opp). Same opportunity set as active ARR. */
+  crm_seats?: number
+  /** ARR from CRM SKUs only: Additional CRM Seats, Dazos CRM Platform (Includes 5 Seats), Dazos CRM Platform (Legacy). Same opportunity set as active ARR. */
+  crm_arr?: number
   subscription_start_date: string | null
   subscription_end_date: string | null
   /** e.g. "ren only" when only open renewal, no closed renewal/NB */

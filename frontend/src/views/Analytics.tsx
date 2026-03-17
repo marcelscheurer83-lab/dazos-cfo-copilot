@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { getActiveARRAnalytics, getARRScheduleActiveARRByMonth, type ActiveARRAnalyticsGroup } from '../api'
+import { getActiveARRAnalytics, getARRScheduleActiveARRByMonth, type ActiveARRAnalyticsGroup, type ActiveARRByMonthRow } from '../api'
 import ProductPenetration, { KeyTakeaways, accountsFromByProduct, accountsFromByProductWithArr } from '../components/ProductPenetration'
 
 function fmtMoney0(n: number) {
@@ -20,6 +20,7 @@ export default function AnalyticsView() {
   const [groups, setGroups] = useState<ActiveARRAnalyticsGroup[]>([])
   const [grandTotal, setGrandTotal] = useState(0)
   const [penetrationAccounts, setPenetrationAccounts] = useState<ReturnType<typeof accountsFromByProduct>>([])
+  const [scheduleRows, setScheduleRows] = useState<ActiveARRByMonthRow[]>([])
   const [salesforceBaseUrl, setSalesforceBaseUrl] = useState<string | null>(null)
   const [err, setErr] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
@@ -38,6 +39,7 @@ export default function AnalyticsView() {
           )
         )
         setGrandTotal(arrRes.grand_total ?? 0)
+        setScheduleRows(byMonthRes.rows ?? [])
         setSalesforceBaseUrl(byMonthRes.salesforce_base_url ?? null)
 
         const monthKey = monthKeyFromAsOf(arrRes.as_of ?? '')
@@ -72,6 +74,13 @@ export default function AnalyticsView() {
       asOfLabel = asOf
     }
   }
+
+  const monthKey = monthKeyFromAsOf(asOf ?? '')
+  const withActiveARR =
+    monthKey === ''
+      ? scheduleRows
+      : scheduleRows.filter((row) => (row.by_month?.[monthKey] ?? 0) > 0)
+  const crmSeatsRows = [...withActiveARR].sort((a, b) => (b.crm_seats ?? 0) - (a.crm_seats ?? 0))
 
   return (
     <div
@@ -175,6 +184,66 @@ export default function AnalyticsView() {
               </table>
                 )
               })()
+            )}
+          </div>
+
+          {/* CRM seats: same opportunity set as active ARR (current subscription period) */}
+          <div
+            style={{
+              gridColumn: '1 / -1',
+              background: 'var(--surface)',
+              border: '1px solid var(--border)',
+              borderRadius: 8,
+              padding: '1rem 1.25rem',
+              minWidth: 0,
+            }}
+          >
+            <div style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '0.5rem' }}>
+              CRM seats
+            </div>
+            <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)', margin: '0 0 0.75rem' }}>
+              Contracted seats per account (Additional CRM Seats quantity + 5 per Dazos CRM Platform (Includes 5 Seats), once per opportunity). Same logic as active ARR.
+            </p>
+            {crmSeatsRows.length === 0 ? (
+              <p style={{ fontSize: '0.85rem', color: 'var(--text-muted)' }}>No accounts with active ARR in this period.</p>
+            ) : (
+              <table
+                style={{
+                  width: '100%',
+                  borderCollapse: 'collapse',
+                  fontSize: '0.85rem',
+                  color: 'var(--text)',
+                }}
+              >
+                <thead>
+                  <tr style={{ borderBottom: '1px solid var(--border)' }}>
+                    <th style={{ textAlign: 'left', padding: '0.5rem 0.75rem', fontWeight: 500, color: 'var(--text-muted)' }}>
+                      Account
+                    </th>
+                    <th style={{ textAlign: 'right', padding: '0.5rem 0.75rem', fontWeight: 500, color: 'var(--text-muted)' }}>
+                      Seats
+                    </th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {crmSeatsRows.map((row, idx) => (
+                    <tr key={row.account_id || row.account_name || `crm-seats-${idx}`} style={{ borderBottom: '1px solid var(--border)' }}>
+                      <td style={{ padding: '0.5rem 0.75rem', color: 'var(--text)' }}>{row.account_name ?? '—'}</td>
+                      <td style={{ padding: '0.5rem 0.75rem', textAlign: 'right', color: 'var(--text)' }}>
+                        {row.crm_seats ?? 0}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+                <tfoot>
+                  <tr style={{ borderTop: '2px solid var(--border)', fontWeight: 600 }}>
+                    <td style={{ padding: '0.5rem 0.75rem', textAlign: 'right', color: 'var(--text-muted)' }}>Total</td>
+                    <td style={{ padding: '0.5rem 0.75rem', textAlign: 'right', color: 'var(--text)' }}>
+                      {crmSeatsRows.reduce((s, r) => s + (r.crm_seats ?? 0), 0)}
+                    </td>
+                  </tr>
+                </tfoot>
+              </table>
             )}
           </div>
 

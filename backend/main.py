@@ -541,8 +541,13 @@ async def sync_google_sheets(
 _SALESFORCE_MRR_FIELD = os.getenv("SALESFORCE_MRR_FIELD", "MRR__c").strip() or "MRR__c"
 # Optional: custom Renewal Date field on Opportunity (e.g. Renewal_Date__c). When set, renewals overview uses it instead of Close Date.
 _SALESFORCE_RENEWAL_DATE_FIELD = (os.getenv("SALESFORCE_RENEWAL_DATE_FIELD") or "").strip()
-# Optional: Original ACV = ARR up for renewal (UFR ARR), e.g. Original_ACV__c.
-_SALESFORCE_UFR_ARR_FIELD = (os.getenv("SALESFORCE_UFR_ARR_FIELD") or "Original_ACV__c").strip() or None
+# ARR up for renewal (UFR baseline) field on Opportunity.
+# NOTE: Hard-coded to remove env-loading ambiguity during debugging.
+_SALESFORCE_UFR_ARR_FIELD = "Original_ARR__c"
+
+# Positive renewal expansion uplift to include in bookings.
+# NOTE: Hard-coded to remove env-loading ambiguity during debugging.
+_SALESFORCE_EXPANSION_ARR_FIELD = "Expansion_ARR__c"
 # Optional: Contract Start/End on Opportunity for New Business (e.g. Contract_Start_Date__c, Contract_End_Date__c). Used for subscription start/end in Active ARR.
 _SALESFORCE_CONTRACT_START_DATE_FIELD = (os.getenv("SALESFORCE_CONTRACT_START_DATE_FIELD") or "Contract_Start_Date__c").strip() or ""
 _SALESFORCE_CONTRACT_END_DATE_FIELD = (os.getenv("SALESFORCE_CONTRACT_END_DATE_FIELD") or "Contract_End_Date__c").strip() or ""
@@ -563,6 +568,29 @@ def _opp_soql_extra_fields() -> str:
         parts.append(_SALESFORCE_RENEWAL_DATE_FIELD)
     if _SALESFORCE_UFR_ARR_FIELD:
         parts.append(_SALESFORCE_UFR_ARR_FIELD)
+    if _SALESFORCE_EXPANSION_ARR_FIELD:
+        parts.append(_SALESFORCE_EXPANSION_ARR_FIELD)
+    if _SALESFORCE_CONTRACT_START_DATE_FIELD:
+        parts.append(_SALESFORCE_CONTRACT_START_DATE_FIELD)
+    if _SALESFORCE_CONTRACT_END_DATE_FIELD:
+        parts.append(_SALESFORCE_CONTRACT_END_DATE_FIELD)
+    if _SALESFORCE_MIDTERM_CANCELLATION_FIELD:
+        parts.append(_SALESFORCE_MIDTERM_CANCELLATION_FIELD)
+    # Include ARR__c when present in org so we can fall back to it for opps without products
+    parts.append("ARR__c")
+    return ", " + ", ".join(parts) if parts else ""
+
+
+def _opp_soql_extra_fields_no_renewal_date() -> str:
+    """Same as `_opp_soql_extra_fields()` but intentionally excludes renewal date field.
+
+    Used for the fallback SOQL when SALESFORCE_RENEWAL_DATE_FIELD is invalid in the org.
+    """
+    parts = []
+    if _SALESFORCE_UFR_ARR_FIELD:
+        parts.append(_SALESFORCE_UFR_ARR_FIELD)
+    if _SALESFORCE_EXPANSION_ARR_FIELD:
+        parts.append(_SALESFORCE_EXPANSION_ARR_FIELD)
     if _SALESFORCE_CONTRACT_START_DATE_FIELD:
         parts.append(_SALESFORCE_CONTRACT_START_DATE_FIELD)
     if _SALESFORCE_CONTRACT_END_DATE_FIELD:
@@ -582,7 +610,7 @@ DEFAULT_OPPORTUNITY_SOQL = (
 DEFAULT_OPPORTUNITY_SOQL_NO_RENEWAL = (
     "SELECT Id, Name, Amount, CloseDate, StageName, Type, RecordType.Name, "
     "Account.Id, Account.Name, Owner.Name, CreatedDate, " + _SALESFORCE_MRR_FIELD
-    + (", " + _SALESFORCE_UFR_ARR_FIELD if _SALESFORCE_UFR_ARR_FIELD else "")
+    + _opp_soql_extra_fields_no_renewal_date()
     + " FROM Opportunity ORDER BY CloseDate DESC NULLS LAST"
 )
 # Opportunity products: TotalPrice = MRR; ARR = MRR * 12. Product2.Name (or Name) for product columns.
@@ -706,6 +734,30 @@ def _arr_product_key(name: str | None) -> str:
     s = " ".join(name.split()).strip().lower()
     s = s.replace(" / ", "/").replace(" /", "/").replace("/ ", "/")
     return s
+
+
+def _is_additional_crm_seats(product_name: str | None) -> bool:
+    """True if this line item is an 'Additional CRM Seats' SKU where quantity ≈ seats."""
+    if not product_name or not product_name.strip():
+        return False
+    key = _arr_product_key(product_name)
+    return "additional crm seats" in key
+
+
+def _is_crm_platform_includes_5_seats(product_name: str | None) -> bool:
+    """True if this is 'Dazos CRM Platform (Includes 5 Seats)' — count 5 seats per opp."""
+    if not product_name or not product_name.strip():
+        return False
+    key = _arr_product_key(product_name)
+    return "crm platform" in key and "includes 5 seats" in key
+
+
+def _is_crm_platform_legacy(product_name: str | None) -> bool:
+    """True if this is 'Dazos CRM Platform (Legacy)' — CRM ARR without explicit seats."""
+    if not product_name or not product_name.strip():
+        return False
+    key = _arr_product_key(product_name)
+    return "crm platform" in key and "legacy" in key
 
 
 def _match_arr_product(sf_product_name: str | None) -> str | None:
@@ -940,7 +992,8 @@ DEFAULT_SEGMENT = "SMB/ MM"
 # Account Status = Account_Status__c; Segment = Segment__c (add Sub_Segment__c or other segment field here if your org has it).
 DEFAULT_ACCOUNT_SOQL = (
     "SELECT Id, Name, Type, Account_Status__c, Industry, AnnualRevenue, NumberOfEmployees, "
-    "BillingCountry, BillingCity, BillingState, Phone, Website, Segment__c, CreatedDate "
+    "BillingCountry, BillingCity, BillingState, Phone, Website, Segment__c, Account_Executive__c, "
+    "Partner_Affiliate_Revenue_Share__c, Owner.Name, CreatedDate "
     "FROM Account ORDER BY Name"
 )
 
@@ -1041,12 +1094,30 @@ def _float_or_none(x) -> Optional[float]:
 
 
 def _original_acv_from_record(rec: dict) -> Optional[float]:
-    """Get contracted ARR for an opportunity from Salesforce.
-    For this org we ONLY use ARR__c (case-insensitive), not Original_ACV__c."""
-    # Prefer exact ARR__c key
+    """Get contracted ARR (UFR baseline) for an opportunity from Salesforce.
+    Priority:
+    1) configured `_SALESFORCE_UFR_ARR_FIELD` (default: Original_ARR__c)
+    2) ARR__c (legacy fallback)
+    """
+    if _SALESFORCE_UFR_ARR_FIELD:
+        direct = rec.get(_SALESFORCE_UFR_ARR_FIELD)
+        if direct is not None:
+            return _float_or_none(direct)
+        # Fallback for flattened keys / case differences from connector output
+        ufr_key_l = _SALESFORCE_UFR_ARR_FIELD.lower()
+        for key, value in rec.items():
+            if key and key.lower() == ufr_key_l and value is not None:
+                return _float_or_none(value)
+    # Explicit fallback aliases used across org history/migrations.
+    for alias in ("Original_ARR__c", "Original_ACV__c"):
+        if rec.get(alias) is not None:
+            return _float_or_none(rec.get(alias))
+        alias_l = alias.lower()
+        for key, value in rec.items():
+            if key and key.lower() == alias_l and value is not None:
+                return _float_or_none(value)
     if rec.get("ARR__c") is not None:
         return _float_or_none(rec.get("ARR__c"))
-    # Fallback: any case-insensitive match to ARR__c
     for key, value in rec.items():
         if key and key.lower() == "arr__c" and value is not None:
             return _float_or_none(value)
@@ -1090,6 +1161,13 @@ async def _run_salesforce_sync(db: AsyncSession) -> dict:
             employees = int(rec["NumberOfEmployees"]) if rec.get("NumberOfEmployees") is not None else None
         except (TypeError, ValueError):
             employees = None
+        owner_obj = rec.get("Owner")
+        owner_name = None
+        if isinstance(owner_obj, dict):
+            owner_name = (owner_obj.get("Name") or owner_obj.get("name") or None)
+        # Fallbacks in case SalesforceConnector flattens fields
+        owner_name = owner_name or rec.get("Owner.Name") or rec.get("Owner_Name")
+
         acc = Account(
             sf_id=sf_id,
             name=rec.get("Name"),
@@ -1104,6 +1182,13 @@ async def _run_salesforce_sync(db: AsyncSession) -> dict:
             phone=rec.get("Phone"),
             website=rec.get("Website"),
             segment=rec.get("Segment__c"),
+            ae_owner=rec.get("Account_Executive__c"),
+            partner_affiliate_revenue_share=(
+                float(rec.get("Partner_Affiliate_Revenue_Share__c"))
+                if rec.get("Partner_Affiliate_Revenue_Share__c") is not None
+                else None
+            ),
+            owner_name=owner_name,
             created_date=_parse_datetime(rec.get("CreatedDate")),
         )
         db.add(acc)
@@ -1142,6 +1227,17 @@ async def _run_salesforce_sync(db: AsyncSession) -> dict:
         record_type_name = (rt or "").strip() or None
         renewal_dt = _parse_date(rec.get(_SALESFORCE_RENEWAL_DATE_FIELD)) if use_renewal_date_field else None
         original_acv_val = _original_acv_from_record(rec)
+        expansion_arr_val = None
+        if _SALESFORCE_EXPANSION_ARR_FIELD:
+            direct = rec.get(_SALESFORCE_EXPANSION_ARR_FIELD)
+            expansion_arr_val = _float_or_none(direct) if direct is not None else None
+            if expansion_arr_val is None:
+                # Fallback for flattened keys / case differences
+                exp_l = _SALESFORCE_EXPANSION_ARR_FIELD.lower()
+                for k, v in rec.items():
+                    if k and k.lower() == exp_l and v is not None:
+                        expansion_arr_val = _float_or_none(v)
+                        break
         contract_start_dt = _parse_date(rec.get(_SALESFORCE_CONTRACT_START_DATE_FIELD)) if _SALESFORCE_CONTRACT_START_DATE_FIELD else None
         contract_end_dt = _parse_date(rec.get(_SALESFORCE_CONTRACT_END_DATE_FIELD)) if _SALESFORCE_CONTRACT_END_DATE_FIELD else None
         midterm_val = rec.get(_SALESFORCE_MIDTERM_CANCELLATION_FIELD) if _SALESFORCE_MIDTERM_CANCELLATION_FIELD else None
@@ -1153,6 +1249,7 @@ async def _run_salesforce_sync(db: AsyncSession) -> dict:
             close_date=_parse_date(rec.get("CloseDate")),
             renewal_date=renewal_dt,
             original_acv=original_acv_val,
+            expansion_arr=expansion_arr_val,
             stage_name=rec.get("StageName"),
             type=rec.get("Type"),
             record_type_name=record_type_name,
@@ -1343,8 +1440,15 @@ async def list_eod_snapshots(db: AsyncSession = Depends(get_db)):
     }
 
 
-async def _compute_active_arr_rows(db: AsyncSession) -> tuple[list[dict], Optional[str]]:
-    """Compute active ARR rows (subscription start/end, ARR per account). Used by active-arr and active-arr-by-month."""
+async def _compute_active_arr_rows(
+    db: AsyncSession,
+    apply_alleva_retained_arr_adjustment: bool = False,
+) -> tuple[list[dict], Optional[str]]:
+    """Compute active ARR rows (subscription start/end, ARR per account).
+
+    Used by active-arr and active-arr-by-month. The optional Alleva retained-ARR adjustment is applied only when
+    the schedule should reflect partner-retained revenue; other endpoints should keep the original math.
+    """
     global _ascension_ascend_cleanup_done
     if not _ascension_ascend_cleanup_done:
         await _remove_ascension_ascend_overrides()
@@ -1621,12 +1725,25 @@ async def _compute_active_arr_rows(db: AsyncSession) -> tuple[list[dict], Option
     account_ids = {aid for (aid, _) in account_keys if aid}
     account_segment: dict[str, str | None] = {}
     account_status: dict[str, str | None] = {}
+    account_type_map: dict[str, str | None] = {}
+    account_owner_name_map: dict[str, str | None] = {}
+    account_partner_affiliate_share_map: dict[str, float | None] = {}
     if account_ids:
-        q_acc = select(Account.sf_id, Account.segment, Account.status).where(Account.sf_id.in_(account_ids))
+        q_acc = select(
+            Account.sf_id,
+            Account.segment,
+            Account.status,
+            Account.type,
+            Account.owner_name,
+            Account.partner_affiliate_revenue_share,
+        ).where(Account.sf_id.in_(account_ids))
         r_acc = await db.execute(q_acc)
-        for (sf_id, seg, st) in r_acc.all():
+        for (sf_id, seg, st, typ, owner_name, share_val) in r_acc.all():
             account_segment[sf_id] = seg
             account_status[sf_id] = st
+            account_type_map[sf_id] = typ
+            account_owner_name_map[sf_id] = owner_name
+            account_partner_affiliate_share_map[sf_id] = share_val
 
     today_est = datetime.now(EST).date()
 
@@ -1678,6 +1795,53 @@ async def _compute_active_arr_rows(db: AsyncSession) -> tuple[list[dict], Option
         if acc not in by_account_product_active:
             by_account_product_active[acc] = {p: 0.0 for p in products}
         by_account_product_active[acc][canonical] = by_account_product_active[acc].get(canonical, 0) + arr
+
+    # CRM seats per opportunity: Additional CRM Seats (quantity) + 5 seats per CRM Platform (Includes 5 Seats) opp.
+    seats_by_opp: dict[str, int] = {}
+    opp_ids_with_platform_5: set[str] = set()
+    for li in lines:
+        opp_id = (li.opportunity_sf_id or "").strip()
+        if not opp_id:
+            continue
+        if _is_additional_crm_seats(li.product_name):
+            try:
+                qty = int(float(li.quantity or 0))
+            except (TypeError, ValueError):
+                qty = 0
+            if qty:
+                seats_by_opp[opp_id] = seats_by_opp.get(opp_id, 0) + qty
+        elif _is_crm_platform_includes_5_seats(li.product_name):
+            opp_ids_with_platform_5.add(opp_id)
+    for oid in opp_ids_with_platform_5:
+        seats_by_opp[oid] = seats_by_opp.get(oid, 0) + 5
+
+    crm_seats_by_account: dict[tuple[str | None, str | None], int] = {}
+    for key, opp_ids in current_period_opp_sf_ids.items():
+        crm_seats_by_account[key] = sum(seats_by_opp.get(oid, 0) for oid in opp_ids)
+
+    # CRM ARR from CRM SKUs only: Additional CRM Seats, CRM Platform (Includes 5 Seats), CRM Platform (Legacy).
+    crm_sku_groups: dict[tuple[str, str], list] = {}
+    for li in lines:
+        opp_id = (li.opportunity_sf_id or "").strip()
+        if not opp_id:
+            continue
+        if _is_additional_crm_seats(li.product_name):
+            crm_sku_groups.setdefault((opp_id, "seats"), []).append(li)
+        elif _is_crm_platform_includes_5_seats(li.product_name):
+            crm_sku_groups.setdefault((opp_id, "platform_5"), []).append(li)
+        elif _is_crm_platform_legacy(li.product_name):
+            crm_sku_groups.setdefault((opp_id, "legacy"), []).append(li)
+
+    crm_arr_by_opp: dict[str, float] = {}
+    for (opp_id, _kind), items in crm_sku_groups.items():
+        arr = _arr_contribution_for_line_group(items)
+        crm_arr_by_opp[opp_id] = crm_arr_by_opp.get(opp_id, 0.0) + arr
+
+    crm_arr_by_account: dict[tuple[str | None, str | None], float] = {}
+    for key, opp_ids in current_period_opp_sf_ids.items():
+        total_arr = sum(crm_arr_by_opp.get(oid, 0.0) for oid in opp_ids)
+        if total_arr:
+            crm_arr_by_account[key] = round(total_arr, 2)
 
     out_rows = []
     for (aid, aname), by_product in by_account_product.items():
@@ -1793,13 +1957,47 @@ async def _compute_active_arr_rows(db: AsyncSession) -> tuple[list[dict], Option
         ]
         if is_churned:
             active_arr_today = 0.0
+        # Alleva Customer adjustment:
+        # For these accounts, a portion of the revenue stays with the partner (Alleva).
+        # We apply this factor to both:
+        # - schedule Active ARR (today)
+        # - schedule monthly ARR (by_month)
+        acct_type_norm = ((account_type_map.get(aid) if aid else None) or '').strip().lower()
+        alleva_retained_factor: float | None = None
+        if apply_alleva_retained_arr_adjustment and acct_type_norm == 'alleva customer':
+            share_raw = account_partner_affiliate_share_map.get(aid)
+            share_val: float | None = None
+            if share_raw is not None:
+                try:
+                    if isinstance(share_raw, str):
+                        s = share_raw.strip().replace('%', '')
+                        share_val = float(s) if s else None
+                    else:
+                        share_val = float(share_raw)
+                except (TypeError, ValueError):
+                    share_val = None
+            share_factor: float | None = None
+            if share_val is not None:
+                # Accept both 0-1 (e.g. 0.8) and 0-100 (e.g. 80).
+                share_factor = share_val / 100.0 if share_val > 1.0 else share_val
+                share_factor = max(0.0, min(1.0, share_factor))
+            if share_factor is not None:
+                alleva_retained_factor = share_factor
+                active_arr_today = round(active_arr_today * share_factor, 2)
         note = account_note.get(key)
+        crm_seats = crm_seats_by_account.get(key)
+        crm_arr_val = crm_arr_by_account.get(key)
         out_rows.append({
             "account_id": aid,
             "account_name": aname or "—",
+            "owner_name": account_owner_name_map.get(aid) if aid else None,
             "status": status,
+            "type": (account_type_map.get(aid) if aid else None),
             "segment": seg,
             "active_arr": active_arr_today,
+            "alleva_retained_factor": alleva_retained_factor,
+            "crm_seats": crm_seats,
+            "crm_arr": crm_arr_val,
             "anchor_arr": anchor_arr,
             "expansions": expansions,
             "by_product": {p: by_product_arr.get(p, 0) for p in products},
@@ -1866,7 +2064,7 @@ async def get_arr_schedule_active_arr(db: AsyncSession = Depends(get_db)):
       subscription start = null, subscription end = close date of that open renewal.
     Classification: Opportunity Record Type (RecordType.Name → o.record_type_name). Overrides applied. Renewal ARR = open renewal opps only. Delta = Active ARR − Renewal ARR.
     """
-    out_rows, base_url = await _compute_active_arr_rows(db)
+    out_rows, base_url = await _compute_active_arr_rows(db, apply_alleva_retained_arr_adjustment=True)
     out_rows.sort(key=lambda x: -x["active_arr"])
     grand_total = round(sum(r["active_arr"] for r in out_rows), 2)
     return {
@@ -2150,11 +2348,16 @@ async def get_active_arr_by_product(
     if base_url:
         resp["salesforce_base_url"] = base_url
     return JSONResponse(content=resp)
+
+
+async def _get_active_arr_by_month_data(
+    db: AsyncSession,
+) -> tuple[list[dict], list[str], dict[str, float], Optional[str]]:
     """
     Returns (rows with by_month filled, months list, totals_by_month, base_url) for the ARR schedule.
     Used by active-arr-by-month GET and by the Copilot ARR export to Google Sheet.
     """
-    out_rows, base_url = await _compute_active_arr_rows(db)
+    out_rows, base_url = await _compute_active_arr_rows(db, apply_alleva_retained_arr_adjustment=True)
     months: list[str] = []
     for year in (2024, 2025, 2026):
         for month in range(1, 13):
@@ -2171,6 +2374,15 @@ async def get_active_arr_by_product(
         sub_end = date.fromisoformat(sub_end_s) if sub_end_s else None
         anchor_arr = row.get("anchor_arr") or 0.0
         expansions = row.get("expansions") or []
+        acct_type_norm = ((row.get("type") or None) or "").strip().lower()
+        alleva_factor: float | None = None
+        if acct_type_norm == "alleva customer":
+            raw_factor = row.get("alleva_retained_factor")
+            if raw_factor is not None:
+                try:
+                    alleva_factor = float(raw_factor)
+                except (TypeError, ValueError):
+                    alleva_factor = None
         # Prefer periods (all closed-won NB + renewal terms) for by_month when present
         periods = row.get("periods") or []
         # Optional pre-anchor NB term (fallback when no periods)
@@ -2229,6 +2441,9 @@ async def get_active_arr_by_product(
                         if exp.get("close_date") and date.fromisoformat(exp["close_date"]) <= month_end
                     )
                     val = round(anchor_arr + expansion_arr, 2)
+
+            if alleva_factor is not None:
+                val = round(val * alleva_factor, 2)
 
             by_month[month_key] = val
             totals_by_month[month_key] = round(totals_by_month[month_key] + val, 2)
@@ -2750,7 +2965,11 @@ async def _closed_won_renewal_expansion_arr_in_range(
     first_day: date,
     last_day: date,
 ) -> float:
-    """Return sum of positive booking ARR (delta) for Closed Won renewals with close_date in [first_day, last_day]. Used to add to dashboard expansion."""
+    """Return sum of renewal expansion ARR for Closed Won renewals in [first_day, last_day].
+
+    Simplified logic: use Opportunity.Expansion_ARR__c (stored in Opportunity.expansion_arr) directly,
+    instead of recomputing uplift from line items + UFR baseline.
+    """
     overrides = await _get_record_type_overrides(db)
 
     def _effective_record_type(o: Opportunity) -> str:
@@ -2768,23 +2987,11 @@ async def _closed_won_renewal_expansion_arr_in_range(
     closed = [o for o in r.scalars().all() if _is_renewal_record_type(_effective_record_type(o)) and not _is_excluded_from_bookings(o)]
     if not closed:
         return 0.0
-    sf_ids = {o.sf_id for o in closed}
-    opp_to_arr: dict[str, float] = {}
-    q_lines = select(OpportunityLineItem).where(OpportunityLineItem.opportunity_sf_id.in_(sf_ids))
-    r_lines = await db.execute(q_lines)
-    for li in r_lines.scalars().all():
-        raw = _normalized_product_name(li.product_name)
-        if not _include_line_item_in_arr(raw, li.product_name):
-            continue
-        opp_sf_id = li.opportunity_sf_id
-        mrr = _line_item_effective_total(li)
-        opp_to_arr[opp_sf_id] = opp_to_arr.get(opp_sf_id, 0) + mrr * PIPELINE_ARR_MULTIPLIER
     total = 0.0
     for o in closed:
-        arr = opp_to_arr.get(o.sf_id, 0)
-        ufr = float(o.original_acv) if getattr(o, "original_acv", None) is not None else 0.0
-        delta = arr - ufr
-        total += max(0.0, delta)
+        # Field is already a MAX(..., 0) in Salesforce formula, but clamp defensively.
+        exp_val = float(o.expansion_arr) if getattr(o, "expansion_arr", None) is not None else 0.0
+        total += max(0.0, exp_val)
     return round(total, 2)
 
 
@@ -2918,6 +3125,26 @@ async def _get_dashboard_bookings_mtd_impl(db: AsyncSession) -> BookingsMTDRespo
         prev_last = prev_last.replace(day=1) - timedelta(days=1)
         prev_label = datetime(year, month - 1, 1).strftime("%b %y")
 
+    # Two months ago date range
+    prev2_month = month - 2
+    prev2_year = year
+    while prev2_month <= 0:
+        prev2_month += 12
+        prev2_year -= 1
+    prev2_first = date(prev2_year, prev2_month, 1)
+    prev2_last = (prev2_first + timedelta(days=32)).replace(day=1) - timedelta(days=1)
+    prev2_label = datetime(prev2_year, prev2_month, 1).strftime("%b %y")
+
+    # Two months ago date range (e.g. Jan when current month is Mar)
+    prev2_month = month - 2
+    prev2_year = year
+    while prev2_month <= 0:
+        prev2_month += 12
+        prev2_year -= 1
+    prev2_first = date(prev2_year, prev2_month, 1)
+    prev2_last = (prev2_first + timedelta(days=32)).replace(day=1) - timedelta(days=1)
+    prev2_label = datetime(prev2_year, prev2_month, 1).strftime("%b %y")
+
     # Current month MTD
     first_of_month = date(year, month, 1)
     current_mtd_last = min(today, first_of_month + timedelta(days=32))
@@ -2959,16 +3186,21 @@ async def _get_dashboard_bookings_mtd_impl(db: AsyncSession) -> BookingsMTDRespo
 
     # Actuals for each period (pipeline NB + Expansion); add Closed Won renewal positive delta to expansion
     prev_total, prev_nb, prev_exp = await _closed_won_arr_in_range(db, prev_first, prev_last)
+    prev2_total, prev2_nb, prev2_exp = await _closed_won_arr_in_range(db, prev2_first, prev2_last)
     mtd_total, mtd_nb, mtd_exp = await _closed_won_arr_in_range(db, first_of_month, today)
     qtd_total, qtd_nb, qtd_exp = await _closed_won_arr_in_range(db, qtd_first, today)
     prev_renewal_exp = await _closed_won_renewal_expansion_arr_in_range(db, prev_first, prev_last)
+    prev2_renewal_exp = await _closed_won_renewal_expansion_arr_in_range(db, prev2_first, prev2_last)
     mtd_renewal_exp = await _closed_won_renewal_expansion_arr_in_range(db, first_of_month, today)
     qtd_renewal_exp = await _closed_won_renewal_expansion_arr_in_range(db, qtd_first, today)
     prev_exp_mid_term, prev_exp_upon_renewal = prev_exp, prev_renewal_exp
+    prev2_exp_mid_term, prev2_exp_upon_renewal = prev2_exp, prev2_renewal_exp
     mtd_exp_mid_term, mtd_exp_upon_renewal = mtd_exp, mtd_renewal_exp
     qtd_exp_mid_term, qtd_exp_upon_renewal = qtd_exp, qtd_renewal_exp
     prev_exp += prev_renewal_exp
     prev_total += prev_renewal_exp
+    prev2_exp += prev2_renewal_exp
+    prev2_total += prev2_renewal_exp
     mtd_exp += mtd_renewal_exp
     mtd_total += mtd_renewal_exp
     qtd_exp += qtd_renewal_exp
@@ -2978,6 +3210,11 @@ async def _get_dashboard_bookings_mtd_impl(db: AsyncSession) -> BookingsMTDRespo
     prev_m = (month - 2 + 12) % 12
     p_nb, p_exp = plan_by_month[prev_m]
     p_tot = (p_nb or 0) + (p_exp or 0) if (p_nb is not None or p_exp is not None) else None
+
+    # Plan for two months ago
+    prev2_m = (month - 3 + 12) % 12
+    p2_nb, p2_exp = plan_by_month[prev2_m]
+    p2_tot = (p2_nb or 0) + (p2_exp or 0) if (p2_nb is not None or p2_exp is not None) else None
 
     # Plan for current month
     c_nb, c_exp = plan_by_month[month - 1]
@@ -3023,6 +3260,17 @@ async def _get_dashboard_bookings_mtd_impl(db: AsyncSession) -> BookingsMTDRespo
     pipe_cov_qtd_exp = round(pipeline_qtd_exp / shortfall_qtd_exp, 2) if shortfall_qtd_exp > 0 else None
 
     return BookingsMTDResponse(
+        two_months_ago=BookingsPeriod(
+            period_label=prev2_label,
+            total=_bookings_row(prev2_total, p2_tot),
+            new_business=_bookings_row(prev2_nb, p2_nb),
+            expansion=_bookings_row(prev2_exp, p2_exp),
+            expansion_mid_term=prev2_exp_mid_term,
+            expansion_upon_renewal=prev2_exp_upon_renewal,
+            pipe_coverage_total=None,
+            pipe_coverage_new_business=None,
+            pipe_coverage_expansion=None,
+        ),
         previous_month=BookingsPeriod(
             period_label=prev_label,
             total=_bookings_row(prev_total, p_tot),
@@ -3071,25 +3319,45 @@ def _safe_renewals_fallback(plan_message: str) -> dict:
     """Minimal valid renewals JSON so frontend never gets 500/non-JSON."""
     now_est = datetime.now(EST)
     y, m = now_est.year, now_est.month
+    tm2 = m - 2
+    ty2 = y
+    while tm2 <= 0:
+        tm2 += 12
+        ty2 -= 1
+    prev2 = datetime(ty2, tm2, 1).strftime("%b %y")
     prev = datetime(y - 1, 12, 1).strftime("%b %y") if m == 1 else datetime(y, m - 1, 1).strftime("%b %y")
     cur = now_est.strftime("%b %y") + " MTD"
     qm = ((m - 1) // 3) * 3 + 1
     qtd = f"Q{(qm - 1) // 3 + 1} {str(y)[2:]} QTD"
     row = {"mtd": 0.0, "plan": None, "achievement_pct": None, "delta_k": None}
     per = lambda label: {"period_label": label, "total": row, "renewed": row, "open": row, "churn": row, "contraction": row, "renewal_rate": row}
-    return {"previous_month": per(prev), "current_mtd": per(cur), "qtd": per(qtd), "plan_source": None, "plan_message": plan_message}
+    return {
+        "two_months_ago": per(prev2),
+        "previous_month": per(prev),
+        "current_mtd": per(cur),
+        "qtd": per(qtd),
+        "plan_source": None,
+        "plan_message": plan_message,
+    }
 
 
 def _safe_cash_fallback(plan_message: str) -> dict:
     """Minimal valid cash JSON for exception handler so frontend never gets 500/non-JSON."""
     now_est = datetime.now(EST)
     y, m = now_est.year, now_est.month
+    tm2 = m - 2
+    ty2 = y
+    while tm2 <= 0:
+        tm2 += 12
+        ty2 -= 1
+    prev2 = datetime(ty2, tm2, 1).strftime("%b %y")
     prev = datetime(y - 1, 12, 1).strftime("%b %y") if m == 1 else datetime(y, m - 1, 1).strftime("%b %y")
     cur = now_est.strftime("%b %y") + " MTD"
     qm = ((m - 1) // 3) * 3 + 1
     qtd = f"Q{(qm - 1) // 3 + 1} {str(y)[2:]} QTD"
     empty = {"period_label": "", "billings_plan": None, "collections_plan": None, "billings_actual": None, "collections_actual": None, "billings_achievement_pct": None, "billings_delta_k": None, "collections_achievement_pct": None, "collections_delta_k": None}
     return {
+        "two_months_ago": {**empty, "period_label": prev2},
         "previous_month": {**empty, "period_label": prev},
         "current_mtd": {**empty, "period_label": cur},
         "qtd": {**empty, "period_label": qtd},
@@ -3103,13 +3371,26 @@ def _safe_bookings_fallback(plan_message: str) -> dict:
     """Minimal valid bookings JSON for exception handler so frontend never gets 500/non-JSON."""
     now_est = datetime.now(EST)
     y, m = now_est.year, now_est.month
+    tm2 = m - 2
+    ty2 = y
+    while tm2 <= 0:
+        tm2 += 12
+        ty2 -= 1
+    prev2 = datetime(ty2, tm2, 1).strftime("%b %y")
     prev = datetime(y - 1, 12, 1).strftime("%b %y") if m == 1 else datetime(y, m - 1, 1).strftime("%b %y")
     cur = now_est.strftime("%b %y") + " MTD"
     qm = ((m - 1) // 3) * 3 + 1
     qtd = f"Q{(qm - 1) // 3 + 1} {str(y)[2:]} QTD"
     row = {"mtd": 0.0, "plan": None, "achievement_pct": None, "delta_k": None}
     per = lambda label: {"period_label": label, "total": row, "new_business": row, "expansion": row}
-    return {"previous_month": per(prev), "current_mtd": per(cur), "qtd": per(qtd), "plan_source": None, "plan_message": plan_message}
+    return {
+        "two_months_ago": per(prev2),
+        "previous_month": per(prev),
+        "current_mtd": per(cur),
+        "qtd": per(qtd),
+        "plan_source": None,
+        "plan_message": plan_message,
+    }
 
 
 @app.get("/api/dashboard/renewals-mtd", response_model=RenewalsMTDResponse)
@@ -3136,6 +3417,16 @@ async def _get_dashboard_renewals_mtd_impl(db: AsyncSession) -> RenewalsMTDRespo
         prev_last = date(year, month - 1, 1) + timedelta(days=32)
         prev_last = (prev_last.replace(day=1) - timedelta(days=1))
         prev_label = datetime(year, month - 1, 1).strftime("%b %y")
+
+    # Two months ago date range (e.g. Jan when current month is Mar)
+    prev2_month = month - 2
+    prev2_year = year
+    while prev2_month <= 0:
+        prev2_month += 12
+        prev2_year -= 1
+    prev2_first = date(prev2_year, prev2_month, 1)
+    prev2_last = (prev2_first + timedelta(days=32)).replace(day=1) - timedelta(days=1)
+    prev2_label = datetime(prev2_year, prev2_month, 1).strftime("%b %y")
 
     first_of_month = date(year, month, 1)
     # Use full month range so cohort matches renewals overview (open + churn + renewed for the whole month)
@@ -3206,10 +3497,12 @@ async def _get_dashboard_renewals_mtd_impl(db: AsyncSession) -> RenewalsMTDRespo
         plan_message = "Renewal rate plan: add values in row 52 at BU (Jan), BV (Feb), X (Q1), then re-sync sheet."
 
     prev_t, prev_r, prev_o, prev_ch, prev_cont, prev_rr = await _renewals_metrics_in_range(db, prev_first, prev_last)
+    prev2_t, prev2_r, prev2_o, prev2_ch, prev2_cont, prev2_rr = await _renewals_metrics_in_range(db, prev2_first, prev2_last)
     mtd_t, mtd_r, mtd_o, mtd_ch, mtd_cont, mtd_rr = await _renewals_metrics_in_range(db, first_of_month, current_mtd_last)
     qtd_t, qtd_r, qtd_o, qtd_ch, qtd_cont, qtd_rr = await _renewals_metrics_in_range(db, qtd_first, qtd_last)
 
     prev_m = (month - 2 + 12) % 12
+    prev2_m = (month - 3 + 12) % 12
     c_m = month - 1
     if q_rr_plan is None:
         q_rr_vals = [plan_renewal_rate_by_month[i] for i in range(quarter_month - 1, min(quarter_month + 2, 12)) if plan_renewal_rate_by_month[i] is not None]
@@ -3238,6 +3531,7 @@ async def _get_dashboard_renewals_mtd_impl(db: AsyncSession) -> RenewalsMTDRespo
         )
 
     return RenewalsMTDResponse(
+        two_months_ago=period(prev2_label, prev2_t, prev2_r, prev2_o, prev2_ch, prev2_cont, prev2_rr, plan_contraction_rate_by_month[prev2_m], plan_renewal_rate_by_month[prev2_m]),
         previous_month=period(prev_label, prev_t, prev_r, prev_o, prev_ch, prev_cont, prev_rr, plan_contraction_rate_by_month[prev_m], plan_renewal_rate_by_month[prev_m]),
         current_mtd=period(current_label, mtd_t, mtd_r, mtd_o, mtd_ch, mtd_cont, mtd_rr, plan_contraction_rate_by_month[c_m], plan_renewal_rate_by_month[c_m]),
         qtd=period(qtd_label, qtd_t, qtd_r, qtd_o, qtd_ch, qtd_cont, qtd_rr, q_cont_rate, q_rr_plan if q_rr_plan else None),
@@ -3275,6 +3569,12 @@ async def get_dashboard_cash_mtd(db: AsyncSession = Depends(get_db)):
     def _safe_cash_body(plan_message: Optional[str]) -> dict:
         now_est = datetime.now(EST)
         year, month = now_est.year, now_est.month
+        prev2_month = month - 2
+        prev2_year = year
+        while prev2_month <= 0:
+            prev2_month += 12
+            prev2_year -= 1
+        prev2_label = datetime(prev2_year, prev2_month, 1).strftime("%b %y")
         if month == 1:
             prev_label = datetime(year - 1, 12, 1).strftime("%b %y")
         else:
@@ -3286,6 +3586,7 @@ async def get_dashboard_cash_mtd(db: AsyncSession = Depends(get_db)):
         c = _empty_period(current_label)
         q = _empty_period(qtd_label)
         return {
+            "two_months_ago": {**empty, "period_label": prev2_label},
             "previous_month": p.model_dump(),
             "current_mtd": c.model_dump(),
             "qtd": q.model_dump(),
@@ -3305,12 +3606,19 @@ async def get_dashboard_cash_mtd(db: AsyncSession = Depends(get_db)):
             # Fallback: minimal dict so frontend always gets valid JSON
             now_est = datetime.now(EST)
             y, m = now_est.year, now_est.month
+            tm2 = m - 2
+            ty2 = y
+            while tm2 <= 0:
+                tm2 += 12
+                ty2 -= 1
+            prev2 = datetime(ty2, tm2, 1).strftime("%b %y")
             prev = datetime(y - 1, 12, 1).strftime("%b %y") if m == 1 else datetime(y, m - 1, 1).strftime("%b %y")
             cur = now_est.strftime("%b %y") + " MTD"
             qm = ((m - 1) // 3) * 3 + 1
             qtd = f"Q{(qm - 1) // 3 + 1} {str(y)[2:]} QTD"
             empty = {"period_label": "", "billings_plan": None, "collections_plan": None, "billings_actual": None, "collections_actual": None, "billings_achievement_pct": None, "billings_delta_k": None, "collections_achievement_pct": None, "collections_delta_k": None}
             return JSONResponse(status_code=200, content={
+                "two_months_ago": {**empty, "period_label": prev2},
                 "previous_month": {**empty, "period_label": prev},
                 "current_mtd": {**empty, "period_label": cur},
                 "qtd": {**empty, "period_label": qtd},
@@ -3327,6 +3635,12 @@ async def _get_dashboard_cash_mtd_impl(db: AsyncSession) -> CashMTDResponse:
         prev_label = datetime(year - 1, 12, 1).strftime("%b %y")
     else:
         prev_label = datetime(year, month - 1, 1).strftime("%b %y")
+    prev2_month = month - 2
+    prev2_year = year
+    while prev2_month <= 0:
+        prev2_month += 12
+        prev2_year -= 1
+    prev2_label = datetime(prev2_year, prev2_month, 1).strftime("%b %y")
     current_label = now_est.strftime("%b %y") + " MTD"
     quarter_month = ((month - 1) // 3) * 3 + 1
     qtd_label = f"Q{(quarter_month - 1) // 3 + 1} {str(year)[2:]} QTD"
@@ -3367,9 +3681,12 @@ async def _get_dashboard_cash_mtd_impl(db: AsyncSession) -> CashMTDResponse:
         plan_message = "No sheet snapshot. Sync BS_2026P first."
 
     prev_m = (month - 2 + 12) % 12
+    prev2_m = (month - 3 + 12) % 12
     c_m = month - 1
     prev_b = billings_by_month[prev_m]
     prev_c = collections_by_month[prev_m]
+    prev2_b = billings_by_month[prev2_m]
+    prev2_c = collections_by_month[prev2_m]
     curr_b = billings_by_month[c_m]
     curr_c = collections_by_month[c_m]
     q_b = sum(billings_by_month[i] or 0 for i in range(quarter_month - 1, min(quarter_month + 2, 12)))
@@ -3378,6 +3695,8 @@ async def _get_dashboard_cash_mtd_impl(db: AsyncSession) -> CashMTDResponse:
     # Actuals from Chargebee: billings = invoice total by invoice date; collections = payment transactions by date (matches Total Payments export)
     prev_billings_act: Optional[float] = None
     prev_coll_act: Optional[float] = None
+    prev2_billings_act: Optional[float] = None
+    prev2_coll_act: Optional[float] = None
     mtd_billings_act: Optional[float] = None
     mtd_coll_act: Optional[float] = None
     qtd_billings_act: Optional[float] = None
@@ -3389,11 +3708,17 @@ async def _get_dashboard_cash_mtd_impl(db: AsyncSession) -> CashMTDResponse:
         prev_first = datetime(year, month - 1, 1, 0, 0, 0, tzinfo=EST)
         next_month_first = (prev_first + timedelta(days=32)).replace(day=1)
         prev_last = next_month_first - timedelta(seconds=1)
+    # Two months ago range for "previous previous month" block
+    prev2_first = datetime(prev2_year, prev2_month, 1, 0, 0, 0, tzinfo=EST)
+    prev2_next_month_first = (prev2_first + timedelta(days=32)).replace(day=1)
+    prev2_last = prev2_next_month_first - timedelta(seconds=1)
     curr_first = datetime(year, month, 1, 0, 0, 0, tzinfo=EST)
     curr_last = now_est
     qtd_first_dt = datetime(year, quarter_month, 1, 0, 0, 0, tzinfo=EST)
     prev_start_ts = int(prev_first.timestamp())
     prev_end_ts = int(prev_last.timestamp())
+    prev2_start_ts = int(prev2_first.timestamp())
+    prev2_end_ts = int(prev2_last.timestamp())
     curr_start_ts = int(curr_first.timestamp())
     curr_end_ts = int(curr_last.timestamp())
     qtd_start_ts = int(qtd_first_dt.timestamp())
@@ -3414,7 +3739,7 @@ async def _get_dashboard_cash_mtd_impl(db: AsyncSession) -> CashMTDResponse:
         try:
             invoices = await asyncio.to_thread(
                 connector.fetch_invoices_in_date_range,
-                prev_start_ts,
+                prev2_start_ts,
                 curr_end_ts + 86400,
             )
         except Exception as e:
@@ -3433,6 +3758,8 @@ async def _get_dashboard_cash_mtd_impl(db: AsyncSession) -> CashMTDResponse:
                 total_f = 0.0
             total_f = total_f / 100.0  # cents to dollars
             if inv_ts is not None:
+                if _in_range(inv_ts, prev2_start_ts, prev2_end_ts):
+                    prev2_billings_act = (prev2_billings_act or 0) + total_f
                 if _in_range(inv_ts, prev_start_ts, prev_end_ts):
                     prev_billings_act = (prev_billings_act or 0) + total_f
                 if _in_range(inv_ts, curr_start_ts, curr_end_ts):
@@ -3444,7 +3771,7 @@ async def _get_dashboard_cash_mtd_impl(db: AsyncSession) -> CashMTDResponse:
         try:
             payments = await asyncio.to_thread(
                 connector.fetch_payments_in_date_range,
-                prev_start_ts,
+                prev2_start_ts,
                 curr_end_ts + 86400,
             )
         except Exception as e:
@@ -3464,6 +3791,8 @@ async def _get_dashboard_cash_mtd_impl(db: AsyncSession) -> CashMTDResponse:
                 amount_f = 0.0
             amount_f = amount_f / 100.0  # cents to dollars
             if txn_ts is not None and amount_f:
+                if _in_range(txn_ts, prev2_start_ts, prev2_end_ts):
+                    prev2_coll_act = (prev2_coll_act or 0) + amount_f
                 if _in_range(txn_ts, prev_start_ts, prev_end_ts):
                     prev_coll_act = (prev_coll_act or 0) + amount_f
                 if _in_range(txn_ts, curr_start_ts, curr_end_ts):
@@ -3500,6 +3829,7 @@ async def _get_dashboard_cash_mtd_impl(db: AsyncSession) -> CashMTDResponse:
         )
 
     return CashMTDResponse(
+        two_months_ago=_cash_period(prev2_label, prev2_b, prev2_c, prev2_billings_act, prev2_coll_act),
         previous_month=_cash_period(prev_label, prev_b, prev_c, prev_billings_act, prev_coll_act),
         current_mtd=_cash_period(current_label, curr_b, curr_c, mtd_billings_act, mtd_coll_act),
         qtd=_cash_period(qtd_label, q_b if q_b else None, q_c if q_c else None, qtd_billings_act, qtd_coll_act),
@@ -4538,11 +4868,13 @@ async def get_closed_overview(
         if _is_renewal_record_type(_effective_record_type(o)) or _is_amendment_record_type(_effective_record_type(o)):
             stage = (o.stage_name or "").strip()
             if stage == "Closed Won":
-                ufr_val = float(o.original_acv) if getattr(o, "original_acv", None) is not None else None
-                ufr = (ufr_val if ufr_val is not None else 0) or 0
-                arr = round(arr_from_lines - ufr, 2)
+                # Simplified logic: use Opportunity.Expansion_ARR__c directly.
+                # Field is defined as MAX(ARR__c - Original_ARR__c, 0) in Salesforce.
+                exp_val = float(o.expansion_arr) if getattr(o, "expansion_arr", None) is not None else 0.0
+                arr = max(0.0, exp_val)
             elif stage == "Closed Lost":
-                arr = round(0.0 - arr_from_lines, 2)
+                # Closed Lost bookings should never be counted as positive booking ARR.
+                arr = 0.0
             else:
                 arr = arr_from_lines
         else:
@@ -4941,7 +5273,7 @@ async def debug_arr_mrr_source(db: AsyncSession = Depends(get_db)):
     raw_env = os.getenv("USE_UNIT_PRICE_TIMES_QUANTITY_AS_MRR", "")
     use_uq = _use_unit_price_times_quantity_as_mrr()
     # Get Active ARR for Prosperity Haven from the same logic as the Schedule
-    rows, _ = await _compute_active_arr_rows(db)
+    rows, _ = await _compute_active_arr_rows(db, apply_alleva_retained_arr_adjustment=True)
     ph = next((r for r in rows if (r.get("account_name") or "").strip().lower() == "prosperity haven"), None)
     return {
         "USE_UNIT_PRICE_TIMES_QUANTITY_AS_MRR_env_raw": raw_env,
@@ -5079,6 +5411,8 @@ async def debug_salesforce_opportunity_fields():
             "first_record_keys": all_keys,
             "acv_related_fields": acv_like,
             "renewal_related_fields": renewal_like,
+            "configured_expansion_field": _SALESFORCE_EXPANSION_ARR_FIELD,
+            "server_main_file": __file__,
             "configured_ufr_field": _SALESFORCE_UFR_ARR_FIELD,
             "configured_renewal_date_field": _SALESFORCE_RENEWAL_DATE_FIELD or "(not set)",
         }

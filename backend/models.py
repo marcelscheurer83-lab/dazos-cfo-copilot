@@ -80,6 +80,9 @@ class Account(Base):
     phone = Column(String(64), nullable=True)
     website = Column(String(512), nullable=True)
     segment = Column(String(128), nullable=True)  # Segment__c or similar from Salesforce
+    ae_owner = Column(String(255), nullable=True)  # Salesforce Account.AE_Owner__c
+    owner_name = Column(String(255), nullable=True)  # Salesforce Account.Owner.Name (standard record owner)
+    partner_affiliate_revenue_share = Column(Float, nullable=True)  # Salesforce Partner/Affiliate Revenue Share (% retained)
     created_date = Column(DateTime, nullable=True)
     synced_at = Column(DateTime, server_default=func.now())
 
@@ -112,6 +115,7 @@ class Opportunity(Base):
     close_date = Column(Date, nullable=True)
     renewal_date = Column(Date, nullable=True)  # Optional; from SF custom e.g. Renewal_Date__c. Used for renewals when set.
     original_acv = Column(Float, nullable=True)  # Optional; from SF Original_ACV__c = ARR up for renewal (UFR ARR).
+    expansion_arr = Column(Float, nullable=True)  # Optional; from SF Expansion_ARR__c = positive renewal expansion uplift.
     stage_name = Column(String(128), nullable=True)
     type = Column(String(128), nullable=True)  # Opportunity type
     record_type_name = Column(String(128), nullable=True)  # RecordType.Name, e.g. 'Renewal'

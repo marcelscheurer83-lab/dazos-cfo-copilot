@@ -34,6 +34,7 @@ class BookingsPeriod(BaseModel):
 
 class BookingsMTDResponse(BaseModel):
     """Bookings vs plan: previous month, current MTD, quarter to date."""
+    two_months_ago: BookingsPeriod
     previous_month: BookingsPeriod
     current_mtd: BookingsPeriod
     qtd: BookingsPeriod
@@ -54,6 +55,7 @@ class RenewalsMTDPeriod(BaseModel):
 
 class RenewalsMTDResponse(BaseModel):
     """Renewals vs plan: previous month, current MTD, quarter to date. Plan from sheet rows 13 (churn), 14 (contraction), 52 (renewal rate)."""
+    two_months_ago: RenewalsMTDPeriod
     previous_month: RenewalsMTDPeriod
     current_mtd: RenewalsMTDPeriod
     qtd: RenewalsMTDPeriod
@@ -75,7 +77,8 @@ class CashPeriod(BaseModel):
 
 
 class CashMTDResponse(BaseModel):
-    """Cash KPIs: Billings and Collections. Plan from BS_2026P. Same period layout as Bookings (previous month, MTD, QTD)."""
+    """Cash KPIs: Billings and Collections. Plan from BS_2026P. Same period layout as Bookings (two months ago, previous month, MTD, QTD)."""
+    two_months_ago: CashPeriod
     previous_month: CashPeriod
     current_mtd: CashPeriod
     qtd: CashPeriod

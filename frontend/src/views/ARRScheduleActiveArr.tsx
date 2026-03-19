@@ -11,9 +11,9 @@ function shortMonthLabel(monthKey: string) {
   return `${names[m - 1]} '${String(y).slice(2)}`
 }
 
-type SortKey = 'account_name' | 'account_id' | 'status' | 'segment' | 'subscription_start_date' | 'subscription_end_date' | 'active_arr' | 'total_all_months' | (string & {})
+type SortKey = 'account_name' | 'account_id' | 'status' | 'segment' | 'type' | 'subscription_start_date' | 'subscription_end_date' | 'active_arr' | 'total_all_months' | (string & {})
 type SortDir = 'asc' | 'desc'
-type FilterColumn = 'segment' | 'status'
+type FilterColumn = 'segment' | 'status' | 'type'
 
 export default function ARRScheduleActiveArrView() {
   const [rows, setRows] = useState<ActiveARRByMonthRow[]>([])
@@ -31,11 +31,14 @@ export default function ARRScheduleActiveArrView() {
   const [sortDir, setSortDir] = useState<SortDir>('asc')
   const [filterSegment, setFilterSegment] = useState<string[]>([])
   const [filterStatus, setFilterStatus] = useState<string[]>([])
+  const [filterType, setFilterType] = useState<string[]>([])
   const [openFilter, setOpenFilter] = useState<FilterColumn | null>(null)
   const segmentThRef = useRef<HTMLTableHeaderCellElement>(null)
   const segmentPopoverRef = useRef<HTMLDivElement>(null)
   const statusThRef = useRef<HTMLTableHeaderCellElement>(null)
   const statusPopoverRef = useRef<HTMLDivElement>(null)
+  const typeThRef = useRef<HTMLTableHeaderCellElement>(null)
+  const typePopoverRef = useRef<HTMLDivElement>(null)
 
   const load = useCallback(() => {
     getARRScheduleActiveARRByMonth()
@@ -112,8 +115,16 @@ export default function ARRScheduleActiveArrView() {
 
   useEffect(() => {
     if (openFilter === null) return
-    const thRef = openFilter === 'segment' ? segmentThRef : openFilter === 'status' ? statusThRef : null
-    const popRef = openFilter === 'segment' ? segmentPopoverRef : openFilter === 'status' ? statusPopoverRef : null
+    const thRef =
+      openFilter === 'segment' ? segmentThRef : openFilter === 'status' ? statusThRef : openFilter === 'type' ? typeThRef : null
+    const popRef =
+      openFilter === 'segment'
+        ? segmentPopoverRef
+        : openFilter === 'status'
+          ? statusPopoverRef
+          : openFilter === 'type'
+            ? typePopoverRef
+            : null
     const handleClick = (e: MouseEvent) => {
       const t = e.target as Node
       if (thRef?.current?.contains(t) || popRef?.current?.contains(t)) return
@@ -160,6 +171,11 @@ export default function ARRScheduleActiveArrView() {
         const bv = (b.status ?? '').trim().toLowerCase()
         return dir * (av < bv ? -1 : av > bv ? 1 : 0)
       }
+      if (sortKey === 'type') {
+        const av = ((a as any).type ?? '').trim().toLowerCase()
+        const bv = ((b as any).type ?? '').trim().toLowerCase()
+        return dir * (av < bv ? -1 : av > bv ? 1 : 0)
+      }
       if (sortKey === 'subscription_start_date') {
         const av = a.subscription_start_date ?? ''
         const bv = b.subscription_start_date ?? ''
@@ -197,6 +213,15 @@ export default function ARRScheduleActiveArrView() {
     return Array.from(set).sort()
   }, [rows])
 
+  const typeOptions = useMemo(() => {
+    const set = new Set<string>()
+    for (const r of rows) {
+      const t = (((r as any).type as string | null | undefined) ?? '').trim() || '—'
+      set.add(t)
+    }
+    return Array.from(set).sort()
+  }, [rows])
+
   const displayRows = useMemo(() => {
     let out = sortedRows
     if (filterSegment.length > 0) {
@@ -211,10 +236,16 @@ export default function ARRScheduleActiveArrView() {
         return filterStatus.includes(st)
       })
     }
+    if (filterType.length > 0) {
+      out = out.filter((r) => {
+        const t = (((r as any).type as string | null | undefined) ?? '').trim() || '—'
+        return filterType.includes(t)
+      })
+    }
     return out
-  }, [sortedRows, filterSegment, filterStatus])
+  }, [sortedRows, filterSegment, filterStatus, filterType])
 
-  const hasActiveFilter = filterSegment.length > 0 || filterStatus.length > 0
+  const hasActiveFilter = filterSegment.length > 0 || filterStatus.length > 0 || filterType.length > 0
   const grandTotalDisplay =
     hasActiveFilter ? displayRows.reduce((s, r) => s + (r.active_arr ?? 0), 0) : grandTotal
 
@@ -480,6 +511,109 @@ export default function ARRScheduleActiveArrView() {
     )
   }
 
+  const thTypeFilter = () => {
+    const isOpen = openFilter === 'type'
+    const isSortActive = sortKey === 'type'
+    const hasActiveFilter = filterType.length > 0
+    return (
+      <th
+        ref={typeThRef}
+        style={{
+          textAlign: 'left',
+          padding: '0.5rem 0.75rem',
+          color: 'var(--text-muted)',
+          fontWeight: 500,
+          whiteSpace: 'nowrap',
+          position: 'relative',
+          verticalAlign: 'bottom',
+          background: 'var(--surface)',
+        }}
+      >
+        <span
+          role="button"
+          tabIndex={0}
+          onClick={() => handleSort('type')}
+          onKeyDown={(e) => (e.key === 'Enter' || e.key === ' ') && handleSort('type')}
+          style={{
+            cursor: 'pointer',
+            userSelect: 'none',
+          }}
+        >
+          Type
+          {isSortActive && <span style={{ marginLeft: 4 }}>{sortDir === 'asc' ? '↑' : '↓'}</span>}
+        </span>
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation()
+            setOpenFilter((f) => (f === 'type' ? null : 'type'))
+          }}
+          title="Filter by type"
+          style={{
+            marginLeft: 4,
+            padding: 2,
+            background: hasActiveFilter ? 'var(--accent)' : 'transparent',
+            color: hasActiveFilter ? '#fff' : 'var(--text-muted)',
+            border: '1px solid var(--border)',
+            borderRadius: 4,
+            cursor: 'pointer',
+            lineHeight: 1,
+          }}
+        >
+          ⋮
+        </button>
+        {isOpen && (
+          <div
+            ref={typePopoverRef}
+            style={popoverStyle}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <select
+              multiple
+              size={Math.min(6, Math.max(2, typeOptions.length))}
+              value={filterType}
+              onChange={(e) => setFilterType(Array.from(e.target.selectedOptions, (o) => o.value))}
+              style={{
+                padding: '0.35rem 0.5rem',
+                fontSize: '0.9rem',
+                width: '100%',
+                border: '1px solid var(--border)',
+                borderRadius: 4,
+                background: 'var(--bg)',
+                color: 'var(--text)',
+              }}
+            >
+              {typeOptions.map((opt) => (
+                <option key={opt} value={opt}>
+                  {opt}
+                </option>
+              ))}
+            </select>
+            <p style={{ fontSize: '0.75rem', color: 'var(--text-muted)', margin: '0.35rem 0 0 0' }}>Ctrl+click to select multiple</p>
+            {filterType.length > 0 && (
+              <button
+                type="button"
+                onClick={() => setFilterType([])}
+                style={{
+                  marginTop: '0.35rem',
+                  padding: '0.25rem 0.5rem',
+                  fontSize: '0.8rem',
+                  cursor: 'pointer',
+                  background: 'var(--bg)',
+                  color: 'var(--text-muted)',
+                  border: '1px solid var(--border)',
+                  borderRadius: 4,
+                }}
+              >
+                Clear
+              </button>
+            )}
+          </div>
+        )}
+      </th>
+    )
+  }
+
   return (
     <>
       <h1 style={{ margin: '0 0 1.5rem', fontSize: '1.5rem', fontWeight: 600, color: 'var(--text)' }}>
@@ -615,6 +749,7 @@ export default function ARRScheduleActiveArrView() {
               >
                 {th('account_name', 'Account', 'left', true)}
                 {th('account_id', '18 Digit SFDC Acct ID', 'left', false)}
+                {thTypeFilter()}
                 {thStatusFilter()}
                 {thSegmentFilter()}
                 {th('subscription_start_date', 'Subscription start')}
@@ -647,6 +782,7 @@ export default function ARRScheduleActiveArrView() {
             <tbody>
               <tr style={{ borderBottom: '1px solid var(--border)', fontWeight: 600, background: 'var(--surface)' }}>
                 <td style={{ padding: '0.5rem 0.75rem', color: 'var(--text-muted)', ...stickyFirstCell('var(--surface)') }}>Total</td>
+                <td style={{ padding: '0.5rem 0.75rem' }} />
                 <td style={{ padding: '0.5rem 0.75rem' }} />
                 <td style={{ padding: '0.5rem 0.75rem' }} colSpan={4} />
                 <td style={{ textAlign: 'right', padding: '0.5rem 0.75rem', color: 'var(--text)' }}>{fmtMoney(grandTotalDisplay)}</td>
@@ -683,8 +819,11 @@ export default function ARRScheduleActiveArrView() {
                       row.account_name
                     )}
                   </td>
-                  <td style={{ padding: '0.5rem 0.75rem', color: 'var(--text-muted)', fontSize: '0.85em' }} title={row.account_id ?? undefined}>
+                  <td style={{ padding: '0.5rem 0.75rem', color: 'var(--text-muted)' }} title={row.account_id ?? undefined}>
                     {row.account_id ?? '—'}
+                  </td>
+                  <td style={{ padding: '0.5rem 0.75rem', color: 'var(--text-muted)' }}>
+                    {(row as any).type ?? '—'}
                   </td>
                   <td style={{ padding: '0.5rem 0.75rem', color: 'var(--text-muted)', whiteSpace: 'nowrap' }}>
                     {row.status?.trim() ? row.status : '—'}

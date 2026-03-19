@@ -84,6 +84,7 @@ export default function Dashboard() {
   const [sheetSyncError, setSheetSyncError] = useState<string | null>(null)
   const [liveArrTotal, setLiveArrTotal] = useState<number | null>(null)
   const [liveArrErr, setLiveArrErr] = useState<string | null>(null)
+  const [liveCrmSeatsTotal, setLiveCrmSeatsTotal] = useState<number | null>(null)
 
   useEffect(() => {
     const fetchKpi = () =>
@@ -107,6 +108,11 @@ export default function Dashboard() {
       getARRScheduleActiveArr()
         .then((res) => {
           setLiveArrTotal(res.grand_total)
+          const totalSeats = (res.rows ?? []).reduce(
+            (sum, row) => sum + ((row as any).crm_seats ?? 0),
+            0,
+          )
+          setLiveCrmSeatsTotal(totalSeats)
           setLiveArrErr(null)
         })
         .catch((e) => setLiveArrErr(normalizeFetchError(e instanceof Error ? e.message : String(e), 'Live ARR')))
@@ -194,22 +200,68 @@ export default function Dashboard() {
           gap: '1.25rem',
         }}
       >
-        {/* Live ARR (as of today) — total from Schedule */}
-        <div style={{ ...blockStyle, width: 'fit-content' }}>
-          <div style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '0.35rem' }}>
-            Live ARR (as of today)
-          </div>
-          {liveArrErr && (
-            <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>{liveArrErr}</p>
-          )}
-          {!liveArrErr && liveArrTotal != null && (
-            <div style={{ fontSize: '1.75rem', fontWeight: 700, color: 'var(--text)' }}>
-              {new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 }).format(liveArrTotal)}
+        {/* Live ARR + CRM seats — from Schedule */}
+        <div
+          style={{
+            display: 'flex',
+            gap: '1.25rem',
+            alignItems: 'stretch',
+            gridColumn: '1 / -1',
+          }}
+        >
+          <div
+            style={{
+              ...blockStyle,
+              flex: '0 0 220px',
+              display: 'flex',
+              flexDirection: 'column',
+              justifyContent: 'center',
+              alignItems: 'center',
+              minHeight: 96,
+            }}
+          >
+            <div style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '0.35rem', textAlign: 'center' }}>
+              Live ARR
             </div>
-          )}
-          {!liveArrErr && liveArrTotal == null && (
-            <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>Loading…</p>
-          )}
+            {liveArrErr && (
+              <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)', textAlign: 'center', margin: 0 }}>{liveArrErr}</p>
+            )}
+            {!liveArrErr && liveArrTotal != null && (
+              <div style={{ fontSize: '1.75rem', fontWeight: 700, color: 'var(--text)', textAlign: 'center' }}>
+                {new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 }).format(liveArrTotal)}
+              </div>
+            )}
+            {!liveArrErr && liveArrTotal == null && (
+              <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)', textAlign: 'center', margin: 0 }}>Loading…</p>
+            )}
+          </div>
+
+          <div
+            style={{
+              ...blockStyle,
+              flex: '0 0 220px',
+              display: 'flex',
+              flexDirection: 'column',
+              justifyContent: 'center',
+              alignItems: 'center',
+              minHeight: 96,
+            }}
+          >
+            <div style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '0.35rem', textAlign: 'center' }}>
+              Live CRM seats
+            </div>
+            {liveArrErr && (
+              <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)', textAlign: 'center', margin: 0 }}>{liveArrErr}</p>
+            )}
+            {!liveArrErr && liveCrmSeatsTotal != null && (
+              <div style={{ fontSize: '1.75rem', fontWeight: 700, color: 'var(--text)', textAlign: 'center' }}>
+                {liveCrmSeatsTotal.toLocaleString('en-US')}
+              </div>
+            )}
+            {!liveArrErr && liveCrmSeatsTotal == null && (
+              <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)', textAlign: 'center', margin: 0 }}>Loading…</p>
+            )}
+          </div>
         </div>
 
         {/* Block 1: Bookings */}
@@ -274,8 +326,8 @@ function periodValueColumnLabel(periodLabel: string | undefined): string {
 }
 
 function BookingsMTDBlock({ data, sheetSyncError }: { data: BookingsMTDResponse; sheetSyncError?: string | null }) {
-  const { previous_month, current_mtd, qtd, plan_message } = data
-  const periods: BookingsPeriod[] = [previous_month, current_mtd, qtd]
+  const { two_months_ago, previous_month, current_mtd, qtd, plan_message } = data
+  const periods: BookingsPeriod[] = [two_months_ago, previous_month, current_mtd, qtd]
   const planNote = sanitizePlanMessage(sheetSyncError) || sanitizePlanMessage(plan_message)
   const needsGoogleConfig =
     planNote && /GOOGLE_SHEET_ID|not configured|credentials/i.test(planNote)
@@ -290,9 +342,10 @@ function BookingsMTDBlock({ data, sheetSyncError }: { data: BookingsMTDResponse;
         </p>
       )}
       <div style={{ display: 'grid', gridTemplateColumns: `repeat(${periods.length}, 1fr)`, gap: '1.5rem', minWidth: 0 }}>
-        {periods.map((period, idx) => {
-          const showPipeCov = idx > 0 // only MTD & QTD
-          const isFirstBlock = idx === 0
+        {periods.map((period) => {
+          // Keep layout identical across periods: always render the "Pipe cov." column.
+          // For the previous_month block, coverage values may be missing and will display as '—'.
+          const showPipeCov = true
           return (
           <div key={period.period_label}>
             <div style={{ fontSize: '0.75rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '0.5rem' }}>
@@ -302,12 +355,6 @@ function BookingsMTDBlock({ data, sheetSyncError }: { data: BookingsMTDResponse;
               <thead>
                 <tr style={{ borderBottom: '1px solid var(--border)' }}>
                   <th style={{ textAlign: 'left', padding: '0.25rem 0.5rem 0.25rem 0', fontWeight: 500, color: 'var(--text-muted)' }}>
-                    {isFirstBlock && (
-                      <>
-                        <br />
-                        &nbsp;
-                      </>
-                    )}
                   </th>
                   <th style={{ textAlign: 'right', padding: '0.25rem 0.5rem', fontWeight: 500, color: 'var(--text-muted)' }}>
                     {periodValueColumnLabel(period.period_label)}
@@ -338,8 +385,8 @@ function BookingsMTDBlock({ data, sheetSyncError }: { data: BookingsMTDResponse;
 }
 
 function CashMTDBlock({ data, sheetSyncError }: { data: CashMTDResponse; sheetSyncError?: string | null }) {
-  const { previous_month, current_mtd, qtd, plan_message, chargebee_message } = data
-  const periods = [previous_month, current_mtd, qtd]
+  const { two_months_ago, previous_month, current_mtd, qtd, plan_message, chargebee_message } = data
+  const periods = [two_months_ago, previous_month, current_mtd, qtd]
   const planNote = sanitizeCashMessage(sheetSyncError) || sanitizeCashMessage(plan_message)
   const needsGoogleConfig = planNote && /GOOGLE_SHEET_ID|not configured|credentials/i.test(planNote)
   return (
@@ -511,8 +558,8 @@ function RenewalsMTDBlock({
   data: RenewalsMTDResponse
   sheetSyncError?: string | null
 }) {
-  const { previous_month, current_mtd, qtd, plan_message } = data
-  const periods: RenewalsMTDPeriod[] = [previous_month, current_mtd, qtd]
+  const { two_months_ago, previous_month, current_mtd, qtd, plan_message } = data
+  const periods: RenewalsMTDPeriod[] = [two_months_ago, previous_month, current_mtd, qtd]
   const planNote = sanitizePlanMessage(sheetSyncError) || sanitizePlanMessage(plan_message)
   const needsGoogleConfig = planNote && /GOOGLE_SHEET_ID|not configured|credentials/i.test(planNote)
   return (
@@ -526,10 +573,11 @@ function RenewalsMTDBlock({
         </p>
       )}
       <div style={{ display: 'grid', gridTemplateColumns: `repeat(${periods.length}, 1fr)`, gap: '1.5rem', minWidth: 0 }}>
-        {periods.map((period, idx) => (
+          {periods.map((period, idx) => (
           <div key={period.period_label ?? idx}>
             <div style={{ fontSize: '0.75rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '0.5rem' }}>
-              {period.period_label ?? (idx === 0 ? 'Prev month' : idx === 1 ? 'MTD' : 'QTD')}
+              {period.period_label ??
+                (idx === 0 ? 'Two months ago' : idx === 1 ? 'Prev month' : idx === 2 ? 'MTD' : 'QTD')}
             </div>
             <table style={{ width: '100%', fontSize: '0.8rem', borderCollapse: 'collapse' }}>
               <thead>

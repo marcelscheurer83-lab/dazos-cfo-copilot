@@ -235,6 +235,7 @@ export type BookingsPeriod = {
 }
 
 export type BookingsMTDResponse = {
+  two_months_ago: BookingsPeriod
   previous_month: BookingsPeriod
   current_mtd: BookingsPeriod
   qtd: BookingsPeriod
@@ -282,6 +283,7 @@ export type RenewalsMTDPeriod = {
 }
 
 export type RenewalsMTDResponse = {
+  two_months_ago: RenewalsMTDPeriod
   previous_month: RenewalsMTDPeriod
   current_mtd: RenewalsMTDPeriod
   qtd: RenewalsMTDPeriod
@@ -302,6 +304,7 @@ export type CashPeriod = {
 }
 
 export type CashMTDResponse = {
+  two_months_ago: CashPeriod
   previous_month: CashPeriod
   current_mtd: CashPeriod
   qtd: CashPeriod
@@ -456,8 +459,16 @@ export type ActiveARRRow = {
   account_name: string
   /** Account Status from Salesforce (e.g. Account_Status__c). */
   status: string | null
+  /** Salesforce Account Type picklist (e.g. Customer, Prospect). */
+  type?: string | null
+  /** Salesforce Account owner (user name) from the anchor opportunity. */
+  owner_name?: string | null
   segment: string | null
   active_arr: number
+  /** CRM seats from CRM SKUs only (Additional CRM Seats quantity + 5 per CRM Platform (Includes 5 Seats)), for the period active today. */
+  crm_seats?: number | null
+  /** ARR from CRM SKUs only (Additional CRM Seats, CRM Platform (Includes 5 Seats), CRM Platform (Legacy)), same period as active_arr. */
+  crm_arr?: number | null
   /** ARR from anchor (renewal/NB) only; used for ARR history over time. */
   anchor_arr?: number
   /** Expansions after anchor: close_date + arr; used for by-month ARR. */
@@ -708,6 +719,22 @@ export async function getBudgetVsActual(periodEnd?: string): Promise<BudgetVsAct
   const path = periodEnd ? `/budget-vs-actual?period_end=${periodEnd}` : '/budget-vs-actual'
   const r = await apiFetch(path)
   if (!r.ok) throw new Error('Failed to fetch budget vs actual')
+  return r.json()
+}
+
+// --- Simple Accounts listing for type analysis ---
+export type AccountRow = {
+  sf_id: string
+  name: string | null
+  type: string | null
+  status: string | null
+  industry: string | null
+  segment: string | null
+}
+
+export async function getAccounts(limit = 5000): Promise<AccountRow[]> {
+  const r = await apiFetch(`/accounts?limit=${limit}`)
+  if (!r.ok) throw new Error('Failed to fetch accounts')
   return r.json()
 }
 

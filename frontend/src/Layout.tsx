@@ -26,9 +26,10 @@ const nav: NavItem[] = [
     ],
   },
   {
-    label: 'Analytics',
+    label: 'Analyses',
     children: [
       { to: '/analytics', label: 'Product penetration' },
+      { to: '/analytics/crm-seats', label: 'CRM seat pricing' },
     ],
   },
   { to: '/financials', label: 'Financials' },
@@ -58,7 +59,7 @@ const subLinkStyle = (isActive: boolean) => ({
 
 const GTM_PATHS = ['/bookings', '/gtm/renewals', '/pipeline-overview']
 const ARR_SCHEDULE_PATHS = ['/arr-schedule/active-arr']
-const ANALYTICS_PATHS = ['/analytics']
+const ANALYTICS_PATHS = ['/analytics', '/analytics/crm-seats']
 
 export default function Layout() {
   const location = useLocation()
@@ -109,7 +110,7 @@ export default function Layout() {
                   ? gtmExpanded
                   : item.label === 'ARR'
                     ? arrScheduleExpanded
-                    : item.label === 'Analytics'
+                    : item.label === 'Analyses'
                       ? analyticsExpanded
                       : true
               const setExpanded =
@@ -117,7 +118,7 @@ export default function Layout() {
                   ? (v: boolean) => setGtmExpanded(v)
                   : item.label === 'ARR'
                     ? (v: boolean) => setArrScheduleExpanded(v)
-                    : item.label === 'Analytics'
+                      : item.label === 'Analyses'
                       ? (v: boolean) => setAnalyticsExpanded(v)
                       : () => {}
               return (
@@ -147,7 +148,12 @@ export default function Layout() {
                   </button>
                   {isExpanded &&
                     item.children.map((child) => (
-                      <NavLink key={child.to} to={child.to} style={({ isActive }) => subLinkStyle(isActive)}>
+                      <NavLink
+                        key={child.to}
+                        to={child.to}
+                        end
+                        style={({ isActive }) => subLinkStyle(isActive)}
+                      >
                         {child.label}
                       </NavLink>
                     ))}

@@ -327,7 +327,7 @@ function periodValueColumnLabel(periodLabel: string | undefined): string {
 
 function BookingsMTDBlock({ data, sheetSyncError }: { data: BookingsMTDResponse; sheetSyncError?: string | null }) {
   const { two_months_ago, previous_month, current_mtd, qtd, plan_message } = data
-  const periods: BookingsPeriod[] = [two_months_ago, previous_month, current_mtd, qtd]
+  const periods: BookingsPeriod[] = [two_months_ago, previous_month, current_mtd, qtd].filter(Boolean) as BookingsPeriod[]
   const planNote = sanitizePlanMessage(sheetSyncError) || sanitizePlanMessage(plan_message)
   const needsGoogleConfig =
     planNote && /GOOGLE_SHEET_ID|not configured|credentials/i.test(planNote)
@@ -386,7 +386,7 @@ function BookingsMTDBlock({ data, sheetSyncError }: { data: BookingsMTDResponse;
 
 function CashMTDBlock({ data, sheetSyncError }: { data: CashMTDResponse; sheetSyncError?: string | null }) {
   const { two_months_ago, previous_month, current_mtd, qtd, plan_message, chargebee_message } = data
-  const periods = [two_months_ago, previous_month, current_mtd, qtd]
+  const periods = [two_months_ago, previous_month, current_mtd, qtd].filter(Boolean)
   const planNote = sanitizeCashMessage(sheetSyncError) || sanitizeCashMessage(plan_message)
   const needsGoogleConfig = planNote && /GOOGLE_SHEET_ID|not configured|credentials/i.test(planNote)
   return (
@@ -559,7 +559,7 @@ function RenewalsMTDBlock({
   sheetSyncError?: string | null
 }) {
   const { two_months_ago, previous_month, current_mtd, qtd, plan_message } = data
-  const periods: RenewalsMTDPeriod[] = [two_months_ago, previous_month, current_mtd, qtd]
+  const periods: RenewalsMTDPeriod[] = [two_months_ago, previous_month, current_mtd, qtd].filter(Boolean) as RenewalsMTDPeriod[]
   const planNote = sanitizePlanMessage(sheetSyncError) || sanitizePlanMessage(plan_message)
   const needsGoogleConfig = planNote && /GOOGLE_SHEET_ID|not configured|credentials/i.test(planNote)
   return (

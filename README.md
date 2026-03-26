@@ -41,6 +41,10 @@ npm run dev
 
 Open **http://localhost:5173**. API runs at **http://localhost:8000**.
 
+**Local dev note:** `npm run dev` always uses the Vite proxy (`/api` → `127.0.0.1:8000`), so a `VITE_API_URL` in `.env` that points at production is ignored. That avoids 404s on new API routes until production is redeployed. To call a remote API from the dev server, set `VITE_USE_REMOTE_API_IN_DEV=true`.
+
+**Admin ARR breakdown** (`/admin` → Show breakdown) calls `http://127.0.0.1:8000/api/...` directly in dev so the Vite proxy cannot drop POST bodies or query params. Override with `VITE_DEV_BACKEND_URL` if the API is not on port 8000, or set `VITE_BREAKDOWN_USE_PROXY=true` to force the proxy.
+
 ### Publishing the front-end (making it accessible online)
 
 1. **Build the frontend** with the API base URL set to your deployed backend:

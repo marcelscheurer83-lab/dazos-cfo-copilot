@@ -9,6 +9,7 @@ backend/.venv/
 __pycache__/
 *.py[cod]
 *.db
+backend/api_timing.log
 
 # Node
 frontend/node_modules/

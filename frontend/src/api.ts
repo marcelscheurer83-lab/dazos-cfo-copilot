@@ -1,11 +1,79 @@
-/** API base URL: use VITE_API_URL when building for production (e.g. https://api.example.com/api). Must include /api so routes work. */
-const RAW_API = import.meta.env.VITE_API_URL ?? '/api'
-const API = RAW_API.endsWith('/api') ? RAW_API : `${RAW_API.replace(/\/$/, '')}/api`
+/**
+ * API base URL for production / preview builds: use VITE_API_URL (e.g. https://api.example.com/api).
+ * Ensures exactly one `/api` suffix so we never produce `/api/api/...` (404 on all routes).
+ * Handles: `https://host`, `https://host/`, `https://host/api`, `https://host/api/`
+ *
+ * While running `npm run dev` (Vite dev server), we **always** use same-origin `/api` so the dev
+ * proxy hits **local** :8000. Otherwise a stray `VITE_API_URL` (e.g. pointing at Railway) makes
+ * new endpoints 404. To call a remote API from the dev server, set:
+ *   VITE_USE_REMOTE_API_IN_DEV=true
+ */
+function apiBaseUrl(): string {
+  if (import.meta.env.DEV && import.meta.env.VITE_USE_REMOTE_API_IN_DEV !== 'true') {
+    return '/api'
+  }
+  const raw = (import.meta.env.VITE_API_URL as string | undefined)?.trim() ?? ''
+  if (!raw) return '/api'
+  const noTrail = raw.replace(/\/+$/, '')
+  if (noTrail.endsWith('/api')) return noTrail
+  return `${noTrail}/api`
+}
+
+const API = apiBaseUrl()
 
 const AUTH_HEADER = 'X-App-Password'
 
 function getStoredPassword(): string | null {
   return sessionStorage.getItem('app_password')
+}
+
+/** Full URL for debugging (browser) or path prefix (SSR). */
+function absoluteApiUrl(pathAndQuery: string): string {
+  const p = pathAndQuery.startsWith('/') ? pathAndQuery : `/${pathAndQuery}`
+  if (API.startsWith('http')) return `${API}${p}`
+  if (typeof window !== 'undefined') return `${window.location.origin}${API}${p}`
+  return `${API}${p}`
+}
+
+/**
+ * Admin ARR breakdown only: in `npm run dev` on localhost, call FastAPI directly on :8000.
+ * Some setups see the Vite proxy strip POST bodies or query strings, so active-arr?breakdown_q=
+ * hits the server without the param and looks like an "old" backend. CORS already allows :5173 → :8000.
+ * Set `VITE_BREAKDOWN_USE_PROXY=true` to keep using `/api` through Vite. Optional `VITE_DEV_BACKEND_URL`
+ * if the API is not on 127.0.0.1:8000.
+ */
+function arrBreakdownApiUrl(pathWithLeadingSlash: string): string {
+  const p = pathWithLeadingSlash.startsWith('/') ? pathWithLeadingSlash : `/${pathWithLeadingSlash}`
+  const forceProxy =
+    import.meta.env.VITE_BREAKDOWN_USE_PROXY === 'true' || import.meta.env.VITE_BREAKDOWN_USE_PROXY === '1'
+  if (
+    !forceProxy &&
+    import.meta.env.DEV &&
+    typeof window !== 'undefined'
+  ) {
+    const h = window.location.hostname
+    if (h === 'localhost' || h === '127.0.0.1') {
+      const base =
+        (import.meta.env.VITE_DEV_BACKEND_URL as string | undefined)?.trim().replace(/\/+$/, '') ||
+        'http://127.0.0.1:8000'
+      return `${base}/api${p}`
+    }
+  }
+  return p.startsWith('/') ? `${API}${p}` : `${API}/${p}`
+}
+
+async function arrBreakdownFetch(path: string, options?: RequestInit): Promise<Response> {
+  const url = arrBreakdownApiUrl(path)
+  const password = getStoredPassword()
+  const headers: Record<string, string> = { ...(options?.headers as Record<string, string>) }
+  if (password) headers[AUTH_HEADER] = password
+  const r = await fetch(url, { ...options, headers })
+  if (r.status === 401) {
+    sessionStorage.removeItem('app_password')
+    window.location.reload()
+    throw new Error('Unauthorized')
+  }
+  return r
 }
 
 /** Fetch with app password header. On 401, clears storage and reloads (except when checking login with passwordOverride). */
@@ -18,7 +86,15 @@ export async function apiFetch(
   const password = passwordOverride ?? getStoredPassword()
   const headers: Record<string, string> = { ...(options?.headers as Record<string, string>) }
   if (password) headers[AUTH_HEADER] = password
+  const t0 =
+    import.meta.env.DEV && typeof localStorage !== 'undefined' && localStorage.getItem('DEBUG_API_TIMING') === '1'
+      ? performance.now()
+      : 0
   const r = await fetch(url, { ...options, headers })
+  if (t0 && import.meta.env.DEV) {
+    const ms = Math.round(performance.now() - t0)
+    console.debug(`[api timing] ${path} ${ms}ms`)
+  }
   if (r.status === 401 && passwordOverride === undefined) {
     sessionStorage.removeItem('app_password')
     window.location.reload()
@@ -191,22 +267,38 @@ export type ARRExamplesResponse = {
 }
 
 export async function getDashboardKPI(): Promise<DashboardKPI> {
-  const r = await apiFetch('/dashboard-kpi')
-  const text = await r.text()
-  if (!r.ok) {
-    const msg = r.status === 401 ? 'Unauthorized — sign in again.' : `Dashboard error ${r.status}. Check backend is up.`
-    try {
-      const j = JSON.parse(text)
-      throw new Error(j.detail || j.error || msg)
-    } catch (e) {
-      if (e instanceof SyntaxError) throw new Error(msg)
-      throw e
-    }
-  }
+  const controller = new AbortController()
+  const timeoutId = setTimeout(() => controller.abort(), 90_000)
   try {
-    return JSON.parse(text) as DashboardKPI
-  } catch {
-    throw new Error('Invalid response from server')
+    const r = await apiFetch('/dashboard-kpi', { signal: controller.signal })
+    const text = await r.text()
+    if (!r.ok) {
+      const msg = r.status === 401 ? 'Unauthorized — sign in again.' : `Dashboard error ${r.status}. Check backend is up.`
+      try {
+        const j = JSON.parse(text)
+        throw new Error(j.detail || j.error || msg)
+      } catch (e) {
+        if (e instanceof SyntaxError) throw new Error(msg)
+        throw e
+      }
+    }
+    try {
+      return JSON.parse(text) as DashboardKPI
+    } catch {
+      throw new Error('Invalid response from server')
+    }
+  } catch (e) {
+    if (
+      e instanceof Error &&
+      (e.name === 'AbortError' || /aborted|AbortError/i.test(String(e.message)))
+    ) {
+      throw new Error(
+        'Dashboard timed out waiting for the server (90s). The backend may be busy — try again in a moment.',
+      )
+    }
+    throw e
+  } finally {
+    clearTimeout(timeoutId)
   }
 }
 
@@ -398,20 +490,42 @@ export async function getARRByAccount(): Promise<ARRByAccountResponse> {
   return r.json()
 }
 
-/** CARR by account with product columns (open renewals; contracted ARR). */
+/** CARR by account with product columns (open renewals). contracted_arr = Live ARR (schedule) + Closed Won NB/Expansion with service start after today (EST). */
 export type ARRByAccountProductResponse = {
   products: string[]
-  rows: { account_id: string | null; account_name: string; segment?: string | null; subscription_end_date?: string | null; by_product: Record<string, number>; total_arr: number }[]
+  rows: {
+    account_id: string | null
+    account_name: string
+    segment?: string | null
+    csm?: string | null
+    subscription_end_date?: string | null
+    active_arr?: number
+    /** Same schedule engine as Active ARR, but uses soonest future period ARR when subscription has not started yet. */
+    contracted_arr?: number
+    by_product: Record<string, number>
+    total_arr: number
+  }[]
   total_by_product: Record<string, number>
   grand_total: number
-  /** When set, account names in Customer overview link to Salesforce (url + "/" + account_id). */
+  /** When set, account names on Products purchased link to Salesforce (url + "/" + account_id). */
   salesforce_base_url?: string
 }
 
 export async function getARRByAccountProduct(): Promise<ARRByAccountProductResponse> {
-  const r = await apiFetch('/arr-by-account-product')
+  const r = await apiFetch('/arr-by-account-product', { cache: 'no-store' })
   if (!r.ok) throw new Error('Failed to fetch ARR by account and product')
   return r.json()
+}
+
+export async function getSalesforceUserNamesByIds(ids: string[]): Promise<Record<string, string>> {
+  const r = await apiFetch('/salesforce/users/by-ids', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ids }),
+  })
+  const data = await r.json().catch(() => ({}))
+  if (!r.ok || data?.ok === false) return {}
+  return (data?.users ?? {}) as Record<string, string>
 }
 
 /** Export the current ARR-by-account-product table to a new Google Sheet (created each time). */
@@ -484,11 +598,15 @@ export type ActiveARRRow = {
 export type ActiveARRResponse = {
   rows: ActiveARRRow[]
   grand_total: number
+  /** Sum of crm_seats on schedule rows (Live). */
+  crm_seats_live_total?: number
+  /** Live CRM seats + CRM seats on Closed Won NB/Expansion with service start after today (same cohort as Contracted ARR). */
+  contracted_crm_seats_total?: number
   salesforce_base_url?: string
 }
 
 export async function getARRScheduleActiveArr(): Promise<ActiveARRResponse> {
-  const r = await apiFetch('/arr-schedule/active-arr')
+  const r = await apiFetch('/arr-schedule/active-arr', { cache: 'no-store' })
   if (!r.ok) throw new Error('Failed to fetch Active ARR')
   return r.json()
 }
@@ -690,6 +808,128 @@ export async function getEodSnapshotContents(
   const r = await apiFetch(path)
   if (!r.ok) throw new Error(r.status === 404 ? 'No snapshot for that date' : 'Failed to fetch snapshot')
   return r.json()
+}
+
+/** Admin: Active vs Contracted ARR calculation steps (same engine as Products purchased schedule). */
+export type ArrScheduleBreakdownMatch = {
+  as_of_date_est: string
+  timezone: string
+  apply_alleva_retained_arr_adjustment: boolean
+  account_id: string | null
+  account_name: string
+  account_type: string | null
+  status: string | null
+  is_churned: boolean
+  schedule_note: string | null
+  in_open_renewal_override_list: boolean
+  open_renewal_line_arr: number
+  anchor_opportunity_arr: number
+  expansions_closed_won: Array<{ close_date: string; arr: number }>
+  expansion_arr_sum_close_on_or_before_today: number
+  subscription_window: { start: string | null; end: string | null }
+  closed_won_periods_with_arr: Array<{ start: string; end: string; arr: number }>
+  period_containing_today: { start: string; end: string; arr: number } | null
+  active_arr_explanation: Record<string, unknown>
+  contracted_arr_explanation: Record<string, unknown>
+  products_purchased_note: string
+}
+
+export async function getArrScheduleBreakdown(q = '12 south'): Promise<{
+  query: string
+  match_count: number
+  matches: ArrScheduleBreakdownMatch[]
+  message?: string
+}> {
+  const rawQ = (q.trim() || '12 south').slice(0, 500)
+  const needleEnc = encodeURIComponent(rawQ)
+
+  // 1) POST first — distinct route; old backends 404 here and we fall back to GET.
+  const postUrl = arrBreakdownApiUrl('/arr-schedule/arr-breakdown')
+  const pr = await arrBreakdownFetch('/arr-schedule/arr-breakdown', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ q: rawQ }),
+    cache: 'no-store',
+  })
+  if (pr.ok) {
+    const data = (await pr.json()) as { matches?: ArrScheduleBreakdownMatch[]; match_count?: number; query?: string; message?: string }
+    if (Array.isArray(data.matches)) {
+      return {
+        query: data.query ?? rawQ,
+        match_count: data.match_count ?? data.matches.length,
+        matches: data.matches,
+        message: data.message,
+      }
+    }
+  }
+
+  // 2) GET fallbacks
+  const paths = [
+    `/arr-schedule/active-arr?breakdown_q=${needleEnc}`,
+    `/arr-schedule/schedule-breakdown?q=${needleEnc}`,
+    `/admin/arr-schedule-breakdown?q=${needleEnc}`,
+  ]
+  const firstUrl = postUrl
+  let lastStatus = 0
+  let lastDetail = ''
+  let sawFullActiveArrWithoutBreakdown = false
+
+  for (const path of paths) {
+    const r = await arrBreakdownFetch(path, { cache: 'no-store' })
+    if (r.ok) {
+      const data = (await r.json()) as {
+        matches?: ArrScheduleBreakdownMatch[]
+        match_count?: number
+        query?: string
+        message?: string
+        rows?: unknown[]
+        grand_total?: number
+        breakdown_only?: boolean
+      }
+      if (Array.isArray(data.matches)) {
+        return {
+          query: data.query ?? q,
+          match_count: data.match_count ?? data.matches.length,
+          matches: data.matches,
+          message: data.message,
+        }
+      }
+      // Old backend ignores `breakdown_q` and returns the normal Schedule payload — do not chase 404 fallbacks.
+      if (Array.isArray(data.rows) && data.grand_total !== undefined) {
+        sawFullActiveArrWithoutBreakdown = true
+        break
+      }
+      continue
+    }
+    lastStatus = r.status
+    const text = await r.text().catch(() => '')
+    try {
+      const parsed = JSON.parse(text) as { detail?: unknown }
+      lastDetail =
+        typeof parsed?.detail === 'string'
+          ? parsed.detail
+          : parsed?.detail != null
+            ? JSON.stringify(parsed.detail)
+            : text
+    } catch {
+      lastDetail = text
+    }
+    if (r.status !== 404) break
+  }
+
+  if (sawFullActiveArrWithoutBreakdown) {
+    throw new Error(
+      `The API still returned the full Schedule without breakdown (missing breakdown_q / POST route). ` +
+        `In dev, breakdown calls http://127.0.0.1:8000 directly — if that is not your API, set VITE_DEV_BACKEND_URL. ` +
+        `Otherwise run .\\backend\\start-backend.ps1 from this repo. Try POST ${postUrl} with {"q":"12 south"}.`
+    )
+  }
+
+  throw new Error(
+    `ARR schedule breakdown failed (${lastStatus}${lastDetail ? `: ${lastDetail.slice(0, 200)}` : ''}). ` +
+      `POST tried: ${postUrl}. ` +
+      `Confirm the process on port 8000 is this project (see start-backend.ps1 “Verified: main.py includes…” line).`
+  )
 }
 
 export async function getKPI(asOf?: string): Promise<KPISummary> {

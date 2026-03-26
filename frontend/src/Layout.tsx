@@ -32,8 +32,13 @@ const nav: NavItem[] = [
       { to: '/analytics/crm-seats', label: 'CRM seat pricing' },
     ],
   },
+  {
+    label: 'Exports',
+    children: [
+      { to: '/products-purchased', label: 'Products purchased' },
+    ],
+  },
   { to: '/financials', label: 'Financials' },
-  { to: '/copilot', label: 'Copilot' },
   { to: '/admin', label: 'Admin' },
 ]
 
@@ -59,12 +64,14 @@ const subLinkStyle = (isActive: boolean) => ({
 
 const GTM_PATHS = ['/bookings', '/gtm/renewals', '/pipeline-overview']
 const ARR_SCHEDULE_PATHS = ['/arr-schedule/active-arr']
+const EXPORTS_PATHS = ['/products-purchased', '/customer-overview']
 const ANALYTICS_PATHS = ['/analytics', '/analytics/crm-seats']
 
 export default function Layout() {
   const location = useLocation()
   const [gtmExpanded, setGtmExpanded] = useState(true)
   const [arrScheduleExpanded, setArrScheduleExpanded] = useState(true)
+  const [exportsExpanded, setExportsExpanded] = useState(true)
   const [analyticsExpanded, setAnalyticsExpanded] = useState(true)
 
   useEffect(() => {
@@ -78,13 +85,18 @@ export default function Layout() {
     }
   }, [location.pathname])
   useEffect(() => {
+    if (EXPORTS_PATHS.some((p) => location.pathname === p || location.pathname.startsWith(p + '/'))) {
+      setExportsExpanded(true)
+    }
+  }, [location.pathname])
+  useEffect(() => {
     if (ANALYTICS_PATHS.some((p) => location.pathname === p || location.pathname.startsWith(p + '/'))) {
       setAnalyticsExpanded(true)
     }
   }, [location.pathname])
 
   return (
-    <div style={{ display: 'flex', minHeight: '100vh' }}>
+    <div style={{ display: 'flex', minHeight: '100vh', zoom: 0.8 }}>
       <aside
         style={{
           width: 220,
@@ -110,6 +122,8 @@ export default function Layout() {
                   ? gtmExpanded
                   : item.label === 'ARR'
                     ? arrScheduleExpanded
+                    : item.label === 'Exports'
+                      ? exportsExpanded
                     : item.label === 'Analyses'
                       ? analyticsExpanded
                       : true
@@ -118,6 +132,8 @@ export default function Layout() {
                   ? (v: boolean) => setGtmExpanded(v)
                   : item.label === 'ARR'
                     ? (v: boolean) => setArrScheduleExpanded(v)
+                    : item.label === 'Exports'
+                      ? (v: boolean) => setExportsExpanded(v)
                       : item.label === 'Analyses'
                       ? (v: boolean) => setAnalyticsExpanded(v)
                       : () => {}

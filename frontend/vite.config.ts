@@ -22,4 +22,20 @@ export default defineConfig({
       },
     },
   },
+  // `npm run preview` serves a production build on :4173; without this, `/api/*` would 404 locally.
+  preview: {
+    port: 4173,
+    proxy: {
+      '/api': {
+        target: 'http://127.0.0.1:8000',
+        changeOrigin: true,
+        configure(proxy) {
+          proxy.on('proxyReq', (proxyReq, req) => {
+            const p = req.headers['x-app-password']
+            if (p !== undefined) proxyReq.setHeader('X-App-Password', p)
+          })
+        },
+      },
+    },
+  },
 })

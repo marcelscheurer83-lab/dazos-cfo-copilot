@@ -5,6 +5,7 @@ import {
   getDashboardRenewalsMTD,
   getDashboardCashMTD,
   getARRScheduleActiveArr,
+  getARRByAccountProduct,
   syncSalesforce,
   syncGoogleSheet,
   type DashboardKPI,
@@ -72,6 +73,25 @@ const blockStyle: React.CSSProperties = {
   padding: '1rem 1.25rem',
 }
 
+/** MTD tables: avoid fixed layout + zoom collapsing row heights; keep rows readable. */
+const mtTableStyle: React.CSSProperties = {
+  width: '100%',
+  fontSize: '1em',
+  borderCollapse: 'collapse',
+  lineHeight: 1.45,
+}
+
+/** Scales down on narrow viewports so four period columns fit without horizontal scroll. */
+function mtPeriodGridStyle(periodCount: number): React.CSSProperties {
+  return {
+    display: 'grid',
+    gridTemplateColumns: `repeat(${periodCount}, minmax(0, 1fr))`,
+    gap: 'clamp(0.5rem, 1.5vw, 1.5rem)',
+    minWidth: 0,
+    fontSize: 'clamp(0.58rem, 0.22rem + 1.15vw, 0.8rem)',
+  }
+}
+
 export default function Dashboard() {
   const [kpi, setKpi] = useState<DashboardKPI | null>(null)
   const [bookingsMTD, setBookingsMTD] = useState<BookingsMTDResponse | null>(null)
@@ -84,7 +104,10 @@ export default function Dashboard() {
   const [sheetSyncError, setSheetSyncError] = useState<string | null>(null)
   const [liveArrTotal, setLiveArrTotal] = useState<number | null>(null)
   const [liveArrErr, setLiveArrErr] = useState<string | null>(null)
+  const [liveCarrTotal, setLiveCarrTotal] = useState<number | null>(null)
+  const [carrErr, setCarrErr] = useState<string | null>(null)
   const [liveCrmSeatsTotal, setLiveCrmSeatsTotal] = useState<number | null>(null)
+  const [contractedCrmSeatsTotal, setContractedCrmSeatsTotal] = useState<number | null>(null)
 
   useEffect(() => {
     const fetchKpi = () =>
@@ -104,18 +127,31 @@ export default function Dashboard() {
         .then(setCashMTD)
         .catch((e) => setCashErr(normalizeFetchError(e instanceof Error ? e.message : String(e), 'Cash')))
 
-    const fetchLiveArr = () =>
+    const fetchLiveArr = () => {
+      const msg = (e: unknown, ctx: string) => normalizeFetchError(e instanceof Error ? e.message : String(e), ctx)
       getARRScheduleActiveArr()
         .then((res) => {
           setLiveArrTotal(res.grand_total)
           const totalSeats = (res.rows ?? []).reduce(
-            (sum, row) => sum + ((row as any).crm_seats ?? 0),
+            (sum, row) => sum + ((row as { crm_seats?: number }).crm_seats ?? 0),
             0,
           )
-          setLiveCrmSeatsTotal(totalSeats)
+          setLiveCrmSeatsTotal(res.crm_seats_live_total ?? totalSeats)
+          setContractedCrmSeatsTotal(
+            res.contracted_crm_seats_total != null
+              ? res.contracted_crm_seats_total
+              : totalSeats,
+          )
           setLiveArrErr(null)
         })
-        .catch((e) => setLiveArrErr(normalizeFetchError(e instanceof Error ? e.message : String(e), 'Live ARR')))
+        .catch((e) => setLiveArrErr(msg(e, 'Live ARR')))
+      getARRByAccountProduct()
+        .then((res) => {
+          setLiveCarrTotal(res.grand_total)
+          setCarrErr(null)
+        })
+        .catch((e) => setCarrErr(msg(e, 'Contracted ARR')))
+    }
 
     const runSyncAndFetch = () => {
       fetchKpi()
@@ -125,20 +161,22 @@ export default function Dashboard() {
       fetchLiveArr()
     }
 
-    const runInitialLoad = async () => {
+    const runInitialLoad = () => {
       if (!hasAutoSyncedThisSession.current) {
         hasAutoSyncedThisSession.current = true
         syncSalesforce().catch(() => {})
         if (!hasSyncedSheetThisSession.current) {
           hasSyncedSheetThisSession.current = true
-          // Sync plan sheets so plan numbers load automatically on first open
-          try {
-            await syncGoogleSheet(ARR_2026P_RANGE)
-            const resBs = await syncGoogleSheet(BS_2026P_RANGE)
-            if (!resBs.ok && resBs.error) setSheetSyncError(resBs.error)
-          } catch (e) {
-            setSheetSyncError((e as Error)?.message || 'Sheet sync failed')
-          }
+          // Do not await: Google sheet sync can hang or take minutes; dashboard data must load in parallel.
+          void (async () => {
+            try {
+              await syncGoogleSheet(ARR_2026P_RANGE)
+              const resBs = await syncGoogleSheet(BS_2026P_RANGE)
+              if (!resBs.ok && resBs.error) setSheetSyncError(resBs.error)
+            } catch (e) {
+              setSheetSyncError((e as Error)?.message || 'Sheet sync failed')
+            }
+          })()
         }
       }
       runSyncAndFetch()
@@ -196,14 +234,17 @@ export default function Dashboard() {
       <div
         style={{
           display: 'grid',
-          gridTemplateColumns: 'repeat(auto-fill, minmax(320px, 1fr))',
+          gridTemplateColumns: 'repeat(auto-fill, minmax(min(320px, 100%), 1fr))',
           gap: '1.25rem',
+          minWidth: 0,
+          width: '100%',
         }}
       >
         {/* Live ARR + CRM seats — from Schedule */}
         <div
           style={{
             display: 'flex',
+            flexWrap: 'wrap',
             gap: '1.25rem',
             alignItems: 'stretch',
             gridColumn: '1 / -1',
@@ -239,6 +280,36 @@ export default function Dashboard() {
           <div
             style={{
               ...blockStyle,
+              flex: '0 0 280px',
+              display: 'flex',
+              flexDirection: 'column',
+              justifyContent: 'center',
+              alignItems: 'center',
+              minHeight: 96,
+            }}
+          >
+            <div
+              style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '0.35rem', textAlign: 'center', lineHeight: 1.3, maxWidth: 260 }}
+              title="Live ARR (schedule) plus Closed Won New Business and Expansion ARR with service start after today — same grand total as Products purchased."
+            >
+              Contracted ARR
+            </div>
+            {carrErr && (
+              <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)', textAlign: 'center', margin: 0 }}>{carrErr}</p>
+            )}
+            {!carrErr && liveCarrTotal != null && (
+              <div style={{ fontSize: '1.75rem', fontWeight: 700, color: 'var(--text)', textAlign: 'center' }}>
+                {new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 }).format(liveCarrTotal)}
+              </div>
+            )}
+            {!carrErr && liveCarrTotal == null && (
+              <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)', textAlign: 'center', margin: 0 }}>Loading…</p>
+            )}
+          </div>
+
+          <div
+            style={{
+              ...blockStyle,
               flex: '0 0 220px',
               display: 'flex',
               flexDirection: 'column',
@@ -262,10 +333,40 @@ export default function Dashboard() {
               <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)', textAlign: 'center', margin: 0 }}>Loading…</p>
             )}
           </div>
+
+          <div
+            style={{
+              ...blockStyle,
+              flex: '0 0 280px',
+              display: 'flex',
+              flexDirection: 'column',
+              justifyContent: 'center',
+              alignItems: 'center',
+              minHeight: 96,
+            }}
+          >
+            <div
+              style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '0.35rem', textAlign: 'center', lineHeight: 1.3, maxWidth: 260 }}
+              title="Live CRM seats on the schedule plus seat count from Closed Won New Business and Expansion with service start after today (same cohort as Contracted ARR)."
+            >
+              Contracted CRM seats
+            </div>
+            {liveArrErr && (
+              <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)', textAlign: 'center', margin: 0 }}>{liveArrErr}</p>
+            )}
+            {!liveArrErr && contractedCrmSeatsTotal != null && (
+              <div style={{ fontSize: '1.75rem', fontWeight: 700, color: 'var(--text)', textAlign: 'center' }}>
+                {contractedCrmSeatsTotal.toLocaleString('en-US')}
+              </div>
+            )}
+            {!liveArrErr && contractedCrmSeatsTotal == null && (
+              <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)', textAlign: 'center', margin: 0 }}>Loading…</p>
+            )}
+          </div>
         </div>
 
         {/* Block 1: Bookings */}
-        <div style={{ ...blockStyle, gridColumn: '1 / -1' }}>
+        <div style={{ ...blockStyle, gridColumn: '1 / -1', minWidth: 0 }}>
           <div style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text)', marginBottom: '0.5rem' }}>
             Bookings (ARR)
           </div>
@@ -281,7 +382,7 @@ export default function Dashboard() {
         </div>
 
         {/* Block 2: Renewals */}
-        <div style={{ ...blockStyle, gridColumn: '1 / -1' }}>
+        <div style={{ ...blockStyle, gridColumn: '1 / -1', minWidth: 0 }}>
           <div style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text)', marginBottom: '0.5rem' }}>
             Renewals (ARR)
           </div>
@@ -297,7 +398,7 @@ export default function Dashboard() {
         </div>
 
         {/* Block 3: Cash */}
-        <div style={{ ...blockStyle, gridColumn: '1 / -1' }}>
+        <div style={{ ...blockStyle, gridColumn: '1 / -1', minWidth: 0 }}>
           <div style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text)', marginBottom: '0.5rem' }}>
             Cash
           </div>
@@ -341,29 +442,29 @@ function BookingsMTDBlock({ data, sheetSyncError }: { data: BookingsMTDResponse;
           )}
         </p>
       )}
-      <div style={{ display: 'grid', gridTemplateColumns: `repeat(${periods.length}, 1fr)`, gap: '1.5rem', minWidth: 0 }}>
+      <div style={mtPeriodGridStyle(periods.length)}>
         {periods.map((period) => {
           // Keep layout identical across periods: always render the "Pipe cov." column.
           // For the previous_month block, coverage values may be missing and will display as '—'.
           const showPipeCov = true
           return (
           <div key={period.period_label}>
-            <div style={{ fontSize: '0.75rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '0.5rem' }}>
+            <div style={{ fontSize: '1.05em', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '0.5rem' }}>
               {period.period_label}
             </div>
-            <table style={{ width: '100%', fontSize: '0.8rem', borderCollapse: 'collapse' }}>
+            <table style={mtTableStyle}>
               <thead>
                 <tr style={{ borderBottom: '1px solid var(--border)' }}>
-                  <th style={{ textAlign: 'left', padding: '0.25rem 0.5rem 0.25rem 0', fontWeight: 500, color: 'var(--text-muted)' }}>
+                  <th style={{ textAlign: 'left', padding: '0.25rem 0.5rem 0.25rem 0', fontWeight: 500, color: 'var(--text-muted)', verticalAlign: 'bottom' }}>
                   </th>
-                  <th style={{ textAlign: 'right', padding: '0.25rem 0.5rem', fontWeight: 500, color: 'var(--text-muted)' }}>
+                  <th style={{ textAlign: 'right', padding: '0.25rem 0.5rem', fontWeight: 500, color: 'var(--text-muted)', verticalAlign: 'bottom' }}>
                     {periodValueColumnLabel(period.period_label)}
                   </th>
-                  <th style={{ textAlign: 'right', padding: '0.25rem 0.5rem', fontWeight: 500, color: 'var(--text-muted)' }}>Plan</th>
-                  <th style={{ textAlign: 'right', padding: '0.25rem 0', fontWeight: 500, color: 'var(--text-muted)' }}>%</th>
-                  <th style={{ textAlign: 'right', padding: '0.25rem 0', fontWeight: 500, color: 'var(--text-muted)' }}>Δ</th>
+                  <th style={{ textAlign: 'right', padding: '0.25rem 0.5rem', fontWeight: 500, color: 'var(--text-muted)', verticalAlign: 'bottom' }}>Plan</th>
+                  <th style={{ textAlign: 'right', padding: '0.25rem 0', fontWeight: 500, color: 'var(--text-muted)', verticalAlign: 'bottom' }}>%</th>
+                  <th style={{ textAlign: 'right', padding: '0.25rem 0', fontWeight: 500, color: 'var(--text-muted)', verticalAlign: 'bottom' }}>Δ</th>
                   {showPipeCov && (
-                    <th style={{ textAlign: 'right', padding: '0.25rem 0', fontWeight: 500, color: 'var(--text-muted)' }}>
+                    <th style={{ textAlign: 'right', padding: '0.25rem 0', fontWeight: 500, color: 'var(--text-muted)', verticalAlign: 'bottom' }}>
                       Pipe cov.
                     </th>
                   )}
@@ -404,44 +505,44 @@ function CashMTDBlock({ data, sheetSyncError }: { data: CashMTDResponse; sheetSy
           {sanitizeCashMessage(chargebee_message) || chargebee_message}
         </p>
       )}
-      <div style={{ display: 'grid', gridTemplateColumns: `repeat(${periods.length}, 1fr)`, gap: '1.5rem', minWidth: 0 }}>
+      <div style={mtPeriodGridStyle(periods.length)}>
         {periods.map((period) => (
           <div key={period.period_label}>
-            <div style={{ fontSize: '0.75rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '0.5rem' }}>
+            <div style={{ fontSize: '1.05em', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '0.5rem' }}>
               {period.period_label}
             </div>
-            <table style={{ width: '100%', fontSize: '0.8rem', borderCollapse: 'collapse' }}>
+            <table style={mtTableStyle}>
               <thead>
                 <tr style={{ borderBottom: '1px solid var(--border)' }}>
-                  <th style={{ textAlign: 'left', padding: '0.25rem 0.5rem 0.25rem 0', fontWeight: 500, color: 'var(--text-muted)' }} />
-                  <th style={{ textAlign: 'right', padding: '0.25rem 0.5rem', fontWeight: 500, color: 'var(--text-muted)' }}>{periodValueColumnLabel(period.period_label)}</th>
-                  <th style={{ textAlign: 'right', padding: '0.25rem 0.5rem', fontWeight: 500, color: 'var(--text-muted)' }}>Plan</th>
-                  <th style={{ textAlign: 'right', padding: '0.25rem 0.5rem', fontWeight: 500, color: 'var(--text-muted)' }}>%</th>
-                  <th style={{ textAlign: 'right', padding: '0.25rem 0', fontWeight: 500, color: 'var(--text-muted)' }}>Δ</th>
+                  <th style={{ textAlign: 'left', padding: '0.25rem 0.5rem 0.25rem 0', fontWeight: 500, color: 'var(--text-muted)', verticalAlign: 'bottom' }} />
+                  <th style={{ textAlign: 'right', padding: '0.25rem 0.5rem', fontWeight: 500, color: 'var(--text-muted)', verticalAlign: 'bottom' }}>{periodValueColumnLabel(period.period_label)}</th>
+                  <th style={{ textAlign: 'right', padding: '0.25rem 0.5rem', fontWeight: 500, color: 'var(--text-muted)', verticalAlign: 'bottom' }}>Plan</th>
+                  <th style={{ textAlign: 'right', padding: '0.25rem 0.5rem', fontWeight: 500, color: 'var(--text-muted)', verticalAlign: 'bottom' }}>%</th>
+                  <th style={{ textAlign: 'right', padding: '0.25rem 0', fontWeight: 500, color: 'var(--text-muted)', verticalAlign: 'bottom' }}>Δ</th>
                 </tr>
               </thead>
               <tbody>
-                <tr style={{ borderBottom: '1px solid var(--border)' }}>
-                  <td style={{ padding: '0.35rem 0.5rem 0.35rem 0', color: 'var(--text)' }}>Billings</td>
-                  <td style={{ textAlign: 'right', padding: '0.35rem 0.5rem', color: 'var(--text)' }}>
+                <tr style={{ borderBottom: '1px solid var(--border)', verticalAlign: 'middle' }}>
+                  <td style={{ padding: '0.4rem 0.5rem 0.4rem 0', color: 'var(--text)' }}>Billings</td>
+                  <td style={{ textAlign: 'right', padding: '0.4rem 0.5rem', color: 'var(--text)' }}>
                     {period.billings_actual != null ? fmtK(period.billings_actual) : '—'}
                   </td>
-                  <td style={{ textAlign: 'right', padding: '0.35rem 0.5rem', color: 'var(--text-muted)' }}>
+                  <td style={{ textAlign: 'right', padding: '0.4rem 0.5rem', color: 'var(--text-muted)' }}>
                     {period.billings_plan != null ? fmtK(period.billings_plan) : '—'}
                   </td>
-                  <td style={{ textAlign: 'right', padding: '0.35rem 0.5rem', color: 'var(--text)' }}>{fmtPct(period.billings_achievement_pct)}</td>
-                  <td style={{ textAlign: 'right', padding: '0.35rem 0', color: period.billings_delta_k != null ? (period.billings_delta_k >= 0 ? 'var(--positive)' : 'var(--negative)') : 'var(--text-muted)' }}>{fmtDeltaK(period.billings_delta_k)}</td>
+                  <td style={{ textAlign: 'right', padding: '0.4rem 0.5rem', color: 'var(--text)' }}>{fmtPct(period.billings_achievement_pct)}</td>
+                  <td style={{ textAlign: 'right', padding: '0.4rem 0', color: period.billings_delta_k != null ? (period.billings_delta_k >= 0 ? 'var(--positive)' : 'var(--negative)') : 'var(--text-muted)' }}>{fmtDeltaK(period.billings_delta_k)}</td>
                 </tr>
-                <tr style={{ borderBottom: '1px solid var(--border)' }}>
-                  <td style={{ padding: '0.35rem 0.5rem 0.35rem 0', color: 'var(--text)' }}>Collections</td>
-                  <td style={{ textAlign: 'right', padding: '0.35rem 0.5rem', color: 'var(--text)' }}>
+                <tr style={{ borderBottom: '1px solid var(--border)', verticalAlign: 'middle' }}>
+                  <td style={{ padding: '0.4rem 0.5rem 0.4rem 0', color: 'var(--text)' }}>Collections</td>
+                  <td style={{ textAlign: 'right', padding: '0.4rem 0.5rem', color: 'var(--text)' }}>
                     {period.collections_actual != null ? fmtK(period.collections_actual) : '—'}
                   </td>
-                  <td style={{ textAlign: 'right', padding: '0.35rem 0.5rem', color: 'var(--text-muted)' }}>
+                  <td style={{ textAlign: 'right', padding: '0.4rem 0.5rem', color: 'var(--text-muted)' }}>
                     {period.collections_plan != null ? fmtK(period.collections_plan) : '—'}
                   </td>
-                  <td style={{ textAlign: 'right', padding: '0.35rem 0.5rem', color: 'var(--text)' }}>{fmtPct(period.collections_achievement_pct)}</td>
-                  <td style={{ textAlign: 'right', padding: '0.35rem 0', color: period.collections_delta_k != null ? (period.collections_delta_k >= 0 ? 'var(--positive)' : 'var(--negative)') : 'var(--text-muted)' }}>{fmtDeltaK(period.collections_delta_k)}</td>
+                  <td style={{ textAlign: 'right', padding: '0.4rem 0.5rem', color: 'var(--text)' }}>{fmtPct(period.collections_achievement_pct)}</td>
+                  <td style={{ textAlign: 'right', padding: '0.4rem 0', color: period.collections_delta_k != null ? (period.collections_delta_k >= 0 ? 'var(--positive)' : 'var(--negative)') : 'var(--text-muted)' }}>{fmtDeltaK(period.collections_delta_k)}</td>
                 </tr>
               </tbody>
             </table>
@@ -469,16 +570,16 @@ function MTDRow({
 }) {
   const deltaColor = row.delta_k != null ? (row.delta_k >= 0 ? 'var(--positive)' : 'var(--negative)') : 'var(--text-muted)'
   return (
-    <tr style={{ borderBottom: '1px solid var(--border)' }}>
-      <td style={{ padding: '0.35rem 0.5rem 0.35rem 0', color: 'var(--text)' }}>{label}</td>
-      <td style={{ textAlign: 'right', padding: '0.35rem 0.5rem', color: 'var(--text)' }}>{fmtK(row.mtd)}</td>
-      <td style={{ textAlign: 'right', padding: '0.35rem 0.5rem', color: 'var(--text-muted)' }}>
+    <tr style={{ borderBottom: '1px solid var(--border)', verticalAlign: 'middle' }}>
+      <td style={{ padding: '0.4rem 0.5rem 0.4rem 0', color: 'var(--text)' }}>{label}</td>
+      <td style={{ textAlign: 'right', padding: '0.4rem 0.5rem', color: 'var(--text)' }}>{fmtK(row.mtd)}</td>
+      <td style={{ textAlign: 'right', padding: '0.4rem 0.5rem', color: 'var(--text-muted)' }}>
         {row.plan != null ? fmtK(row.plan) : '—'}
       </td>
-      <td style={{ textAlign: 'right', padding: '0.35rem 0.5rem', color: 'var(--text)' }}>{fmtPct(row.achievement_pct)}</td>
-      <td style={{ textAlign: 'right', padding: '0.35rem 0', color: deltaColor }}>{fmtDeltaK(row.delta_k)}</td>
+      <td style={{ textAlign: 'right', padding: '0.4rem 0.5rem', color: 'var(--text)' }}>{fmtPct(row.achievement_pct)}</td>
+      <td style={{ textAlign: 'right', padding: '0.4rem 0', color: deltaColor }}>{fmtDeltaK(row.delta_k)}</td>
       {showPipeCov && (
-        <td style={{ textAlign: 'right', padding: '0.35rem 0', color: 'var(--text)' }}>
+        <td style={{ textAlign: 'right', padding: '0.4rem 0', color: 'var(--text)' }}>
           {fmtPipeCoverage(pipeCoverage ?? null)}
         </td>
       )}
@@ -489,10 +590,10 @@ function MTDRow({
 /** Indented sub-row: value only in first data column, no plan/%/delta; optional empty pipe cov cell for alignment */
 function MTDRowSub({ label, value, showPipeCov }: { label: string; value: number; showPipeCov?: boolean }) {
   return (
-    <tr style={{ borderBottom: '1px solid var(--border)' }}>
+    <tr style={{ borderBottom: '1px solid var(--border)', verticalAlign: 'middle' }}>
       <td
         style={{
-          padding: '0.35rem 0.5rem 0.35rem 0',
+          padding: '0.4rem 0.5rem 0.4rem 0',
           color: 'var(--text-muted)',
           paddingLeft: '1.25rem',
           whiteSpace: 'nowrap',
@@ -500,12 +601,12 @@ function MTDRowSub({ label, value, showPipeCov }: { label: string; value: number
       >
         {label}
       </td>
-      <td style={{ textAlign: 'right', padding: '0.35rem 0.5rem', color: 'var(--text)' }}>{fmtK(value)}</td>
-      <td style={{ textAlign: 'right', padding: '0.35rem 0.5rem', color: 'var(--text-muted)' }}>—</td>
-      <td style={{ textAlign: 'right', padding: '0.35rem 0.5rem', color: 'var(--text-muted)' }}>—</td>
-      <td style={{ textAlign: 'right', padding: '0.35rem 0', color: 'var(--text-muted)' }}>—</td>
+      <td style={{ textAlign: 'right', padding: '0.4rem 0.5rem', color: 'var(--text)' }}>{fmtK(value)}</td>
+      <td style={{ textAlign: 'right', padding: '0.4rem 0.5rem', color: 'var(--text-muted)' }}>—</td>
+      <td style={{ textAlign: 'right', padding: '0.4rem 0.5rem', color: 'var(--text-muted)' }}>—</td>
+      <td style={{ textAlign: 'right', padding: '0.4rem 0', color: 'var(--text-muted)' }}>—</td>
       {showPipeCov && (
-        <td style={{ textAlign: 'right', padding: '0.35rem 0', color: 'var(--text-muted)' }}>—</td>
+        <td style={{ textAlign: 'right', padding: '0.4rem 0', color: 'var(--text-muted)' }}>—</td>
       )}
     </tr>
   )
@@ -539,14 +640,14 @@ function RenewalsMTDRow({
     return fmtDeltaK(row.delta_k)
   }
   return (
-    <tr style={{ borderBottom: '1px solid var(--border)' }}>
-      <td style={{ padding: '0.35rem 0.5rem 0.35rem 0', color: 'var(--text)' }}>{label}</td>
-      <td style={{ textAlign: 'right', padding: '0.35rem 0.5rem', color: 'var(--text)' }}>{fmtVal(row.mtd)}</td>
-      <td style={{ textAlign: 'right', padding: '0.35rem 0.5rem', color: 'var(--text-muted)' }}>
+    <tr style={{ borderBottom: '1px solid var(--border)', verticalAlign: 'middle' }}>
+      <td style={{ padding: '0.4rem 0.5rem 0.4rem 0', color: 'var(--text)' }}>{label}</td>
+      <td style={{ textAlign: 'right', padding: '0.4rem 0.5rem', color: 'var(--text)' }}>{fmtVal(row.mtd)}</td>
+      <td style={{ textAlign: 'right', padding: '0.4rem 0.5rem', color: 'var(--text-muted)' }}>
         {row.plan != null ? fmtVal(row.plan) : '—'}
       </td>
-      <td style={{ textAlign: 'right', padding: '0.35rem 0.5rem', color: 'var(--text)' }}>{fmtPct(row.achievement_pct, asPct ? 1 : 0)}</td>
-      <td style={{ textAlign: 'right', padding: '0.35rem 0', color: deltaColor }}>{fmtDelta()}</td>
+      <td style={{ textAlign: 'right', padding: '0.4rem 0.5rem', color: 'var(--text)' }}>{fmtPct(row.achievement_pct, asPct ? 1 : 0)}</td>
+      <td style={{ textAlign: 'right', padding: '0.4rem 0', color: deltaColor }}>{fmtDelta()}</td>
     </tr>
   )
 }
@@ -572,21 +673,21 @@ function RenewalsMTDBlock({
           )}
         </p>
       )}
-      <div style={{ display: 'grid', gridTemplateColumns: `repeat(${periods.length}, 1fr)`, gap: '1.5rem', minWidth: 0 }}>
-          {periods.map((period, idx) => (
+      <div style={mtPeriodGridStyle(periods.length)}>
+        {periods.map((period, idx) => (
           <div key={period.period_label ?? idx}>
-            <div style={{ fontSize: '0.75rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '0.5rem' }}>
+            <div style={{ fontSize: '1.05em', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '0.5rem' }}>
               {period.period_label ??
                 (idx === 0 ? 'Two months ago' : idx === 1 ? 'Prev month' : idx === 2 ? 'MTD' : 'QTD')}
             </div>
-            <table style={{ width: '100%', fontSize: '0.8rem', borderCollapse: 'collapse' }}>
+            <table style={mtTableStyle}>
               <thead>
                 <tr style={{ borderBottom: '1px solid var(--border)' }}>
-                  <th style={{ textAlign: 'left', padding: '0.25rem 0.5rem 0.25rem 0', fontWeight: 500, color: 'var(--text-muted)' }} />
-                  <th style={{ textAlign: 'right', padding: '0.25rem 0.5rem', fontWeight: 500, color: 'var(--text-muted)' }}>{periodValueColumnLabel(period.period_label)}</th>
-                  <th style={{ textAlign: 'right', padding: '0.25rem 0.5rem', fontWeight: 500, color: 'var(--text-muted)' }}>Plan</th>
-                  <th style={{ textAlign: 'right', padding: '0.25rem 0', fontWeight: 500, color: 'var(--text-muted)' }}>%</th>
-                  <th style={{ textAlign: 'right', padding: '0.25rem 0', fontWeight: 500, color: 'var(--text-muted)' }}>Δ</th>
+                  <th style={{ textAlign: 'left', padding: '0.25rem 0.5rem 0.25rem 0', fontWeight: 500, color: 'var(--text-muted)', verticalAlign: 'bottom' }} />
+                  <th style={{ textAlign: 'right', padding: '0.25rem 0.5rem', fontWeight: 500, color: 'var(--text-muted)', verticalAlign: 'bottom' }}>{periodValueColumnLabel(period.period_label)}</th>
+                  <th style={{ textAlign: 'right', padding: '0.25rem 0.5rem', fontWeight: 500, color: 'var(--text-muted)', verticalAlign: 'bottom' }}>Plan</th>
+                  <th style={{ textAlign: 'right', padding: '0.25rem 0', fontWeight: 500, color: 'var(--text-muted)', verticalAlign: 'bottom' }}>%</th>
+                  <th style={{ textAlign: 'right', padding: '0.25rem 0', fontWeight: 500, color: 'var(--text-muted)', verticalAlign: 'bottom' }}>Δ</th>
                 </tr>
               </thead>
               <tbody>

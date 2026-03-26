@@ -23,6 +23,13 @@ if (-not (Test-Path $python)) {
   exit 1
 }
 
+$mainPy = Join-Path $PSScriptRoot "main.py"
+if (-not (Select-String -Path $mainPy -Pattern "post_arr_schedule_arr_breakdown" -Quiet)) {
+  Write-Host "WARNING: $mainPy does not define Admin ARR breakdown (post_arr_schedule_arr_breakdown). Pull latest code."
+} else {
+  Write-Host "Verified: main.py includes Admin ARR breakdown endpoint."
+}
+
 # Ensure Python loads main.py from this repo (avoids wrong copy when started from another cwd)
 $env:PYTHONPATH = $PSScriptRoot
 Set-Location $PSScriptRoot

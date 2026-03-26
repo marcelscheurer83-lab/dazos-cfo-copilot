@@ -9,7 +9,6 @@ import Analytics from './views/Analytics'
 import AnalyticsCRMSeats from './views/AnalyticsCRMSeats'
 import Pipeline from './views/Pipeline'
 import Closed from './views/Closed'
-import Copilot from './views/Copilot'
 import Placeholder from './views/Placeholder'
 import Renewals from './views/Renewals'
 import Admin from './views/Admin'
@@ -66,14 +65,14 @@ export default function App() {
         <Route path="bookings" element={<Closed />} />
         <Route path="gtm/renewals" element={<Renewals />} />
         <Route path="pipeline-overview" element={<Pipeline />} />
-        <Route path="customer-overview" element={<ARR />} />
+        <Route path="products-purchased" element={<ARR />} />
+        <Route path="customer-overview" element={<Navigate to="/products-purchased" replace />} />
         <Route path="arr-schedule/active-arr" element={<ARRScheduleActiveArr />} />
         <Route path="analytics" element={<Analytics />} />
         <Route path="analytics/crm-seats" element={<AnalyticsCRMSeats />} />
-        <Route path="arr" element={<Navigate to="/customer-overview" replace />} />
+        <Route path="arr" element={<Navigate to="/products-purchased" replace />} />
         <Route path="closed-data" element={<Navigate to="/bookings" replace />} />
         <Route path="financials" element={<Placeholder title="Financials" />} />
-        <Route path="copilot" element={<Copilot />} />
         <Route path="admin" element={<Admin />} />
       </Route>
       <Route path="*" element={<Navigate to="/dashboard" replace />} />

@@ -1,10 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { createPortal } from 'react-dom'
-import { getARRByAccountProduct, syncSalesforce, type ARRByAccountProductResponse } from '../api'
-
-function fmtMoney(n: number) {
-  return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 }).format(n)
-}
+import { getARRByAccountProduct, getSalesforceUserNamesByIds, syncSalesforce, type ARRByAccountProductResponse } from '../api'
 
 const menuItemStyle: React.CSSProperties = {
   display: 'block',
@@ -18,22 +14,46 @@ const menuItemStyle: React.CSSProperties = {
   fontSize: '0.9rem',
 }
 
-type SortKey = 'account_name' | 'segment' | 'subscription_end_date' | 'total_arr' | (string & {})
+type SortKey = 'account_name' | 'csm' | 'subscription_end_date' | 'contracted_arr' | (string & {})
 type SortDir = 'asc' | 'desc'
 type ColumnFilterMode = 'zero' | 'nonzero'
 
+const KNOWN_CSM_NAME_BY_ID: Record<string, string> = {
+  '005Vq000006cPI9IAM': 'Anna Kelley',
+  '005Vq000007P4qnIAC': 'Roberto Lagos',
+  '005Vq000007P4yrIAC': 'Sabrina Cummings',
+  '005Vq000007VZruIAG': 'Johnny Lin',
+  '005Vq000007VdaXIAS': 'Emily Abreu',
+}
+
+/**
+ * Products purchased grid columns — must match backend `PRODUCTS_PURCHASED_COLUMNS` + Other.
+ * We always render this order so the layout is correct even when `VITE_API_URL` points at an older
+ * API that still returns the legacy `products` list in JSON.
+ */
+const PRODUCTS_PURCHASED_TABLE_COLUMNS: string[] = [
+  'CRM Platform',
+  'CRM Billing Platform',
+  'MR Platform',
+  'IQ Platform',
+  'iCampaign Platform',
+  'Other',
+]
+
 export default function ARR() {
   const [data, setData] = useState<ARRByAccountProductResponse | null>(null)
+  const [csmNameById, setCsmNameById] = useState<Record<string, string>>({})
   const [err, setErr] = useState<string | null>(null)
   const [syncStatus, setSyncStatus] = useState<'idle' | 'loading' | 'ok' | 'error'>('idle')
   const [syncMessage, setSyncMessage] = useState<string | null>(null)
-  const [sortKey, setSortKey] = useState<SortKey>('total_arr')
-  const [sortDir, setSortDir] = useState<SortDir>('desc')
+  const [sortKey, setSortKey] = useState<SortKey>('account_name')
+  const [sortDir, setSortDir] = useState<SortDir>('asc')
   const [columnFilter, setColumnFilter] = useState<Record<string, ColumnFilterMode>>({})
   const [openFilterMenu, setOpenFilterMenu] = useState<SortKey | null>(null)
   const [filterMenuPosition, setFilterMenuPosition] = useState<{ left: number; top: number } | null>(null)
 
   const loadData = () => {
+    setErr(null)
     getARRByAccountProduct()
       .then(setData)
       .catch((e) => setErr(e.message))
@@ -42,6 +62,25 @@ export default function ARR() {
   useEffect(() => {
     loadData()
   }, [])
+
+  useEffect(() => {
+    const rows = Array.isArray(data?.rows) ? data.rows : []
+    const sfUserIdRe = /^005[a-zA-Z0-9]{12}(?:[a-zA-Z0-9]{3})?$/
+    const ids = Array.from(
+      new Set(
+        rows
+          .map((r) => (r.csm ?? '').trim())
+          .filter((v) => sfUserIdRe.test(v))
+      )
+    )
+    if (ids.length === 0) {
+      setCsmNameById({})
+      return
+    }
+    getSalesforceUserNamesByIds(ids)
+      .then((map) => setCsmNameById(map))
+      .catch(() => setCsmNameById({}))
+  }, [data])
 
   const handleSyncSalesforce = () => {
     setSyncStatus('loading')
@@ -66,10 +105,15 @@ export default function ARR() {
   }
 
   // Derive data for table (safe when data is null) — must be before any early return so hooks below run every time
-  const products = Array.isArray(data?.products) ? data.products : []
+  const apiProducts = Array.isArray(data?.products) ? data.products : []
+  /** Always canonical columns; cells use row.by_product[key] (missing keys => 0). */
+  const products = PRODUCTS_PURCHASED_TABLE_COLUMNS
   const rows = Array.isArray(data?.rows) ? data.rows : []
-  const total_by_product = data?.total_by_product ?? {}
-  const grand_total = data?.grand_total ?? 0
+  // Legacy payload still includes add-on columns. We only warn in production builds.
+  const apiReturnsLegacyProductColumns = apiProducts.includes('Add. CRM Seats')
+  const showLegacyApiBanner = import.meta.env.PROD && apiReturnsLegacyProductColumns
+  const apiBaseHint =
+    (import.meta.env.VITE_API_URL as string | undefined)?.replace(/\/$/, '') || '(same origin /api)'
   const salesforce_base_url =
     data?.salesforce_base_url &&
     (data.salesforce_base_url.includes("salesforce.com") || data.salesforce_base_url.includes("lightning.force.com"))
@@ -82,7 +126,7 @@ export default function ARR() {
       setSortDir((d) => (d === 'asc' ? 'desc' : 'asc'))
     } else {
       setSortKey(key)
-      setSortDir(key === 'account_name' || key === 'segment' || key === 'subscription_end_date' ? 'asc' : 'desc')
+      setSortDir(key === 'account_name' || key === 'csm' || key === 'subscription_end_date' ? 'asc' : 'desc')
     }
   }
 
@@ -95,9 +139,9 @@ export default function ARR() {
         bVal = (b.account_name ?? '').toLowerCase()
         return dir * (aVal < bVal ? -1 : aVal > bVal ? 1 : 0)
       }
-      if (sortKey === 'segment') {
-        aVal = (a.segment ?? 'SMB/ MM').trim().toLowerCase()
-        bVal = (b.segment ?? 'SMB/ MM').trim().toLowerCase()
+      if (sortKey === 'csm') {
+        aVal = (a.csm ?? '—').trim().toLowerCase()
+        bVal = (b.csm ?? '—').trim().toLowerCase()
         return dir * (aVal < bVal ? -1 : aVal > bVal ? 1 : 0)
       }
       if (sortKey === 'subscription_end_date') {
@@ -105,8 +149,10 @@ export default function ARR() {
         bVal = b.subscription_end_date ?? ''
         return dir * (aVal < bVal ? -1 : aVal > bVal ? 1 : 0)
       }
-      if (sortKey === 'total_arr') {
-        return dir * ((a.total_arr ?? 0) - (b.total_arr ?? 0))
+      if (sortKey === 'contracted_arr') {
+        aVal = a.contracted_arr ?? a.total_arr ?? 0
+        bVal = b.contracted_arr ?? b.total_arr ?? 0
+        return dir * ((aVal as number) - (bVal as number))
       }
       // product column
       aVal = a.by_product[sortKey] ?? 0
@@ -137,7 +183,12 @@ export default function ARR() {
     if (keys.length === 0) return sortedRows
     return sortedRows.filter((row) => {
       for (const col of keys) {
-        const val = col === 'total_arr' ? row.total_arr : row.by_product[col]
+        const val =
+          col === 'total_arr'
+            ? row.total_arr
+            : col === 'contracted_arr'
+              ? row.contracted_arr ?? row.total_arr
+              : row.by_product[col]
         const v = val ?? 0
         const mode = columnFilter[col]
         if (mode === 'zero' && v !== 0) return false
@@ -222,8 +273,18 @@ export default function ARR() {
     </>
   )
 
-  const thSortable = (key: SortKey, label: string, align: 'left' | 'right' = 'left', extraStyle: React.CSSProperties = {}, filterable = false) => {
+  const thSortable = (
+    key: SortKey,
+    label: string,
+    align: 'left' | 'right' = 'left',
+    extraStyle: React.CSSProperties = {},
+    filterable = false,
+    /** If set, prepended to the sort hint in the native tooltip */
+    detailTitle?: string
+  ) => {
     const isActive = sortKey === key
+    const sortHint = `Sort by ${label} (${isActive && sortDir === 'asc' ? 'desc' : 'asc'})`
+    const title = detailTitle ? `${detailTitle} ${sortHint}` : sortHint
     return (
       <th
         role="button"
@@ -240,7 +301,7 @@ export default function ARR() {
           userSelect: 'none',
           ...extraStyle,
         }}
-        title={`Sort by ${label} (${isActive && sortDir === 'asc' ? 'desc' : 'asc'})`}
+        title={title}
       >
         {label}
         {isActive && <span style={{ marginLeft: 4 }}>{sortDir === 'asc' ? '↑' : '↓'}</span>}
@@ -270,13 +331,54 @@ export default function ARR() {
   if (err) return <p style={{ color: 'var(--negative)' }}>{err}</p>
   if (!data) return <p style={{ color: 'var(--text-muted)' }}>Loading…</p>
 
+  const yesNo = (n: number | null | undefined) => (n != null && n !== 0 ? 'Yes' : '-')
+  const fmtMoney = (n: number | null | undefined) =>
+    new Intl.NumberFormat(undefined, { style: 'currency', currency: 'USD', maximumFractionDigits: 0 }).format(n ?? 0)
+
   return (
     <>
-      <h1 style={{ margin: '0 0 1.5rem', fontSize: '1.5rem', fontWeight: 600, color: 'var(--text)' }}>ARR</h1>
-      <p style={{ fontSize: '0.9rem', color: 'var(--text-muted)', marginBottom: '1rem' }}>
-        Rows = accounts. Columns = contracted ARR (CARR) by product; includes customers with future start date. Last column = total CARR per account. iVerify Monthly Credits and Kipu API excluded.
+      <h1 style={{ margin: '0 0 0.5rem', fontSize: '1.5rem', fontWeight: 600, color: 'var(--text)' }}>Products purchased</h1>
+      <p style={{ margin: '0 0 1rem', fontSize: '0.85rem', color: 'var(--text-muted)', maxWidth: 960, lineHeight: 1.5 }}>
+        <strong>Contracted ARR (CARR)</strong> (column) = <strong>Live ARR</strong> (same schedule as the Schedule view) plus ARR from{' '}
+        <strong>Closed Won</strong> New Business and Expansion opportunities whose <strong>service start</strong> (earliest included line, else contract start) is{' '}
+        <strong>after today</strong> (America/New_York). Product columns still reflect <strong>open renewal</strong> line items only (unchanged).
       </p>
+      {showLegacyApiBanner && (
+        <p
+          style={{
+            margin: '0 0 1rem',
+            padding: '0.65rem 0.85rem',
+            fontSize: '0.875rem',
+            lineHeight: 1.45,
+            color: 'var(--text)',
+            background: 'rgba(234, 179, 8, 0.12)',
+            border: '1px solid rgba(234, 179, 8, 0.45)',
+            borderRadius: 8,
+            maxWidth: 920,
+          }}
+        >
+          <strong>Older API detected.</strong> The server is still returning the legacy <code>products</code> list (e.g. &quot;Add. CRM Seats&quot;).
+          This page shows the updated column layout anyway — <strong>redeploy the backend</strong> so the API matches. API base:{' '}
+          <code style={{ wordBreak: 'break-all' }}>{apiBaseHint}</code>
+        </p>
+      )}
       <p style={{ marginBottom: '1rem', display: 'flex', alignItems: 'center', gap: '0.75rem', flexWrap: 'wrap' }}>
+        <button
+          type="button"
+          onClick={() => loadData()}
+          style={{
+            padding: '0.5rem 1rem',
+            fontSize: '0.9rem',
+            fontWeight: 600,
+            cursor: 'pointer',
+            background: 'var(--surface)',
+            color: 'var(--text)',
+            border: '1px solid var(--border)',
+            borderRadius: 6,
+          }}
+        >
+          Refresh data
+        </button>
         <button
           type="button"
           onClick={handleSyncSalesforce}
@@ -328,8 +430,16 @@ export default function ARR() {
           <thead>
             <tr style={{ borderBottom: '1px solid var(--border)' }}>
               {thSortable('account_name', 'Account', 'left', { position: 'sticky', left: 0, background: 'var(--surface)', zIndex: 1 })}
-              {thSortable('segment', 'Segment')}
+              {thSortable('csm', 'CSM')}
               {thSortable('subscription_end_date', 'Subscription end')}
+              {thSortable(
+                'contracted_arr',
+                'Contracted ARR',
+                'right',
+                {},
+                false,
+                'Schedule Active ARR evaluated 12 months after today (EST).'
+              )}
               {products.map((p, i) => (
                 <th
                   key={p}
@@ -369,21 +479,9 @@ export default function ARR() {
                   </button>
                 </th>
               ))}
-              {thSortable('total_arr', 'Total CARR', 'right', { fontWeight: 600, position: 'sticky', right: 0, background: 'var(--surface)', zIndex: 1 }, true)}
             </tr>
           </thead>
           <tbody>
-            <tr style={{ borderBottom: '1px solid var(--border)', fontWeight: 600, background: 'var(--surface)' }}>
-              <td style={{ padding: '0.5rem 0.75rem', color: 'var(--text-muted)', position: 'sticky', left: 0, background: 'var(--surface)', zIndex: 0 }}>Total</td>
-              <td style={{ padding: '0.5rem 0.75rem' }} />
-              <td style={{ padding: '0.5rem 0.75rem' }} />
-              {products.map((p) => (
-                <td key={p} style={{ textAlign: 'right', padding: '0.5rem 0.75rem', color: 'var(--text)' }}>
-                  {fmtMoney(total_by_product[p] ?? 0)}
-                </td>
-              ))}
-              <td style={{ textAlign: 'right', padding: '0.5rem 0.75rem', color: 'var(--text)', position: 'sticky', right: 0, background: 'var(--surface)', zIndex: 0 }}>{fmtMoney(grand_total)}</td>
-            </tr>
             {displayRows.map((row) => (
               <tr key={row.account_id ?? row.account_name} style={{ borderBottom: '1px solid var(--border)' }}>
                 <td style={{ padding: '0.5rem 0.75rem', color: 'var(--text)', position: 'sticky', left: 0, background: 'var(--bg)', zIndex: 0 }}>
@@ -403,30 +501,31 @@ export default function ARR() {
                     row.account_name
                   )}
                 </td>
-                <td style={{ padding: '0.5rem 0.75rem', color: 'var(--text-muted)', whiteSpace: 'nowrap' }}>{row.segment?.trim() ? row.segment : 'SMB/ MM'}</td>
+                <td style={{ padding: '0.5rem 0.75rem', color: 'var(--text-muted)', whiteSpace: 'nowrap' }}>
+                  {(() => {
+                    const raw = row.csm?.trim() ?? ''
+                    return raw ? (csmNameById[raw] ?? KNOWN_CSM_NAME_BY_ID[raw] ?? raw) : '—'
+                  })()}
+                </td>
                 <td style={{ padding: '0.5rem 0.75rem', color: 'var(--text)', whiteSpace: 'nowrap' }}>{row.subscription_end_date ?? '—'}</td>
+                <td
+                  style={{ textAlign: 'right', padding: '0.5rem 0.75rem', color: 'var(--text)', whiteSpace: 'nowrap' }}
+                  title={
+                    row.contracted_arr != null
+                      ? 'CARR = Live ARR + future Closed Won NB/Exp (service start after today).'
+                      : 'Renewal line total (API did not send contracted_arr).'
+                  }
+                >
+                  {fmtMoney(row.contracted_arr ?? row.total_arr)}
+                </td>
                 {products.map((p) => (
                   <td key={p} style={{ textAlign: 'right', padding: '0.5rem 0.75rem', color: 'var(--text)' }}>
-                    {fmtMoney(row.by_product[p] ?? 0)}
+                    {yesNo(row.by_product[p] ?? 0)}
                   </td>
                 ))}
-                <td style={{ textAlign: 'right', padding: '0.5rem 0.75rem', fontWeight: 600, color: 'var(--text)', position: 'sticky', right: 0, background: 'var(--bg)', zIndex: 0 }}>{fmtMoney(row.total_arr)}</td>
               </tr>
             ))}
           </tbody>
-          <tfoot>
-            <tr style={{ borderTop: '2px solid var(--border)', fontWeight: 600 }}>
-              <td style={{ padding: '0.5rem 0.75rem', color: 'var(--text)', position: 'sticky', left: 0, background: 'var(--surface)', zIndex: 1 }}>Total</td>
-              <td style={{ padding: '0.5rem 0.75rem' }} />
-              <td style={{ padding: '0.5rem 0.75rem' }} />
-              {products.map((p) => (
-                <td key={p} style={{ textAlign: 'right', padding: '0.5rem 0.75rem', color: 'var(--text)' }}>
-                  {fmtMoney(total_by_product[p] ?? 0)}
-                </td>
-              ))}
-              <td style={{ textAlign: 'right', padding: '0.5rem 0.75rem', color: 'var(--text)', position: 'sticky', right: 0, background: 'var(--surface)', zIndex: 1 }}>{fmtMoney(grand_total)}</td>
-            </tr>
-          </tfoot>
         </table>
       </div>
       {rows.length === 0 && (

@@ -7,6 +7,7 @@ import asyncio
 import calendar
 import json
 import logging
+import time
 import os
 import re
 from contextlib import asynccontextmanager
@@ -17,6 +18,7 @@ from typing import Any, List, Optional
 
 from dotenv import load_dotenv, dotenv_values
 from fastapi import FastAPI, Depends, HTTPException, Query
+from pydantic import BaseModel, Field
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -133,6 +135,7 @@ _ascension_ascend_cleanup_done = False
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await seed()
+    await asyncio.to_thread(_init_api_timing_log_file_on_startup)
     await _remove_ascension_ascend_overrides()
     await _remove_ascension_ascend_record_type_overrides()
     # Background task: hourly Salesforce sync at :59 EST (ARR + pipeline); daily EOD snapshot at 23:59 EST (for historical ARR + pipeline)
@@ -214,7 +217,73 @@ class RequireAppPasswordMiddleware(BaseHTTPMiddleware):
         return await call_next(request)
 
 
+def _api_timing_log_file_path() -> Optional[Path]:
+    """Optional log file; no terminal needed when set. See APITimingMiddleware docstring."""
+    raw = (os.getenv("API_TIMING_LOG_FILE") or "").strip()
+    if not raw or raw.lower() in ("0", "false", "no", "off"):
+        return None
+    base = Path(__file__).resolve().parent
+    if raw.lower() in ("1", "true", "yes"):
+        return base / "api_timing.log"
+    p = Path(raw)
+    if not p.is_absolute():
+        p = base / p
+    return p
+
+
+def _append_api_timing_line(path: Path, line: str) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now(EST).isoformat(timespec="milliseconds")
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(f"{ts} {line}\n")
+    except OSError:
+        pass
+
+
+def _init_api_timing_log_file_on_startup() -> None:
+    """Create/append a line so backend/api_timing.log exists when API_TIMING_LOG_FILE is set."""
+    log_path = _api_timing_log_file_path()
+    if log_path is None:
+        return
+    _append_api_timing_line(log_path, "--- backend started — timing log (see API_TIMING_LOG / SLOW_REQUEST_MS for console) ---")
+
+
+class APITimingMiddleware(BaseHTTPMiddleware):
+    """Log how long each /api request takes. Enable when profiling slowness.
+
+    Env:
+    - API_TIMING_LOG=1 (or true/all) — log every /api request with duration in ms (Uvicorn console).
+    - Otherwise log only if duration >= SLOW_REQUEST_MS (default 500).
+    - API_TIMING_LOG_FILE=1 (or true/yes) — append **every** /api request to backend/api_timing.log
+      (independent of console; no terminal needed). Or set to a path (backend-relative or absolute).
+    """
+
+    async def dispatch(self, request: Request, call_next):
+        path = request.url.path
+        if not path.startswith("/api/") or request.method == "OPTIONS":
+            return await call_next(request)
+        raw = (os.getenv("API_TIMING_LOG") or "").strip().lower()
+        log_all = raw in ("1", "true", "all", "yes")
+        try:
+            slow_ms = float(os.getenv("SLOW_REQUEST_MS") or "500")
+        except ValueError:
+            slow_ms = 500.0
+        t0 = time.perf_counter()
+        response = await call_next(request)
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        if log_all or elapsed_ms >= slow_ms:
+            logging.getLogger("api.timing").info("%s %s %.2fms", request.method, path, elapsed_ms)
+        log_path = _api_timing_log_file_path()
+        if log_path is not None:
+            # Never block the asyncio event loop with sync disk I/O (would stall all API responses).
+            line = f"{request.method} {path} {elapsed_ms:.2f}ms"
+            await asyncio.to_thread(_append_api_timing_line, log_path, line)
+        return response
+
+
 app.add_middleware(RequireAppPasswordMiddleware)
+app.add_middleware(APITimingMiddleware)
 
 # Ensure dashboard MTD endpoints never return 500/non-JSON (e.g. if get_db or any dependency fails)
 _DASHBOARD_MTD_PATHS = frozenset({"/api/dashboard/renewals-mtd", "/api/dashboard/cash-mtd", "/api/dashboard/bookings-mtd"})
@@ -412,18 +481,22 @@ async def copilot(body: CopilotRequest, db: AsyncSession = Depends(get_db)):
     # Total CARR / how much CARR
     if any(phrase in q_lower for phrase in ("total arr", "total carr", "how much arr", "how much carr", "what's our arr", "what's our carr", "what is our arr", "what is our carr", "total recurring", "arr as of", "carr as of", "arr on ", "carr on ")):
         return CopilotResponse(
-            answer=f"**Total CARR**{date_note} is **${grand_total:,.0f}** across **{len(rows)}** account(s).",
+            answer=f"**Total CARR**{date_note} is **${grand_total:,.0f}** (Live ARR on the schedule plus Closed Won New Business and Expansion ARR with service start after today).",
             sources=[source_label],
         )
 
     # Largest / biggest / top customer by ARR
     if any(phrase in q_lower for phrase in ("largest customer", "biggest customer", "top customer", "who is our largest", "largest account", "biggest account")):
         if rows:
-            top = rows[0]
+            rows_by_carr = sorted(
+                rows,
+                key=lambda x: -float(x.get("contracted_arr") or x.get("total_arr") or 0),
+            )
+            top = rows_by_carr[0]
             name = top.get("account_name") or "—"
-            arr = top.get("total_arr") or 0
+            arr = float(top.get("contracted_arr") or top.get("total_arr") or 0)
             return CopilotResponse(
-                answer=f"Your **largest customer** by CARR{date_note} is **{name}** with **${arr:,.0f} CARR.**",
+                answer=f"Your **largest customer** among renewal accounts by CARR{date_note} is **{name}** with **${arr:,.0f}** (column = Live ARR + future Closed Won NB/Exp for that account).",
                 sources=[source_label],
             )
         return CopilotResponse(
@@ -680,6 +753,15 @@ ARR_PRODUCT_COLUMNS = [
     "Add. MR/ IQ Locations",
     "iCampaign Platform",
 ]
+# Products purchased page only: no Add. CRM Seats / Add. MR/ IQ Locations.
+PRODUCTS_PURCHASED_SKIP_CANONICAL = frozenset({"Add. CRM Seats", "Add. MR/ IQ Locations"})
+PRODUCTS_PURCHASED_COLUMNS = [
+    "CRM Platform",
+    "CRM Billing Platform",
+    "MR Platform",
+    "IQ Platform",
+    "iCampaign Platform",
+]
 _ARR_PRODUCT_NORMALIZED = {p.strip().lower(): p for p in ARR_PRODUCT_COLUMNS}
 # Map raw Salesforce product names to canonical display names (view-only; calculation unchanged)
 _ARR_SF_TO_CANONICAL = {
@@ -758,6 +840,28 @@ def _is_crm_platform_legacy(product_name: str | None) -> bool:
         return False
     key = _arr_product_key(product_name)
     return "crm platform" in key and "legacy" in key
+
+
+def _crm_seats_for_opportunity_lines(opp_sf_id: str, lines: list) -> int:
+    """Additional CRM Seats quantities + 5 if any 'CRM Platform (Includes 5 Seats)' line (same rules as schedule)."""
+    oid = (opp_sf_id or "").strip()
+    seats = 0
+    has_platform_5 = False
+    for li in lines:
+        if (li.opportunity_sf_id or "").strip() != oid:
+            continue
+        if _is_additional_crm_seats(li.product_name):
+            try:
+                qty = int(float(li.quantity or 0))
+            except (TypeError, ValueError):
+                qty = 0
+            if qty:
+                seats += qty
+        elif _is_crm_platform_includes_5_seats(li.product_name):
+            has_platform_5 = True
+    if has_platform_5:
+        seats += 5
+    return seats
 
 
 def _match_arr_product(sf_product_name: str | None) -> str | None:
@@ -949,6 +1053,41 @@ def _line_items_to_arr_by_group(lines: list) -> list[tuple[str, str, float]]:
     return out
 
 
+def _products_purchased_line_bucket(li) -> str | None:
+    """Canonical column for Products purchased grid only; None = omit line."""
+    raw = _normalized_product_name(li.product_name)
+    full = li.product_name or ""
+    if not _include_line_item_in_arr(raw, full):
+        return None
+    canonical = _match_arr_product(full) or _match_arr_product(raw)
+    if canonical is None:
+        canonical = "Other"
+    if canonical in PRODUCTS_PURCHASED_SKIP_CANONICAL:
+        return None
+    return canonical
+
+
+def _line_items_to_products_purchased_by_group(lines: list) -> list[tuple[str, str, float]]:
+    """Like _line_items_to_arr_by_group but Products purchased columns (skips two add-on columns)."""
+    groups: dict[tuple[str, str], list] = {}
+    for li in lines:
+        bucket = _products_purchased_line_bucket(li)
+        if bucket is None:
+            continue
+        raw = _normalized_product_name(li.product_name)
+        pk = _arr_product_key(raw) or _arr_product_key(li.product_name) or bucket.lower().replace(".", "").replace(" ", "_")
+        key = (li.opportunity_sf_id, pk)
+        groups.setdefault(key, []).append(li)
+    out: list[tuple[str, str, float]] = []
+    for (opp_sf_id, _pk), items in groups.items():
+        b = _products_purchased_line_bucket(items[0])
+        if b is None:
+            continue
+        arr = _arr_contribution_for_line_group(items)
+        out.append((opp_sf_id, b, arr))
+    return out
+
+
 def _line_item_effective_total_dict(li: dict) -> float:
     """Same for line item dict (e.g. from EOD snapshot JSON). Respects USE_UNIT_PRICE_TIMES_QUANTITY_AS_MRR."""
     if _use_unit_price_times_quantity_as_mrr():
@@ -992,7 +1131,7 @@ DEFAULT_SEGMENT = "SMB/ MM"
 # Account Status = Account_Status__c; Segment = Segment__c (add Sub_Segment__c or other segment field here if your org has it).
 DEFAULT_ACCOUNT_SOQL = (
     "SELECT Id, Name, Type, Account_Status__c, Industry, AnnualRevenue, NumberOfEmployees, "
-    "BillingCountry, BillingCity, BillingState, Phone, Website, Segment__c, Account_Executive__c, "
+    "BillingCountry, BillingCity, BillingState, Phone, Website, Segment__c, Customer_Success_Manager__c, Customer_Success_Manager__r.Name, Account_Executive__c, "
     "Partner_Affiliate_Revenue_Share__c, Owner.Name, CreatedDate "
     "FROM Account ORDER BY Name"
 )
@@ -1093,6 +1232,16 @@ def _float_or_none(x) -> Optional[float]:
         return None
 
 
+def _opportunity_arr_c_from_record(rec: dict) -> Optional[float]:
+    """Salesforce Opportunity.ARR__c (renewed ARR for closed-won renewals)."""
+    if rec.get("ARR__c") is not None:
+        return _float_or_none(rec.get("ARR__c"))
+    for key, value in rec.items():
+        if key and key.lower() == "arr__c" and value is not None:
+            return _float_or_none(value)
+    return None
+
+
 def _original_acv_from_record(rec: dict) -> Optional[float]:
     """Get contracted ARR (UFR baseline) for an opportunity from Salesforce.
     Priority:
@@ -1152,6 +1301,32 @@ async def _run_salesforce_sync(db: AsyncSession) -> dict:
         account_records = await _salesforce_query_with_retry(connector, DEFAULT_ACCOUNT_SOQL)
     except Exception as e:
         return {"ok": False, "error": f"Accounts sync failed: {e}"}
+
+    # Resolve CSM user names for records where only Customer_Success_Manager__c (Id) is present.
+    csm_user_name_by_id: dict[str, str] = {}
+    csm_user_ids = {
+        (rec.get("Customer_Success_Manager__c") or "").strip()
+        for rec in account_records
+        if (rec.get("Customer_Success_Manager__c") or "").strip()
+    }
+    if csm_user_ids:
+        user_ids = sorted(csm_user_ids)
+        chunk_size = 200
+        for i in range(0, len(user_ids), chunk_size):
+            chunk = user_ids[i:i + chunk_size]
+            ids_list = ",".join(f"'{uid}'" for uid in chunk)
+            soql_users = f"SELECT Id, Name FROM User WHERE Id IN ({ids_list})"
+            try:
+                user_records = await _salesforce_query_with_retry(connector, soql_users)
+                for u in user_records:
+                    uid = (u.get("Id") or "").strip()
+                    uname = (u.get("Name") or "").strip()
+                    if uid and uname:
+                        csm_user_name_by_id[uid] = uname
+            except Exception:
+                # Non-fatal: fallback remains Id when name can't be resolved.
+                pass
+
     await db.execute(delete(Account))
     for rec in account_records:
         sf_id = rec.get("Id")
@@ -1167,6 +1342,13 @@ async def _run_salesforce_sync(db: AsyncSession) -> dict:
             owner_name = (owner_obj.get("Name") or owner_obj.get("name") or None)
         # Fallbacks in case SalesforceConnector flattens fields
         owner_name = owner_name or rec.get("Owner.Name") or rec.get("Owner_Name")
+        csm_id = (rec.get("Customer_Success_Manager__c") or "").strip() or None
+        csm_name = (
+            rec.get("Customer_Success_Manager__r_Name")
+            or rec.get("Customer_Success_Manager__r.Name")
+            or (csm_user_name_by_id.get(csm_id) if csm_id else None)
+            or csm_id
+        )
 
         acc = Account(
             sf_id=sf_id,
@@ -1182,6 +1364,7 @@ async def _run_salesforce_sync(db: AsyncSession) -> dict:
             phone=rec.get("Phone"),
             website=rec.get("Website"),
             segment=rec.get("Segment__c"),
+            customer_success_manager=csm_name,
             ae_owner=rec.get("Account_Executive__c"),
             partner_affiliate_revenue_share=(
                 float(rec.get("Partner_Affiliate_Revenue_Share__c"))
@@ -1227,6 +1410,7 @@ async def _run_salesforce_sync(db: AsyncSession) -> dict:
         record_type_name = (rt or "").strip() or None
         renewal_dt = _parse_date(rec.get(_SALESFORCE_RENEWAL_DATE_FIELD)) if use_renewal_date_field else None
         original_acv_val = _original_acv_from_record(rec)
+        opportunity_arr_val = _opportunity_arr_c_from_record(rec)
         expansion_arr_val = None
         if _SALESFORCE_EXPANSION_ARR_FIELD:
             direct = rec.get(_SALESFORCE_EXPANSION_ARR_FIELD)
@@ -1249,6 +1433,7 @@ async def _run_salesforce_sync(db: AsyncSession) -> dict:
             close_date=_parse_date(rec.get("CloseDate")),
             renewal_date=renewal_dt,
             original_acv=original_acv_val,
+            opportunity_arr=opportunity_arr_val,
             expansion_arr=expansion_arr_val,
             stage_name=rec.get("StageName"),
             type=rec.get("Type"),
@@ -1440,12 +1625,88 @@ async def list_eod_snapshots(db: AsyncSession = Depends(get_db)):
     }
 
 
+@app.get("/api/arr-schedule/schedule-breakdown")
+@app.get("/api/admin/arr-schedule-breakdown")
+async def arr_schedule_breakdown(
+    q: str = Query("12 south", description="Case-insensitive substring of Salesforce account name"),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Step-by-step Active ARR vs Contracted ARR for accounts whose name contains `q`.
+    Contracted = schedule Active as-of today + 12 calendar months (EST); Alleva share applies when enabled.
+
+    Registered at both `/api/arr-schedule/schedule-breakdown` (next to other schedule APIs) and
+    `/api/admin/arr-schedule-breakdown` for convenience.
+    """
+    needle = (q or "").strip()
+    if not needle:
+        return {"query": "", "matches": [], "message": "Pass a non-empty q= substring."}
+    diagnostic: list = []
+    await _compute_active_arr_rows(
+        db,
+        apply_alleva_retained_arr_adjustment=True,
+        diagnostic_account_name_substring=needle,
+        diagnostic_out=diagnostic,
+    )
+    return {"query": needle, "match_count": len(diagnostic), "matches": diagnostic}
+
+
+def _add_calendar_months(d: date, months: int) -> date:
+    """Add calendar months to d (day clamped to last valid day of target month)."""
+    m0 = d.month - 1 + months
+    y = d.year + m0 // 12
+    mo = m0 % 12 + 1
+    last = calendar.monthrange(y, mo)[1]
+    return date(y, mo, min(d.day, last))
+
+
+def _schedule_active_arr_as_of(
+    periods_with_arr: list[dict],
+    sub_start: Optional[date],
+    sub_end: Optional[date],
+    as_of: date,
+    anchor_arr: float,
+    expansions: list[dict],
+) -> float:
+    """Schedule Active ARR using the same closed-won period / anchor+expansion rules, on calendar date ``as_of`` (EST)."""
+    if periods_with_arr:
+        period_hit = next(
+            (p for p in periods_with_arr if p["start"] <= as_of <= p["end"]),
+            None,
+        )
+        if period_hit is not None:
+            return float(period_hit["arr"])
+        if sub_start is not None and as_of < sub_start:
+            return 0.0
+        if sub_end is not None and as_of > sub_end:
+            return 0.0
+        expansion_sum = sum(
+            float(exp["arr"])
+            for exp in expansions
+            if exp.get("close_date") and date.fromisoformat(exp["close_date"]) <= as_of
+        )
+        return round(float(anchor_arr) + expansion_sum, 2)
+    if sub_start is not None and as_of < sub_start:
+        return 0.0
+    if sub_end is not None and as_of > sub_end:
+        return 0.0
+    expansion_sum = sum(
+        float(exp["arr"])
+        for exp in expansions
+        if exp.get("close_date") and date.fromisoformat(exp["close_date"]) <= as_of
+    )
+    return round(float(anchor_arr) + expansion_sum, 2)
+
+
 async def _compute_active_arr_rows(
     db: AsyncSession,
     apply_alleva_retained_arr_adjustment: bool = False,
+    diagnostic_account_name_substring: Optional[str] = None,
+    diagnostic_out: Optional[list] = None,
 ) -> tuple[list[dict], Optional[str]]:
     """Compute active ARR rows (subscription start/end, ARR per account).
 
+    **contracted_arr** uses the same schedule rules as **active_arr** but with as-of date = today + 12 calendar months (EST).
     Used by active-arr and active-arr-by-month. The optional Alleva retained-ARR adjustment is applied only when
     the schedule should reflect partner-retained revenue; other endpoints should keep the original math.
     """
@@ -1456,6 +1717,11 @@ async def _compute_active_arr_rows(
         _ascension_ascend_cleanup_done = True
     overrides = await _get_record_type_overrides(db)
     active_arr_use_open_renewal = await _get_active_arr_account_overrides(db)
+    _diag_sub = (diagnostic_account_name_substring or "").strip().lower()
+    _want_diag = bool(_diag_sub and diagnostic_out is not None)
+
+    def _account_matches_diagnostic(name: str | None) -> bool:
+        return _want_diag and _diag_sub in (name or "").lower()
 
     def _opp_type(o) -> str:
         key = (o.sf_id or "").strip()
@@ -1919,48 +2185,71 @@ async def _compute_active_arr_rows(
             pre_anchor_base_arr[key] = round(nb_base, 2)
             pre_anchor_expansions[key] = pre_exp_list
             pre_anchor_arr[key] = round(nb_base + sum(e["arr"] for e in pre_exp_list), 2)
-        # Active ARR as of today: use period that contains today (reflects all closed-won NB + renewal periods)
+        # Active ARR as of today (EST): closed-won NB + renewal schedule, or anchor + expansions (same rules as before).
         periods_with_arr = account_periods_with_arr.get(key, [])
-        if periods_with_arr:
-            period_containing_today = next(
-                (p for p in periods_with_arr if p["start"] <= today_est <= p["end"]),
-                None,
-            )
-            if period_containing_today is not None:
-                active_arr_today = period_containing_today["arr"]
-            elif sub_start is not None and today_est < sub_start:
-                active_arr_today = 0.0
-            elif sub_end is not None and today_est > sub_end:
-                active_arr_today = 0.0
-            else:
-                expansion_arr_today = sum(
-                    exp["arr"]
-                    for exp in expansions
-                    if exp.get("close_date") and date.fromisoformat(exp["close_date"]) <= today_est
-                )
-                active_arr_today = round(anchor_arr + expansion_arr_today, 2)
-        elif sub_start is not None and today_est < sub_start:
-            active_arr_today = 0.0
-        elif sub_end is not None and today_est > sub_end:
-            active_arr_today = 0.0
-        else:
-            expansion_arr_today = sum(
-                exp["arr"]
-                for exp in expansions
-                if exp.get("close_date") and date.fromisoformat(exp["close_date"]) <= today_est
-            )
-            active_arr_today = round(anchor_arr + expansion_arr_today, 2)
+        period_containing_today = (
+            next((p for p in periods_with_arr if p["start"] <= today_est <= p["end"]), None)
+            if periods_with_arr
+            else None
+        )
+        active_arr_today = _schedule_active_arr_as_of(
+            periods_with_arr, sub_start, sub_end, today_est, anchor_arr, expansions
+        )
+        active_schedule_branch = "closed-won schedule / anchor+expansions evaluated as of today (America/New_York)"
+
+        expansion_arr_for_diag = sum(
+            float(exp["arr"])
+            for exp in expansions
+            if exp.get("close_date") and date.fromisoformat(exp["close_date"]) <= today_est
+        )
+        active_after_schedule = float(active_arr_today)
+        name_lower = (aname or "").strip().lower()
+        in_open_renewal_override = name_lower in active_arr_use_open_renewal
+        open_renewal_override_applied = in_open_renewal_override and not is_churned
+        # Manual override: Active ARR = open renewal line ARR.
+        if open_renewal_override_applied:
+            active_arr_today = renewal_arr_val
+        # Contracted ARR = same schedule definition as Active, but evaluated 12 calendar months after today (EST).
+        # Open-renewal override applies only to Active, not to Contracted (Contracted stays pure +12mo schedule view).
+        future_est = _add_calendar_months(today_est, 12)
+        contracted_arr_today = _schedule_active_arr_as_of(
+            periods_with_arr, sub_start, sub_end, future_est, anchor_arr, expansions
+        )
+        contracted_branch = (
+            f"same schedule rules as Active, as-of date +12 months ({future_est.isoformat()} EST)"
+        )
+        future_period_hit = (
+            next((p for p in periods_with_arr if p["start"] <= future_est <= p["end"]), None)
+            if periods_with_arr
+            else None
+        )
+        future_contract_period: dict | None = (
+            {
+                "start": future_period_hit["start"].isoformat(),
+                "end": future_period_hit["end"].isoformat(),
+                "arr": future_period_hit["arr"],
+                "as_of_plus_12mo": future_est.isoformat(),
+            }
+            if future_period_hit
+            else {"as_of_plus_12mo": future_est.isoformat(), "note": "no period contains the +12mo as-of date"}
+        )
         # Serialize periods for by-month and export (both closed-won NB and renewal terms)
         periods_serialized = [
             {"start": p["start"].isoformat(), "end": p["end"].isoformat(), "arr": p["arr"]}
             for p in periods_with_arr
         ]
+        active_before_churn = float(active_arr_today)
+        contracted_before_churn = float(contracted_arr_today)
         if is_churned:
             active_arr_today = 0.0
+            contracted_arr_today = 0.0
+        active_before_alleva = float(active_arr_today)
+        contracted_before_alleva = float(contracted_arr_today)
         # Alleva Customer adjustment:
         # For these accounts, a portion of the revenue stays with the partner (Alleva).
         # We apply this factor to both:
         # - schedule Active ARR (today)
+        # - schedule Contracted ARR (today)
         # - schedule monthly ARR (by_month)
         acct_type_norm = ((account_type_map.get(aid) if aid else None) or '').strip().lower()
         alleva_retained_factor: float | None = None
@@ -1984,7 +2273,62 @@ async def _compute_active_arr_rows(
             if share_factor is not None:
                 alleva_retained_factor = share_factor
                 active_arr_today = round(active_arr_today * share_factor, 2)
+                contracted_arr_today = round(contracted_arr_today * share_factor, 2)
         note = account_note.get(key)
+        if _account_matches_diagnostic(aname) and diagnostic_out is not None:
+            diagnostic_out.append(
+                {
+                    "as_of_date_est": today_est.isoformat(),
+                    "timezone": "America/New_York",
+                    "apply_alleva_retained_arr_adjustment": apply_alleva_retained_arr_adjustment,
+                    "account_id": aid,
+                    "account_name": aname or "—",
+                    "account_type": (account_type_map.get(aid) if aid else None),
+                    "status": status,
+                    "is_churned": is_churned,
+                    "schedule_note": note,
+                    "in_open_renewal_override_list": in_open_renewal_override,
+                    "open_renewal_line_arr": renewal_arr_val,
+                    "anchor_opportunity_arr": anchor_arr,
+                    "expansions_closed_won": expansions,
+                    "expansion_arr_sum_close_on_or_before_today": round(expansion_arr_for_diag, 2),
+                    "subscription_window": {
+                        "start": sub_start.isoformat() if sub_start else None,
+                        "end": sub_end.isoformat() if sub_end else None,
+                    },
+                    "closed_won_periods_with_arr": periods_serialized,
+                    "period_containing_today": (
+                        {
+                            "start": period_containing_today["start"].isoformat(),
+                            "end": period_containing_today["end"].isoformat(),
+                            "arr": period_containing_today["arr"],
+                        }
+                        if period_containing_today
+                        else None
+                    ),
+                    "active_arr_explanation": {
+                        "schedule_branch": active_schedule_branch,
+                        "value_after_schedule_only": round(active_after_schedule, 2),
+                        "open_renewal_override_applied": open_renewal_override_applied,
+                        "value_after_override_before_churn": round(active_before_churn, 2),
+                        "value_after_churn_before_alleva": round(active_before_alleva, 2),
+                        "alleva_retained_factor_applied": alleva_retained_factor,
+                        "final_active_arr": active_arr_today,
+                    },
+                    "contracted_arr_explanation": {
+                        "branch": contracted_branch,
+                        "future_period_used": future_contract_period,
+                        "value_before_churn": round(contracted_before_churn, 2),
+                        "value_after_churn_before_alleva": round(contracted_before_alleva, 2),
+                        "alleva_retained_factor_applied": alleva_retained_factor,
+                        "final_contracted_arr": round(contracted_arr_today, 2),
+                    },
+                    "products_purchased_note": (
+                        "Products purchased: Active ARR / Contracted ARR columns use this schedule row. "
+                        "Total / by-product $ come from open Renewal opps' line items only (not this breakdown)."
+                    ),
+                }
+            )
         crm_seats = crm_seats_by_account.get(key)
         crm_arr_val = crm_arr_by_account.get(key)
         out_rows.append({
@@ -1995,6 +2339,7 @@ async def _compute_active_arr_rows(
             "type": (account_type_map.get(aid) if aid else None),
             "segment": seg,
             "active_arr": active_arr_today,
+            "contracted_arr": round(contracted_arr_today, 2),
             "alleva_retained_factor": alleva_retained_factor,
             "crm_seats": crm_seats,
             "crm_arr": crm_arr_val,
@@ -2035,6 +2380,115 @@ async def _active_arr_by_account_id(db: AsyncSession) -> dict[str, float]:
     return out
 
 
+def _norm_sf_account_id(aid: str | None) -> str | None:
+    if not aid or not isinstance(aid, str):
+        return None
+    s = aid.strip()
+    return s or None
+
+
+def _norm_account_name_match(name: str | None) -> str | None:
+    """Lowercase, strip, collapse whitespace; None if missing or placeholder."""
+    if name is None or not isinstance(name, str):
+        return None
+    t = name.strip()
+    if not t or t == "—":
+        return None
+    return " ".join(t.split()).lower()
+
+
+def _sf_account_ids_match(a: str | None, b: str | None) -> bool:
+    aa = _norm_sf_account_id(a)
+    bb = _norm_sf_account_id(b)
+    if not aa or not bb:
+        return False
+    if aa == bb:
+        return True
+    if len(aa) >= 15 and len(bb) >= 15 and aa[:15] == bb[:15]:
+        return True
+    return False
+
+
+def _schedule_row_active_arr_value(sr: dict) -> float:
+    try:
+        return float(sr.get("active_arr") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _schedule_row_contracted_arr_value(sr: dict) -> float:
+    try:
+        v = sr.get("contracted_arr")
+        if v is not None:
+            return float(v)
+    except (TypeError, ValueError):
+        pass
+    return _schedule_row_active_arr_value(sr)
+
+
+def _pick_schedule_row_for_account(
+    schedule_rows: list[dict],
+    account_id: str | None,
+    account_name: str | None,
+    *,
+    official_account_name_norm: str | None = None,
+) -> dict | None:
+    """
+    Single schedule row for Products purchased / lookups. When multiple rows match by name, pick the one
+    with highest active_arr so active_arr and contracted_arr are read from the same row (not max(active) vs max(contracted)).
+    """
+    pid = _norm_sf_account_id(account_id)
+    pname = _norm_account_name_match(account_name)
+
+    if pid:
+        for sr in schedule_rows:
+            if _sf_account_ids_match(pid, sr.get("account_id")):
+                return sr
+
+    names_to_try = [n for n in (pname, official_account_name_norm) if n]
+    for try_name in names_to_try:
+        matches = [sr for sr in schedule_rows if _norm_account_name_match(sr.get("account_name")) == try_name]
+        if len(matches) == 1:
+            return matches[0]
+        for sr in matches:
+            if pid and _sf_account_ids_match(pid, sr.get("account_id")):
+                return sr
+        if matches:
+            return max(matches, key=lambda m: _schedule_row_active_arr_value(m))
+    return None
+
+
+def _active_arr_from_schedule_rows(
+    schedule_rows: list[dict],
+    account_id: str | None,
+    account_name: str | None,
+    *,
+    official_account_name_norm: str | None = None,
+) -> float:
+    """
+    Products purchased: use the exact same `rows` list as GET /api/arr-schedule/active-arr
+    (from _compute_active_arr_rows with Alleva adjustment). Scan that list — no separate index.
+    """
+    sr = _pick_schedule_row_for_account(
+        schedule_rows, account_id, account_name, official_account_name_norm=official_account_name_norm
+    )
+    return _schedule_row_active_arr_value(sr) if sr else 0.0
+
+
+def _contracted_arr_from_schedule_rows(
+    schedule_rows: list[dict],
+    account_id: str | None,
+    account_name: str | None,
+    *,
+    official_account_name_norm: str | None = None,
+) -> float:
+    """Products purchased: Contracted ARR from same schedule row as active (+12 month as-of date vs today)."""
+    sr = _pick_schedule_row_for_account(
+        schedule_rows, account_id, account_name, official_account_name_norm=official_account_name_norm
+    )
+    return _schedule_row_contracted_arr_value(sr) if sr else 0.0
+
+
 async def _arr_total_by_account_as_of(db: AsyncSession, as_of: date | None) -> dict[str, float]:
     """
     Map Salesforce account_id -> ARR as of a specific date based on the ARR schedule:
@@ -2054,22 +2508,73 @@ async def _arr_total_by_account_as_of(db: AsyncSession, as_of: date | None) -> d
     return out
 
 
+class ArrBreakdownPostBody(BaseModel):
+    """Admin ARR breakdown: JSON body so proxies cannot drop query params."""
+
+    q: str = Field(min_length=1, max_length=500, description="Substring of Salesforce account name (case-insensitive)")
+
+
+async def _arr_schedule_breakdown_payload(db: AsyncSession, needle: str) -> dict:
+    diagnostic: list = []
+    await _compute_active_arr_rows(
+        db,
+        apply_alleva_retained_arr_adjustment=True,
+        diagnostic_account_name_substring=needle.strip(),
+        diagnostic_out=diagnostic,
+    )
+    return {"query": needle.strip(), "match_count": len(diagnostic), "matches": diagnostic, "breakdown_only": True}
+
+
+@app.post("/api/arr-schedule/arr-breakdown")
+async def post_arr_schedule_arr_breakdown(
+    body: ArrBreakdownPostBody,
+    db: AsyncSession = Depends(get_db),
+):
+    """Admin: same response as GET active-arr?breakdown_q= (POST avoids caches/proxies dropping query strings)."""
+    return await _arr_schedule_breakdown_payload(db, body.q)
+
+
 @app.get("/api/arr-schedule/active-arr")
-async def get_arr_schedule_active_arr(db: AsyncSession = Depends(get_db)):
+async def get_arr_schedule_active_arr(
+    breakdown_q: Optional[str] = Query(
+        None,
+        description=(
+            "Admin only: if set, returns only step-by-step Active/Contracted breakdown for accounts "
+            "whose name contains this substring (same payload as /api/arr-schedule/schedule-breakdown)."
+        ),
+    ),
+    db: AsyncSession = Depends(get_db),
+):
     """
     Active ARR by account. Simplified logic:
     - Regular: Active ARR = ARR of most recent closed-won renewal or new business + expansions since then.
       Subscription start/end from that most recent closed-won renewal or NB opp.
     - If no closed renewal/NB (only an open renewal): note flags it; Active ARR = ARR from that open renewal;
       subscription start = null, subscription end = close date of that open renewal.
-    Classification: Opportunity Record Type (RecordType.Name → o.record_type_name). Overrides applied. Renewal ARR = open renewal opps only. Delta = Active ARR − Renewal ARR.
+    Each row also includes **contracted_arr**: **same schedule rules as Active ARR**, evaluated on a date
+    **12 calendar months after today** (America/New_York), with no open-renewal override applied to Contracted.
+    Response also includes **crm_seats_live_total** and **contracted_crm_seats_total** (live seats + CRM seats on
+    future Closed Won NB/Expansion, same cohort as Products purchased Contracted ARR).
+    Classification: Opportunity Record Type (RecordType.Name → o.record_type_name). Overrides applied to Active only. Renewal ARR = open renewal opps only. Delta = Active ARR − Renewal ARR.
+
+    When **breakdown_q** is non-empty, skips the full table and returns only **{ query, match_count, matches }**
+    for the Admin ARR breakdown tool (reuses this stable route so proxies/old deploys without schedule-breakdown still work).
     """
+    needle = (breakdown_q or "").strip()
+    if needle:
+        return await _arr_schedule_breakdown_payload(db, needle)
     out_rows, base_url = await _compute_active_arr_rows(db, apply_alleva_retained_arr_adjustment=True)
     out_rows.sort(key=lambda x: -x["active_arr"])
     grand_total = round(sum(r["active_arr"] for r in out_rows), 2)
+    live_crm_seats_total = sum(int(r.get("crm_seats") or 0) for r in out_rows)
+    today_est = datetime.now(EST).date()
+    future_seats, _ = await _future_start_closed_won_nb_exp_crm_seats_by_account(db, today_est)
+    contracted_crm_seats_total = int(live_crm_seats_total) + int(future_seats)
     return {
         "rows": out_rows,
         "grand_total": grand_total,
+        "crm_seats_live_total": live_crm_seats_total,
+        "contracted_crm_seats_total": contracted_crm_seats_total,
         "salesforce_base_url": base_url,
     }
 
@@ -2729,7 +3234,11 @@ async def _get_active_arr_account_overrides(db: AsyncSession) -> set[str]:
 @app.get("/api/health")
 async def health():
     """No auth. Returns 200 so the frontend can check backend reachability before login."""
-    return {"ok": True}
+    return {
+        "ok": True,
+        # Admin ARR breakdown: POST /api/arr-schedule/arr-breakdown or GET active-arr?breakdown_q=
+        "features": {"arr_breakdown_post": True, "arr_breakdown_query_param": True},
+    }
 
 
 @app.get("/api/auth/check")
@@ -2890,6 +3399,141 @@ async def _closed_won_arr_in_range(
     return nb + exp, nb, exp
 
 
+def _earliest_included_line_start_for_opp(o, lines: list) -> date | None:
+    """Min service_start_date among ARR line items; else opportunity contract_start_date."""
+    dates: list[date] = []
+    for li in lines:
+        if li.opportunity_sf_id != o.sf_id:
+            continue
+        raw = _normalized_product_name(li.product_name)
+        if not _include_line_item_in_arr(raw, li.product_name):
+            continue
+        if li.service_start_date:
+            dates.append(li.service_start_date)
+    if dates:
+        return min(dates)
+    return o.contract_start_date
+
+
+def _closed_won_pipeline_opp_arr_from_lines(opp_sf_id: str, lines: list) -> float:
+    """ARR from product lines (same filter as bookings closed-won)."""
+    t = 0.0
+    for li in lines:
+        if li.opportunity_sf_id != opp_sf_id:
+            continue
+        raw = _normalized_product_name(li.product_name)
+        if not _include_line_item_in_arr(raw, li.product_name):
+            continue
+        t += _line_item_effective_total(li) * PIPELINE_ARR_MULTIPLIER
+    return round(t, 2)
+
+
+def _future_arr_lookup_for_account(
+    future_by_account: dict[tuple[str | None, str | None], float],
+    aid: str | None,
+    aname: str | None,
+) -> float:
+    """Match future closed-won ARR to a renewal row by account id / name."""
+    if (aid, aname) in future_by_account:
+        return float(future_by_account[(aid, aname)])
+    for (k_aid, _k_aname), val in future_by_account.items():
+        if _sf_account_ids_match(aid, k_aid):
+            return float(val)
+    return 0.0
+
+
+async def _future_start_closed_won_nb_exp_arr_by_account(
+    db: AsyncSession,
+    as_of: date,
+) -> tuple[float, dict[tuple[str | None, str | None], float]]:
+    """
+    Closed Won New Business + Expansion opportunities whose service (earliest included line start,
+    else contract_start_date) is strictly after ``as_of`` (America/New_York calendar date).
+    Returns (total ARR, per-account map keyed by (account_id, account_name)).
+    """
+    q = select(Opportunity).where(Opportunity.stage_name.isnot(None))
+    r = await db.execute(q)
+    closed_won_opps = [
+        o
+        for o in r.scalars().all()
+        if _is_closed_won_stage(o.stage_name)
+        and _is_pipeline_record_type(o.record_type_name)
+        and not _is_excluded_from_bookings(o)
+    ]
+    if not closed_won_opps:
+        return 0.0, {}
+    sf_ids = {o.sf_id for o in closed_won_opps if o.sf_id}
+    if not sf_ids:
+        return 0.0, {}
+    q_lines = select(OpportunityLineItem).where(OpportunityLineItem.opportunity_sf_id.in_(sf_ids))
+    r_lines = await db.execute(q_lines)
+    all_lines = list(r_lines.scalars().all())
+    by_opp: dict[str, list] = {}
+    for li in all_lines:
+        oid = li.opportunity_sf_id
+        by_opp.setdefault(oid, []).append(li)
+    out: dict[tuple[str | None, str | None], float] = {}
+    total = 0.0
+    for o in closed_won_opps:
+        lines = by_opp.get(o.sf_id, [])
+        earliest = _earliest_included_line_start_for_opp(o, lines)
+        if earliest is None or earliest <= as_of:
+            continue
+        arr = _closed_won_pipeline_opp_arr_from_lines(o.sf_id, lines)
+        if arr <= 0:
+            continue
+        key = (o.account_id, o.account_name or None)
+        out[key] = out.get(key, 0.0) + arr
+        total += arr
+    rounded = {k: round(v, 2) for k, v in out.items()}
+    return round(total, 2), rounded
+
+
+async def _future_start_closed_won_nb_exp_crm_seats_by_account(
+    db: AsyncSession,
+    as_of: date,
+) -> tuple[int, dict[tuple[str | None, str | None], int]]:
+    """
+    Same Closed Won New Business + Expansion cohort as future ARR (service start after ``as_of``),
+    but sum CRM seats from line items (Additional CRM Seats qty + 5 per Platform Includes 5 Seats).
+    """
+    q = select(Opportunity).where(Opportunity.stage_name.isnot(None))
+    r = await db.execute(q)
+    closed_won_opps = [
+        o
+        for o in r.scalars().all()
+        if _is_closed_won_stage(o.stage_name)
+        and _is_pipeline_record_type(o.record_type_name)
+        and not _is_excluded_from_bookings(o)
+    ]
+    if not closed_won_opps:
+        return 0, {}
+    sf_ids = {o.sf_id for o in closed_won_opps if o.sf_id}
+    if not sf_ids:
+        return 0, {}
+    q_lines = select(OpportunityLineItem).where(OpportunityLineItem.opportunity_sf_id.in_(sf_ids))
+    r_lines = await db.execute(q_lines)
+    all_lines = list(r_lines.scalars().all())
+    by_opp: dict[str, list] = {}
+    for li in all_lines:
+        oid = li.opportunity_sf_id
+        by_opp.setdefault(oid, []).append(li)
+    out: dict[tuple[str | None, str | None], int] = {}
+    total = 0
+    for o in closed_won_opps:
+        lines = by_opp.get(o.sf_id, [])
+        earliest = _earliest_included_line_start_for_opp(o, lines)
+        if earliest is None or earliest <= as_of:
+            continue
+        seats = _crm_seats_for_opportunity_lines(o.sf_id, lines)
+        if seats <= 0:
+            continue
+        key = (o.account_id, o.account_name or None)
+        out[key] = out.get(key, 0) + seats
+        total += seats
+    return total, out
+
+
 def _open_pipeline_arr_from_opps(
     open_opps: list, opp_to_arr_from_lines: dict[str, float]
 ) -> tuple[float, float]:
@@ -2995,21 +3639,38 @@ async def _closed_won_renewal_expansion_arr_in_range(
     return round(total, 2)
 
 
+def _renewal_ufr_original_arr(o: Opportunity) -> float:
+    """UFR = Original_ARR__c (stored on Opportunity.original_acv by sync)."""
+    v = getattr(o, "original_acv", None)
+    return float(v) if v is not None else 0.0
+
+
+def _renewal_renewed_arr_c(o: Opportunity) -> float:
+    """Renewed ARR for closed-won renewals = ARR__c (stored on Opportunity.opportunity_arr)."""
+    v = getattr(o, "opportunity_arr", None)
+    return float(v) if v is not None else 0.0
+
+
 async def _renewals_metrics_in_range(
     db: AsyncSession,
     first_day: date,
     last_day: date,
+    *,
+    overrides: Optional[dict[str, str]] = None,
 ) -> tuple[float, float, float, float, float, Optional[float]]:
     """Return (total, renewed, open, churn, contracted, renewal_rate_pct) for renewals with renewal_date in [first_day, last_day].
-    Definitions (consistent with Renewals overview):
-    - Up for renewal (total) = sum of all UFR ARR for opps with renewal date in month
-    - Open = UFR ARR for opps not closed won yet (open stage)
-    - Churned = UFR ARR for all closed lost
-    - Contracted = sum of |delta| for closed won with negative delta (UFR - renewed)
-    - Renewed = sum of UFR for closed won with 0 or positive delta (renewed amount when no contraction)
-    Then total = open + churned + contracted + renewed. Renewal rate = renewed / total (up for renewal) * 100.
+
+    Definitions:
+    - UFR (total and per-row buckets) = Original_ARR__c (Opportunity.original_acv) for each renewal opp in range.
+    - Closed Lost: renewed ARR = 0; churn bucket += UFR.
+    - Closed Won: renewed ARR = ARR__c (Opportunity.opportunity_arr); contraction += max(0, UFR - ARR__c).
+    - Open: renewed = 0; open bucket += UFR.
+    - Renewal rate = sum(renewed ARR for Closed Won) / sum(UFR) * 100.
+
+    Note: open + churn + contraction + renewed does not necessarily equal total when ARR__c > UFR (expansion).
     """
-    overrides = await _get_record_type_overrides(db)
+    if overrides is None:
+        overrides = await _get_record_type_overrides(db)
 
     def _effective_record_type(o: Opportunity) -> str:
         key = (o.sf_id or "").strip()
@@ -3026,61 +3687,32 @@ async def _renewals_metrics_in_range(
     if not in_range:
         return 0.0, 0.0, 0.0, 0.0, 0.0, None
 
-    # ARR as of today (Schedule) for open renewals
-    active_arr_by_account_today = await _active_arr_by_account_id(db)
-
-    # ARR as of each renewal date for closed renewals: use ARR schedule snapshots on/around that date
-    unique_dates: set[date] = set()
-    for o in in_range:
-        rd = _renewal_date(o)
-        if rd:
-            unique_dates.add(rd)
-    arr_by_account_and_date: dict[tuple[date, str], float] = {}
-    for d in unique_dates:
-        arr_by_account = await _arr_total_by_account_as_of(db, d)
-        for aid, val in arr_by_account.items():
-            arr_by_account_and_date[(d, aid)] = val
-
-    sf_ids = {o.sf_id for o in in_range}
-    opp_to_arr = await _compute_arr_from_line_items(db, sf_ids)
     open_arr = 0.0
     churned = 0.0
     contracted = 0.0
     renewed = 0.0
+    total = 0.0
     for o in in_range:
-        arr_from_lines = opp_to_arr.get(o.sf_id, 0)
+        ufr = _renewal_ufr_original_arr(o)
+        total += ufr
         stage = (o.stage_name or "").strip()
-        rd = _renewal_date(o)
-        acct_id = o.account_id or ""
-        snapshot_ufr = 0.0
-        if rd and acct_id:
-            snapshot_ufr = arr_by_account_and_date.get((rd, acct_id), 0.0)
-
         if stage == "Closed Won":
-            # UFR ARR = ARR that was active as of the renewal date (Schedule), falling back to Original ACV then line items.
-            ufr_val = float(o.original_acv) if getattr(o, "original_acv", None) is not None else None
-            base_ufr = snapshot_ufr if snapshot_ufr > 0 else (ufr_val if ufr_val is not None else arr_from_lines)
-            ufr = base_ufr or 0
-            renewed_arr = arr_from_lines
-            delta = renewed_arr - ufr
-            if delta >= 0:
-                renewed += ufr
-            else:
-                contracted += -delta  # UFR - renewed
-                renewed += renewed_arr  # renewed part (so contracted + renewed = UFR for this opp)
+            r_amt = _renewal_renewed_arr_c(o)
+            renewed += r_amt
+            contracted += max(0.0, ufr - r_amt)
         elif stage == "Closed Lost":
-            # Closed Lost: UFR ARR from ARR schedule as of renewal date; fall back to line items.
-            ufr = snapshot_ufr if snapshot_ufr > 0 else arr_from_lines
             churned += ufr
         else:
-            # Open renewals: Up for renewal ARR = Active ARR as of today (Schedule definition) when available;
-            # fall back to line-item ARR when Schedule has no entry for this account.
-            today_ufr = active_arr_by_account_today.get(acct_id, 0.0)
-            ufr = today_ufr if today_ufr > 0 else arr_from_lines
             open_arr += ufr
-    # Total = sum of all UFR in period; must equal open + churned + contracted + renewed
-    total = open_arr + churned + contracted + renewed
+
+    total = round(total, 2)
+    renewed = round(renewed, 2)
+    open_arr = round(open_arr, 2)
+    churned = round(churned, 2)
+    contracted = round(contracted, 2)
     renewal_rate_pct = (renewed / total * 100) if total > 0 else None
+    if renewal_rate_pct is not None:
+        renewal_rate_pct = round(renewal_rate_pct, 2)
     return total, renewed, open_arr, churned, contracted, renewal_rate_pct
 
 
@@ -3496,10 +4128,12 @@ async def _get_dashboard_renewals_mtd_impl(db: AsyncSession) -> RenewalsMTDRespo
     if plan_message is None and plan_source and all(plan_renewal_rate_by_month[i] is None for i in range(12)) and q_rr_plan is None:
         plan_message = "Renewal rate plan: add values in row 52 at BU (Jan), BV (Feb), X (Q1), then re-sync sheet."
 
-    prev_t, prev_r, prev_o, prev_ch, prev_cont, prev_rr = await _renewals_metrics_in_range(db, prev_first, prev_last)
-    prev2_t, prev2_r, prev2_o, prev2_ch, prev2_cont, prev2_rr = await _renewals_metrics_in_range(db, prev2_first, prev2_last)
-    mtd_t, mtd_r, mtd_o, mtd_ch, mtd_cont, mtd_rr = await _renewals_metrics_in_range(db, first_of_month, current_mtd_last)
-    qtd_t, qtd_r, qtd_o, qtd_ch, qtd_cont, qtd_rr = await _renewals_metrics_in_range(db, qtd_first, qtd_last)
+    rt_overrides = await _get_record_type_overrides(db)
+    kw = {"overrides": rt_overrides}
+    prev_t, prev_r, prev_o, prev_ch, prev_cont, prev_rr = await _renewals_metrics_in_range(db, prev_first, prev_last, **kw)
+    prev2_t, prev2_r, prev2_o, prev2_ch, prev2_cont, prev2_rr = await _renewals_metrics_in_range(db, prev2_first, prev2_last, **kw)
+    mtd_t, mtd_r, mtd_o, mtd_ch, mtd_cont, mtd_rr = await _renewals_metrics_in_range(db, first_of_month, current_mtd_last, **kw)
+    qtd_t, qtd_r, qtd_o, qtd_ch, qtd_cont, qtd_rr = await _renewals_metrics_in_range(db, qtd_first, qtd_last, **kw)
 
     prev_m = (month - 2 + 12) % 12
     prev2_m = (month - 3 + 12) % 12
@@ -3961,7 +4595,15 @@ async def get_arr_by_account(db: AsyncSession = Depends(get_db)):
 
 
 async def _get_arr_by_account_product_data(db: AsyncSession) -> dict:
-    """Compute ARR by account and product (open renewals only). Shared by GET and export."""
+    """Compute ARR by account and product (open renewals for product columns). CARR (grand_total, contracted_arr) = Live ARR + future NB/Exp Closed Won."""
+    products = list(PRODUCTS_PURCHASED_COLUMNS) + ["Other"]
+    today_est = datetime.now(EST).date()
+
+    schedule_rows, _ = await _compute_active_arr_rows(db, apply_alleva_retained_arr_adjustment=True)
+    live_grand = round(sum(float(r.get("active_arr") or 0) for r in schedule_rows), 2)
+    future_total, future_by_account = await _future_start_closed_won_nb_exp_arr_by_account(db, today_est)
+    carr_grand = round(live_grand + future_total, 2)
+
     q_open = select(Opportunity).where(
         Opportunity.stage_name.isnot(None),
         ~Opportunity.stage_name.in_(CLOSED_STAGES),
@@ -3973,7 +4615,12 @@ async def _get_arr_by_account_product_data(db: AsyncSession) -> dict:
     opp_to_account = {o.sf_id: (o.account_id, o.account_name or None) for o in renewal_opps}
 
     if not renewal_sf_ids:
-        return {"products": [], "rows": [], "total_by_product": {}, "grand_total": 0.0}
+        return {
+            "products": products,
+            "rows": [],
+            "total_by_product": {p: 0.0 for p in products},
+            "grand_total": carr_grand,
+        }
 
     q_lines = select(OpportunityLineItem).where(
         OpportunityLineItem.opportunity_sf_id.in_(renewal_sf_ids)
@@ -3981,9 +4628,8 @@ async def _get_arr_by_account_product_data(db: AsyncSession) -> dict:
     r_lines = await db.execute(q_lines)
     lines = r_lines.scalars().all()
 
-    products = list(ARR_PRODUCT_COLUMNS) + ["Other"]
     by_account_product: dict[tuple[str | None, str | None], dict[str, float]] = {}
-    for opp_sf_id, canonical, arr in _line_items_to_arr_by_group(lines):
+    for opp_sf_id, canonical, arr in _line_items_to_products_purchased_by_group(lines):
         acc = opp_to_account.get(opp_sf_id)
         if not acc:
             continue
@@ -3997,32 +4643,99 @@ async def _get_arr_by_account_product_data(db: AsyncSession) -> dict:
         if key not in account_end_date or (o.close_date and (not account_end_date[key] or o.close_date > account_end_date[key])):
             account_end_date[key] = o.close_date
 
-    # Load segment per account for rows
+    # Load segment + CSM per account for rows
     account_ids = {aid for (aid, _) in by_account_product.keys() if aid}
-    account_segment: dict[str, str | None] = {}
+    account_meta: dict[str, tuple[str | None, str | None]] = {}
     if account_ids:
-        q_acc = select(Account.sf_id, Account.segment).where(Account.sf_id.in_(account_ids))
+        q_acc = select(Account.sf_id, Account.segment, Account.customer_success_manager).where(Account.sf_id.in_(account_ids))
         r_acc = await db.execute(q_acc)
-        for (sf_id, seg) in r_acc.all():
-            account_segment[sf_id] = seg
+        for (sf_id, seg, csm) in r_acc.all():
+            account_meta[sf_id] = (seg, csm)
+
+    # Fail-safe only for Customer overview:
+    # if CSM values are still Salesforce User IDs, resolve to User.Name live.
+    csm_name_by_id: dict[str, str] = {}
+    sf_user_id_re = re.compile(r"^005[a-zA-Z0-9]{12}(?:[a-zA-Z0-9]{3})?$")
+    csm_ids_to_resolve = sorted({
+        (csm or "").strip()
+        for (_seg, csm) in account_meta.values()
+        if (csm or "").strip() and sf_user_id_re.match((csm or "").strip())
+    })
+    if csm_ids_to_resolve:
+        try:
+            connector = SalesforceConnector()
+            chunk_size = 200
+            for i in range(0, len(csm_ids_to_resolve), chunk_size):
+                chunk = csm_ids_to_resolve[i:i + chunk_size]
+                ids_list = ",".join(f"'{uid}'" for uid in chunk)
+                soql_users = f"SELECT Id, Name FROM User WHERE Id IN ({ids_list})"
+                user_records = await asyncio.to_thread(connector.query, soql_users)
+                for u in user_records:
+                    uid = (u.get("Id") or "").strip()
+                    uname = (u.get("Name") or "").strip()
+                    if uid and uname:
+                        csm_name_by_id[uid] = uname
+        except Exception:
+            # Non-fatal: keep original csm values if live lookup fails.
+            pass
+
+    # Resolve opp Account Id / name vs synced Account (renewals may omit Id or use a different opp name string).
+    name_lower_to_account_sf_id: dict[str, str] = {}
+    sf_id_to_official_name_norm: dict[str, str] = {}
+    r_names = await db.execute(select(Account.sf_id, Account.name))
+    for acc_sf_id, acc_nm in r_names.all():
+        aid_k = _norm_sf_account_id(acc_sf_id)
+        nk = _norm_account_name_match(acc_nm)
+        if nk:
+            if nk not in name_lower_to_account_sf_id:
+                name_lower_to_account_sf_id[nk] = acc_sf_id
+            if aid_k:
+                sf_id_to_official_name_norm[aid_k] = nk
+                if len(aid_k) == 18:
+                    sf_id_to_official_name_norm[aid_k[:15]] = nk
 
     total_by_product: dict[str, float] = {p: 0.0 for p in products}
     rows = []
-    grand_total = 0.0
     for (aid, aname), by_product in by_account_product.items():
         by_product_arr = {p: round(by_product.get(p, 0), 2) for p in products}  # already ARR (period-weighted when term_months present)
         for p in products:
             total_by_product[p] = total_by_product.get(p, 0) + by_product_arr.get(p, 0)
         total_arr = round(sum(by_product_arr.values()), 2)
-        grand_total += total_arr
-        seg = account_segment.get(aid) if aid else None
+        seg = account_meta.get(aid)[0] if aid and aid in account_meta else None
         seg = (seg or "").strip() or DEFAULT_SEGMENT
+        csm = account_meta.get(aid)[1] if aid and aid in account_meta else None
+        csm = (csm or "").strip() or "—"
+        csm = csm_name_by_id.get(csm, csm)
         end_d = account_end_date.get((aid, aname))
+        lookup_aid = aid
+        if not _norm_sf_account_id(lookup_aid) and aname:
+            nk_acc = _norm_account_name_match(aname)
+            if nk_acc and nk_acc in name_lower_to_account_sf_id:
+                lookup_aid = name_lower_to_account_sf_id[nk_acc]
+        la = _norm_sf_account_id(lookup_aid)
+        official_nm = None
+        if la:
+            official_nm = sf_id_to_official_name_norm.get(la)
+            if official_nm is None and len(la) == 18:
+                official_nm = sf_id_to_official_name_norm.get(la[:15])
+        active_val = round(
+            _active_arr_from_schedule_rows(
+                schedule_rows,
+                lookup_aid,
+                aname,
+                official_account_name_norm=official_nm,
+            ),
+            2,
+        )
+        fut_part = _future_arr_lookup_for_account(future_by_account, lookup_aid or aid, aname)
         rows.append({
             "account_id": aid,
             "account_name": aname or "—",
             "segment": seg,
+            "csm": csm,
             "subscription_end_date": end_d.isoformat() if end_d else None,
+            "active_arr": active_val,
+            "contracted_arr": round(active_val + fut_part, 2),
             "by_product": {p: by_product_arr.get(p, 0) for p in products},
             "total_arr": total_arr,
         })
@@ -4032,7 +4745,7 @@ async def _get_arr_by_account_product_data(db: AsyncSession) -> dict:
         "products": products,
         "rows": rows,
         "total_by_product": total_by_product,
-        "grand_total": round(grand_total, 2),
+        "grand_total": carr_grand,
     }
 
 
@@ -4156,14 +4869,57 @@ async def _get_arr_data_for_date(db: AsyncSession, as_of_date: date | None) -> t
 async def get_arr_by_account_product(db: AsyncSession = Depends(get_db)):
     """
     ARR by account with product columns (open renewals only). total_price from SF = MRR; ARR = MRR * 12.
-    Returns: products (column order), rows (account_name, by_product, total_arr), total_by_product, grand_total.
+    Returns: products (column order), rows (account_name, by_product, total_arr, active_arr, contracted_arr),
+    total_by_product, grand_total.
+    **Contracted ARR (CARR) per row** = Live ARR (schedule) + Closed Won New Business/Expansion ARR whose
+    service start is **after today** (EST). **grand_total** = sum of Live ARR across all accounts on the schedule
+    plus that future closed-won ARR (company total).
     Optional salesforce_base_url when SALESFORCE_BASE_URL is set (for account links).
     """
     data = await _get_arr_by_account_product_data(db)
     base = os.getenv("SALESFORCE_BASE_URL", "").strip().rstrip("/")
     if base and ("salesforce.com" in base or "lightning.force.com" in base):
         data["salesforce_base_url"] = base
-    return data
+    # Avoid stale grids when a CDN/browser caches GET (Products purchased columns come from this payload).
+    return JSONResponse(content=data, headers={"Cache-Control": "no-store, must-revalidate"})
+
+
+@app.post("/api/salesforce/users/by-ids")
+async def get_salesforce_users_by_ids(payload: dict):
+    """
+    Resolve Salesforce User IDs to names (table-level UI fallback).
+    Body: { "ids": ["005...", ...] }
+    """
+    raw_ids = payload.get("ids") if isinstance(payload, dict) else None
+    if not isinstance(raw_ids, list):
+        return {"ok": False, "error": "ids must be a list", "users": {}}
+
+    sf_user_id_re = re.compile(r"^005[a-zA-Z0-9]{12}(?:[a-zA-Z0-9]{3})?$")
+    ids = sorted({str(i).strip() for i in raw_ids if str(i).strip() and sf_user_id_re.match(str(i).strip())})
+    if not ids:
+        return {"ok": True, "users": {}}
+
+    try:
+        connector = SalesforceConnector()
+    except Exception as e:
+        return {"ok": False, "error": f"Salesforce connector not available: {e}", "users": {}}
+
+    users: dict[str, str] = {}
+    chunk_size = 200
+    for i in range(0, len(ids), chunk_size):
+        chunk = ids[i:i + chunk_size]
+        ids_list = ",".join(f"'{uid}'" for uid in chunk)
+        soql = f"SELECT Id, Name FROM User WHERE Id IN ({ids_list})"
+        try:
+            recs = await asyncio.to_thread(connector.query, soql)
+            for rec in recs:
+                uid = (rec.get("Id") or "").strip()
+                name = (rec.get("Name") or "").strip()
+                if uid and name:
+                    users[uid] = name
+        except Exception:
+            continue
+    return {"ok": True, "users": users}
 
 
 @app.post("/api/export/arr-to-google-sheet")
@@ -4180,17 +4936,19 @@ async def export_arr_to_google_sheet(db: AsyncSession = Depends(get_db)):
     total_by_product = data["total_by_product"]
     grand_total = data["grand_total"]
 
-    # Build sheet rows: header (Account, Segment, products..., Total CARR), data rows, total row
-    header = ["Account", "Segment"] + products + ["Total CARR"]
+    # Build sheet rows: header (Account, Segment, products..., Contracted ARR), data rows, total row
+    header = ["Account", "Segment"] + products + ["Contracted ARR"]
+    # CARR total = Live ARR + future Closed Won NB/Exp (global); footer matches API grand_total).
+    contracted_sum = round(float(grand_total or 0), 2)
     values = [header]
     for r in rows_data:
         values.append(
             [r["account_name"], (r.get("segment") or "").strip() or DEFAULT_SEGMENT]
             + [r["by_product"].get(p, 0) for p in products]
-            + [r["total_arr"]]
+            + [round(float(r.get("contracted_arr") or r.get("total_arr") or 0), 2)]
         )
     values.append(
-        ["Total", ""] + [total_by_product.get(p, 0) for p in products] + [grand_total]
+        ["Total", ""] + [total_by_product.get(p, 0) for p in products] + [contracted_sum]
     )
 
     backend_dir = Path(__file__).resolve().parent
@@ -4922,8 +5680,8 @@ async def get_renewals_overview(
 ):
     """
     All renewal opportunities (open + Closed Won + Closed Lost). Record type = Renewal only.
-    Renewal date = Opportunity.renewal_date (if set, e.g. from Renewal_Date__c) else close_date.
-    Same filters and response shape as closed-overview. ARR from product line items (excl. iVerify/Kipu).
+    Renewal date = Opportunity.renewal_date (if set) else close_date.
+    UFR = Original_ARR__c (original_acv). Renewed ARR = ARR__c (opportunity_arr) for Closed Won; 0 otherwise.
     """
     def _renewal_date(o) -> date | None:
         return o.renewal_date if (getattr(o, "renewal_date", None) and o.renewal_date) else o.close_date
@@ -4940,7 +5698,6 @@ async def get_renewals_overview(
     ).order_by(Opportunity.close_date.desc().nullslast(), Opportunity.id.desc())
     r = await db.execute(q_renewals)
     renewal_opps_all = [o for o in r.scalars().all() if _is_renewal_record_type(_effective_record_type(o))]
-    active_arr_by_account_today = await _active_arr_by_account_id(db)
     account_ids_all = {o.account_id for o in renewal_opps_all if o.account_id}
     account_segment: dict[str, str] = {}
     if account_ids_all:
@@ -4960,18 +5717,6 @@ async def get_renewals_overview(
         rd = _renewal_date(o)
         if rd:
             available_months_set.add(rd.strftime("%Y-%m"))
-
-    # ARR as of each renewal date for all renewal opps: map (date, account_id) -> ARR from schedule on that date
-    unique_dates: set[date] = set()
-    for o in renewal_opps_all:
-        rd = _renewal_date(o)
-        if rd:
-            unique_dates.add(rd)
-    arr_by_account_and_date: dict[tuple[date, str], float] = {}
-    for d in unique_dates:
-        arr_by_account = await _arr_total_by_account_as_of(db, d)
-        for aid, val in arr_by_account.items():
-            arr_by_account_and_date[(d, aid)] = val
 
     def _norm(s: str) -> str:
         return (s or "").strip().lower()
@@ -5015,40 +5760,22 @@ async def get_renewals_overview(
             renewal_opps = [o for o in renewal_opps_all if _keep(o)]
     else:
         renewal_opps = [o for o in renewal_opps_all if _keep(o)]
-    renewal_sf_ids = {o.sf_id for o in renewal_opps}
-    opp_to_arr_from_lines = await _compute_arr_from_line_items(db, renewal_sf_ids)
     rows = []
     grand_total = 0.0
     for o in renewal_opps:
-        arr_from_lines = opp_to_arr_from_lines.get(o.sf_id, 0)
         stage = (o.stage_name or "").strip()
-        is_closed = stage in CLOSED_STAGES
         rd = _renewal_date(o)
-        acct_id = o.account_id or ""
-        snapshot_ufr = 0.0
-        if rd and acct_id:
-            snapshot_ufr = arr_by_account_and_date.get((rd, acct_id), 0.0)
-
-        if is_closed:
-            if stage == "Closed Won":
-                # Closed Won: UFR ARR = ARR active as of renewal date (Schedule), fall back to Original ACV then line items.
-                ufr_val = float(o.original_acv) if getattr(o, "original_acv", None) is not None else None
-                base_ufr = snapshot_ufr if snapshot_ufr > 0 else (ufr_val if ufr_val is not None else arr_from_lines)
-                ufr_arr = round(base_ufr, 2) if base_ufr is not None else None
-                renewed_arr = round(arr_from_lines, 2)
-                renewal_change_arr = round(renewed_arr - (base_ufr or 0), 2)
-            else:
-                # Closed Lost: UFR ARR = ARR active as of renewal date (Schedule), fall back to line items; Renewed ARR = 0.
-                base_ufr = snapshot_ufr if snapshot_ufr > 0 else arr_from_lines
-                ufr_arr = round(base_ufr, 2) if base_ufr else None
-                renewed_arr = 0.0
-                renewal_change_arr = round(0.0 - (base_ufr or 0), 2)
-        else:
-            # Open: UFR ARR = Active ARR as of today (Schedule) when available; fall back to line items.
-            base_ufr = active_arr_by_account_today.get(acct_id, 0.0) or arr_from_lines
-            ufr_arr = round(base_ufr, 2) if base_ufr else None
+        ufr = _renewal_ufr_original_arr(o)
+        ufr_arr = round(ufr, 2)
+        if stage == "Closed Won":
+            renewed_arr = round(_renewal_renewed_arr_c(o), 2)
+            renewal_change_arr = round(renewed_arr - ufr, 2)
+        elif stage == "Closed Lost":
             renewed_arr = 0.0
-            renewal_change_arr = round(0.0 - (base_ufr or 0), 2)  # delta = renewed - ufr = 0 - ufr
+            renewal_change_arr = round(0.0 - ufr, 2)
+        else:
+            renewed_arr = 0.0
+            renewal_change_arr = round(0.0 - ufr, 2)
         grand_total += renewed_arr
         seg = account_segment.get(o.account_id) if o.account_id else DEFAULT_SEGMENT
         rd = _renewal_date(o)

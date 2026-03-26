@@ -27,14 +27,6 @@ function getStoredPassword(): string | null {
   return sessionStorage.getItem('app_password')
 }
 
-/** Full URL for debugging (browser) or path prefix (SSR). */
-function absoluteApiUrl(pathAndQuery: string): string {
-  const p = pathAndQuery.startsWith('/') ? pathAndQuery : `/${pathAndQuery}`
-  if (API.startsWith('http')) return `${API}${p}`
-  if (typeof window !== 'undefined') return `${window.location.origin}${API}${p}`
-  return `${API}${p}`
-}
-
 /**
  * Admin ARR breakdown only: in `npm run dev` on localhost, call FastAPI directly on :8000.
  * Some setups see the Vite proxy strip POST bodies or query strings, so active-arr?breakdown_q=
@@ -364,25 +356,6 @@ export async function getDashboardBookingsMTD(): Promise<BookingsMTDResponse> {
   }
 }
 
-export type RenewalsMTDPeriod = {
-  period_label?: string
-  total: BookingsMTDRow
-  renewed: BookingsMTDRow
-  open: BookingsMTDRow
-  churn: BookingsMTDRow
-  contraction: BookingsMTDRow
-  renewal_rate: BookingsMTDRow
-}
-
-export type RenewalsMTDResponse = {
-  two_months_ago: RenewalsMTDPeriod
-  previous_month: RenewalsMTDPeriod
-  current_mtd: RenewalsMTDPeriod
-  qtd: RenewalsMTDPeriod
-  plan_source: string | null
-  plan_message: string | null
-}
-
 export type CashPeriod = {
   period_label: string
   billings_plan: number | null
@@ -403,35 +376,6 @@ export type CashMTDResponse = {
   plan_source: string | null
   plan_message: string | null
   chargebee_message?: string | null
-}
-
-export async function getDashboardRenewalsMTD(): Promise<RenewalsMTDResponse> {
-  const RENEWALS_ERR = 'Renewals — server returned invalid data. Check that the backend is running and try again.'
-  let text: string
-  try {
-    const r = await apiFetch('/dashboard/renewals-mtd')
-    text = await r.text()
-    if (!r.ok) {
-      try {
-        const j = JSON.parse(text)
-        throw new Error(j.detail || j.error || `Failed to fetch renewals MTD (${r.status})`)
-      } catch (e) {
-        const msg = e instanceof Error ? e.message : ''
-        if (/Unexpected token|not valid JSON|SyntaxError|Internal S/i.test(msg)) throw new Error(RENEWALS_ERR)
-        if (e instanceof Error && /detail|error|Failed to fetch/.test(msg)) throw e
-        throw new Error(text?.slice(0, 80) || `Renewals endpoint error (${r.status})`)
-      }
-    }
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e)
-    if (/Unexpected token|not valid JSON|JSON\.parse|SyntaxError|Internal S/i.test(msg)) throw new Error(RENEWALS_ERR)
-    throw e
-  }
-  try {
-    return JSON.parse(text) as RenewalsMTDResponse
-  } catch {
-    throw new Error(RENEWALS_ERR)
-  }
 }
 
 const CASH_ERR = 'Cash — server returned invalid data. Check that the backend is running and try again.'
@@ -668,8 +612,6 @@ export type PipelineOverviewRow = {
   stage_name: string
   record_type_name: string
   close_date: string | null
-  /** Renewals overview only: effective renewal date (SF Renewal Date or close date). */
-  renewal_date?: string | null
   arr: number
 }
 
@@ -728,30 +670,6 @@ export async function getClosedOverview(filters?: ClosedOverviewFilters): Promis
   const qs = params.toString()
   const r = await apiFetch(`/closed-overview${qs ? `?${qs}` : ''}`)
   if (!r.ok) throw new Error('Failed to fetch closed overview')
-  return r.json()
-}
-
-/** Renewals overview: same as closed but with UFR ARR (up for renewal) and renewal change. */
-export type RenewalsOverviewRow = ClosedOverviewRow & {
-  ufr_arr: number | null
-  renewal_change_arr: number
-}
-
-export type RenewalsOverviewResponse = Omit<ClosedOverviewResponse, 'rows'> & {
-  rows: RenewalsOverviewRow[]
-  /** When false, no opp has renewal_date set so months are based on close date. Set SALESFORCE_RENEWAL_DATE_FIELD and sync for correct bucketing. */
-  renewal_date_used?: boolean
-}
-
-export async function getRenewalsOverview(filters?: ClosedOverviewFilters): Promise<RenewalsOverviewResponse> {
-  const params = new URLSearchParams()
-  if (filters?.segment?.length) filters.segment.forEach((s) => params.append('segment', s))
-  if (filters?.stage?.length) filters.stage.forEach((s) => params.append('stage', s))
-  if (filters?.record_type?.length) filters.record_type.forEach((r) => params.append('record_type', r))
-  if (filters?.months?.length) filters.months.forEach((m) => params.append('months', m))
-  const qs = params.toString()
-  const r = await apiFetch(`/renewals-overview${qs ? `?${qs}` : ''}`)
-  if (!r.ok) throw new Error('Failed to fetch renewals overview')
   return r.json()
 }
 
@@ -869,7 +787,6 @@ export async function getArrScheduleBreakdown(q = '12 south'): Promise<{
     `/arr-schedule/schedule-breakdown?q=${needleEnc}`,
     `/admin/arr-schedule-breakdown?q=${needleEnc}`,
   ]
-  const firstUrl = postUrl
   let lastStatus = 0
   let lastDetail = ''
   let sawFullActiveArrWithoutBreakdown = false

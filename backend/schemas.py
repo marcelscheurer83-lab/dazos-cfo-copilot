@@ -42,27 +42,6 @@ class BookingsMTDResponse(BaseModel):
     plan_message: Optional[str] = None
 
 
-class RenewalsMTDPeriod(BaseModel):
-    """Renewals metrics for one period: Total, Renewed, Open, Churn, Contraction, Renewal rate (ARR-based)."""
-    period_label: Optional[str] = None
-    total: BookingsMTDRow
-    renewed: BookingsMTDRow
-    open: BookingsMTDRow
-    churn: BookingsMTDRow
-    contraction: BookingsMTDRow
-    renewal_rate: BookingsMTDRow  # mtd/plan as percentage (e.g. 85.2)
-
-
-class RenewalsMTDResponse(BaseModel):
-    """Renewals vs plan: previous month, current MTD, quarter to date. Plan from sheet rows 13 (churn), 14 (contraction), 52 (renewal rate)."""
-    two_months_ago: RenewalsMTDPeriod
-    previous_month: RenewalsMTDPeriod
-    current_mtd: RenewalsMTDPeriod
-    qtd: RenewalsMTDPeriod
-    plan_source: Optional[str] = None
-    plan_message: Optional[str] = None
-
-
 class CashPeriod(BaseModel):
     """One period: Billings and Collections plan and actuals (actuals from Chargebee). % and delta vs plan."""
     period_label: str

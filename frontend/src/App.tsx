@@ -10,7 +10,6 @@ import AnalyticsCRMSeats from './views/AnalyticsCRMSeats'
 import Pipeline from './views/Pipeline'
 import Closed from './views/Closed'
 import Placeholder from './views/Placeholder'
-import Renewals from './views/Renewals'
 import Admin from './views/Admin'
 
 class ErrorBoundary extends Component<{ children: ReactNode }, { error: Error | null; key: number }> {
@@ -63,7 +62,6 @@ export default function App() {
         <Route index element={<Navigate to="/dashboard" replace />} />
         <Route path="dashboard" element={<Dashboard />} />
         <Route path="bookings" element={<Closed />} />
-        <Route path="gtm/renewals" element={<Renewals />} />
         <Route path="pipeline-overview" element={<Pipeline />} />
         <Route path="products-purchased" element={<ARR />} />
         <Route path="customer-overview" element={<Navigate to="/products-purchased" replace />} />

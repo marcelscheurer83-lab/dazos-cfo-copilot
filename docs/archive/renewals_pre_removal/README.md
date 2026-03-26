@@ -31,4 +31,4 @@ The **dashboard Renewals (ARR) block**, **Go-To-Market → Renewals** page, and 
 
 ## Suggested direction for the rebuild (summary)
 
-See the same task’s assistant response in the repo history: materialized renewal cohorts, narrow SQL filters, optional read models fed by sync or nightly jobs, and avoiding per-request full-table scans + snapshot replay.
+See **[`docs/renewals_rebuild_notes.md`](../renewals_rebuild_notes.md)** — materialized cohorts / rollups, narrow SQL filters, read models fed by sync or nightly jobs, and avoiding per-request full-table scans plus heavy schedule replay.

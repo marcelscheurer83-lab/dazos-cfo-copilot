@@ -15,7 +15,6 @@ const nav: NavItem[] = [
     label: 'Go-To-Market',
     children: [
       { to: '/bookings', label: 'Bookings' },
-      { to: '/gtm/renewals', label: 'Renewals' },
       { to: '/pipeline-overview', label: 'Pipeline' },
     ],
   },
@@ -62,7 +61,7 @@ const subLinkStyle = (isActive: boolean) => ({
   fontSize: subLevelFontSize,
 })
 
-const GTM_PATHS = ['/bookings', '/gtm/renewals', '/pipeline-overview']
+const GTM_PATHS = ['/bookings', '/pipeline-overview']
 const ARR_SCHEDULE_PATHS = ['/arr-schedule/active-arr']
 const EXPORTS_PATHS = ['/products-purchased', '/customer-overview']
 const ANALYTICS_PATHS = ['/analytics', '/analytics/crm-seats']

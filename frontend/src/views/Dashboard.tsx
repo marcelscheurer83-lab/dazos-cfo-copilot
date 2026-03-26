@@ -2,7 +2,6 @@ import { useEffect, useState } from 'react'
 import {
   getDashboardKPI,
   getDashboardBookingsMTD,
-  getDashboardRenewalsMTD,
   getDashboardCashMTD,
   getARRScheduleActiveArr,
   getARRByAccountProduct,
@@ -12,8 +11,6 @@ import {
   type BookingsMTDResponse,
   type BookingsMTDRow,
   type BookingsPeriod,
-  type RenewalsMTDResponse,
-  type RenewalsMTDPeriod,
   type CashMTDResponse,
 } from '../api'
 
@@ -95,11 +92,9 @@ function mtPeriodGridStyle(periodCount: number): React.CSSProperties {
 export default function Dashboard() {
   const [kpi, setKpi] = useState<DashboardKPI | null>(null)
   const [bookingsMTD, setBookingsMTD] = useState<BookingsMTDResponse | null>(null)
-  const [renewalsMTD, setRenewalsMTD] = useState<RenewalsMTDResponse | null>(null)
   const [cashMTD, setCashMTD] = useState<CashMTDResponse | null>(null)
   const [err, setErr] = useState<string | null>(null)
   const [bookingsErr, setBookingsErr] = useState<string | null>(null)
-  const [renewalsErr, setRenewalsErr] = useState<string | null>(null)
   const [cashErr, setCashErr] = useState<string | null>(null)
   const [sheetSyncError, setSheetSyncError] = useState<string | null>(null)
   const [liveArrTotal, setLiveArrTotal] = useState<number | null>(null)
@@ -118,10 +113,6 @@ export default function Dashboard() {
       getDashboardBookingsMTD()
         .then(setBookingsMTD)
         .catch((e) => setBookingsErr(normalizeFetchError(e instanceof Error ? e.message : String(e), 'Bookings')))
-    const fetchRenewals = () =>
-      getDashboardRenewalsMTD()
-        .then(setRenewalsMTD)
-        .catch((e) => setRenewalsErr(normalizeFetchError(e instanceof Error ? e.message : String(e), 'Renewals')))
     const fetchCash = () =>
       getDashboardCashMTD()
         .then(setCashMTD)
@@ -156,7 +147,6 @@ export default function Dashboard() {
     const runSyncAndFetch = () => {
       fetchKpi()
       fetchBookings()
-      fetchRenewals()
       fetchCash()
       fetchLiveArr()
     }
@@ -188,7 +178,7 @@ export default function Dashboard() {
   // If plan is missing after first load, retry sheet sync once and refetch so plan numbers appear
   useEffect(() => {
     if (hasRetriedPlanRefetch.current) return
-    const needsPlan = (renewalsMTD?.plan_message && /no snapshot|sync.*first/i.test(renewalsMTD.plan_message)) ||
+    const needsPlan =
       (bookingsMTD?.plan_message && /no snapshot|sync.*first/i.test(bookingsMTD.plan_message)) ||
       (cashMTD?.plan_message && /no snapshot|sync.*first/i.test(cashMTD.plan_message))
     if (!needsPlan) return
@@ -202,9 +192,6 @@ export default function Dashboard() {
               getDashboardBookingsMTD()
                 .then((d) => { setBookingsMTD(d); setBookingsErr(null) })
                 .catch((e) => setBookingsErr(normalizeFetchError(e instanceof Error ? e.message : String(e), 'Bookings')))
-              getDashboardRenewalsMTD()
-                .then((d) => { setRenewalsMTD(d); setRenewalsErr(null) })
-                .catch((e) => setRenewalsErr(normalizeFetchError(e instanceof Error ? e.message : String(e), 'Renewals')))
             }, 600)
           }
         })
@@ -222,7 +209,7 @@ export default function Dashboard() {
         .catch(() => {})
     }, 800)
     return () => clearTimeout(t)
-  }, [renewalsMTD?.plan_message, bookingsMTD?.plan_message, cashMTD?.plan_message])
+  }, [bookingsMTD?.plan_message, cashMTD?.plan_message])
 
   if (err) return <p style={{ color: 'var(--negative)' }}>{err}</p>
   if (!kpi) return <p style={{ color: 'var(--text-muted)' }}>Loading…</p>
@@ -381,23 +368,7 @@ export default function Dashboard() {
           )}
         </div>
 
-        {/* Block 2: Renewals */}
-        <div style={{ ...blockStyle, gridColumn: '1 / -1', minWidth: 0 }}>
-          <div style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text)', marginBottom: '0.5rem' }}>
-            Renewals (ARR)
-          </div>
-          {renewalsErr && (
-            <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>{normalizeFetchError(renewalsErr, 'Renewals')}</p>
-          )}
-          {!renewalsErr && renewalsMTD && (
-            <RenewalsMTDBlock data={renewalsMTD} sheetSyncError={sheetSyncError} />
-          )}
-          {!renewalsErr && !renewalsMTD && (
-            <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>Loading…</p>
-          )}
-        </div>
-
-        {/* Block 3: Cash */}
+        {/* Block 2: Cash */}
         <div style={{ ...blockStyle, gridColumn: '1 / -1', minWidth: 0 }}>
           <div style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text)', marginBottom: '0.5rem' }}>
             Cash
@@ -612,96 +583,3 @@ function MTDRowSub({ label, value, showPipeCov }: { label: string; value: number
   )
 }
 
-function RenewalsMTDRow({
-  label,
-  row,
-  asPct,
-  deltaNeutral,
-  deltaBadWhenPositive,
-}: {
-  label: string
-  row: BookingsMTDRow
-  asPct?: boolean
-  /** Up for renewal: delta irrelevant (always 0), use neutral color */
-  deltaNeutral?: boolean
-  /** Churn/Contraction: higher than plan is bad → red when delta > 0 */
-  deltaBadWhenPositive?: boolean
-}) {
-  const deltaColor =
-    row.delta_k == null || deltaNeutral
-      ? 'var(--text-muted)'
-      : deltaBadWhenPositive
-        ? (row.delta_k > 0 ? 'var(--negative)' : row.delta_k < 0 ? 'var(--positive)' : 'var(--text-muted)')
-        : (row.delta_k >= 0 ? 'var(--positive)' : 'var(--negative)')
-  const fmtVal = (n: number) => (asPct ? `${n.toFixed(1)}%` : fmtK(n))
-  const fmtDelta = () => {
-    if (row.delta_k == null) return '—'
-    if (asPct) return (row.delta_k >= 0 ? '+' : '') + row.delta_k.toFixed(1) + ' pp'
-    return fmtDeltaK(row.delta_k)
-  }
-  return (
-    <tr style={{ borderBottom: '1px solid var(--border)', verticalAlign: 'middle' }}>
-      <td style={{ padding: '0.4rem 0.5rem 0.4rem 0', color: 'var(--text)' }}>{label}</td>
-      <td style={{ textAlign: 'right', padding: '0.4rem 0.5rem', color: 'var(--text)' }}>{fmtVal(row.mtd)}</td>
-      <td style={{ textAlign: 'right', padding: '0.4rem 0.5rem', color: 'var(--text-muted)' }}>
-        {row.plan != null ? fmtVal(row.plan) : '—'}
-      </td>
-      <td style={{ textAlign: 'right', padding: '0.4rem 0.5rem', color: 'var(--text)' }}>{fmtPct(row.achievement_pct, asPct ? 1 : 0)}</td>
-      <td style={{ textAlign: 'right', padding: '0.4rem 0', color: deltaColor }}>{fmtDelta()}</td>
-    </tr>
-  )
-}
-
-function RenewalsMTDBlock({
-  data,
-  sheetSyncError,
-}: {
-  data: RenewalsMTDResponse
-  sheetSyncError?: string | null
-}) {
-  const { two_months_ago, previous_month, current_mtd, qtd, plan_message } = data
-  const periods: RenewalsMTDPeriod[] = [two_months_ago, previous_month, current_mtd, qtd].filter(Boolean) as RenewalsMTDPeriod[]
-  const planNote = sanitizePlanMessage(sheetSyncError) || sanitizePlanMessage(plan_message)
-  const needsGoogleConfig = planNote && /GOOGLE_SHEET_ID|not configured|credentials/i.test(planNote)
-  return (
-    <>
-      {planNote && (
-        <p style={{ fontSize: '0.75rem', color: 'var(--text-muted)', marginBottom: '0.5rem' }}>
-          {planNote}
-          {needsGoogleConfig && (
-            <> — Set <strong>GOOGLE_SHEET_ID</strong> (and credentials) in the backend environment.</>
-          )}
-        </p>
-      )}
-      <div style={mtPeriodGridStyle(periods.length)}>
-        {periods.map((period, idx) => (
-          <div key={period.period_label ?? idx}>
-            <div style={{ fontSize: '1.05em', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '0.5rem' }}>
-              {period.period_label ??
-                (idx === 0 ? 'Two months ago' : idx === 1 ? 'Prev month' : idx === 2 ? 'MTD' : 'QTD')}
-            </div>
-            <table style={mtTableStyle}>
-              <thead>
-                <tr style={{ borderBottom: '1px solid var(--border)' }}>
-                  <th style={{ textAlign: 'left', padding: '0.25rem 0.5rem 0.25rem 0', fontWeight: 500, color: 'var(--text-muted)', verticalAlign: 'bottom' }} />
-                  <th style={{ textAlign: 'right', padding: '0.25rem 0.5rem', fontWeight: 500, color: 'var(--text-muted)', verticalAlign: 'bottom' }}>{periodValueColumnLabel(period.period_label)}</th>
-                  <th style={{ textAlign: 'right', padding: '0.25rem 0.5rem', fontWeight: 500, color: 'var(--text-muted)', verticalAlign: 'bottom' }}>Plan</th>
-                  <th style={{ textAlign: 'right', padding: '0.25rem 0', fontWeight: 500, color: 'var(--text-muted)', verticalAlign: 'bottom' }}>%</th>
-                  <th style={{ textAlign: 'right', padding: '0.25rem 0', fontWeight: 500, color: 'var(--text-muted)', verticalAlign: 'bottom' }}>Δ</th>
-                </tr>
-              </thead>
-              <tbody>
-                <RenewalsMTDRow label="Up for renewal" row={period.total} deltaNeutral />
-                <RenewalsMTDRow label="Renewed" row={period.renewed} />
-                <RenewalsMTDRow label="Open" row={period.open} />
-                <RenewalsMTDRow label="Churn" row={period.churn} deltaBadWhenPositive />
-                <RenewalsMTDRow label="Contraction" row={period.contraction} deltaBadWhenPositive />
-                <RenewalsMTDRow label="Renewal rate" row={period.renewal_rate} asPct />
-              </tbody>
-            </table>
-          </div>
-        ))}
-      </div>
-    </>
-  )
-}

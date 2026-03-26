@@ -56,10 +56,8 @@ from schemas import (
     BookingsMTDResponse,
     BookingsMTDRow,
     BookingsPeriod,
-    RenewalsMTDResponse,
     CashMTDResponse,
     CashPeriod,
-    RenewalsMTDPeriod,
 )
 from seed_data import seed
 
@@ -286,7 +284,7 @@ app.add_middleware(RequireAppPasswordMiddleware)
 app.add_middleware(APITimingMiddleware)
 
 # Ensure dashboard MTD endpoints never return 500/non-JSON (e.g. if get_db or any dependency fails)
-_DASHBOARD_MTD_PATHS = frozenset({"/api/dashboard/renewals-mtd", "/api/dashboard/cash-mtd", "/api/dashboard/bookings-mtd"})
+_DASHBOARD_MTD_PATHS = frozenset({"/api/dashboard/cash-mtd", "/api/dashboard/bookings-mtd"})
 _logger = logging.getLogger(__name__)
 
 
@@ -297,8 +295,6 @@ async def _dashboard_mtd_exception_handler(request: Request, exc: Exception):
         raise exc
     _logger.exception("Dashboard MTD error for %s: %s", request.url.path, exc)
     msg = f"{type(exc).__name__}: {str(exc)[:120]}"
-    if request.url.path == "/api/dashboard/renewals-mtd":
-        return JSONResponse(status_code=200, content=_safe_renewals_fallback(msg))
     if request.url.path == "/api/dashboard/cash-mtd":
         return JSONResponse(status_code=200, content=_safe_cash_fallback(msg))
     if request.url.path == "/api/dashboard/bookings-mtd":
@@ -2365,8 +2361,8 @@ async def _compute_active_arr_rows(
 
 async def _active_arr_by_account_id(db: AsyncSession) -> dict[str, float]:
     """
-    Helper for other endpoints (e.g. Renewals): map Salesforce account_id -> Active ARR as of today (EST),
-    using the same definition as the Schedule (anchor + expansions within subscription window).
+    Map Salesforce account_id -> Active ARR as of today (EST), using the same definition as the
+    Schedule (anchor + expansions within subscription window).
     """
     rows, _ = await _compute_active_arr_rows(db)
     out: dict[str, float] = {}
@@ -3334,15 +3330,6 @@ def _to_float_sheet_pct(x) -> Optional[float]:
     return None
 
 
-def _normalize_renewal_rate_pct(val: Optional[float]) -> Optional[float]:
-    """If sheet stores renewal rate as decimal (e.g. 0.588 for 58.8%), convert to percentage."""
-    if val is None:
-        return None
-    if 0 < val <= 1:
-        return val * 100
-    return val
-
-
 def _bookings_row(mtd: float, plan_val: Optional[float]) -> BookingsMTDRow:
     achievement_pct = (mtd / plan_val * 100) if plan_val and plan_val != 0 else None
     delta_k = (mtd - plan_val) / 1000.0 if plan_val is not None else None
@@ -3639,94 +3626,6 @@ async def _closed_won_renewal_expansion_arr_in_range(
     return round(total, 2)
 
 
-def _renewal_ufr_original_arr(o: Opportunity) -> float:
-    """UFR = Original_ARR__c (stored on Opportunity.original_acv by sync)."""
-    v = getattr(o, "original_acv", None)
-    return float(v) if v is not None else 0.0
-
-
-def _renewal_renewed_arr_c(o: Opportunity) -> float:
-    """Renewed ARR for closed-won renewals = ARR__c (stored on Opportunity.opportunity_arr)."""
-    v = getattr(o, "opportunity_arr", None)
-    return float(v) if v is not None else 0.0
-
-
-async def _renewals_metrics_in_range(
-    db: AsyncSession,
-    first_day: date,
-    last_day: date,
-    *,
-    overrides: Optional[dict[str, str]] = None,
-) -> tuple[float, float, float, float, float, Optional[float]]:
-    """Return (total, renewed, open, churn, contracted, renewal_rate_pct) for renewals with renewal_date in [first_day, last_day].
-
-    Definitions:
-    - UFR (total and per-row buckets) = Original_ARR__c (Opportunity.original_acv) for each renewal opp in range.
-    - Closed Lost: renewed ARR = 0; churn bucket += UFR.
-    - Closed Won: renewed ARR = ARR__c (Opportunity.opportunity_arr); contraction += max(0, UFR - ARR__c).
-    - Open: renewed = 0; open bucket += UFR.
-    - Renewal rate = sum(renewed ARR for Closed Won) / sum(UFR) * 100.
-
-    Note: open + churn + contraction + renewed does not necessarily equal total when ARR__c > UFR (expansion).
-    """
-    if overrides is None:
-        overrides = await _get_record_type_overrides(db)
-
-    def _effective_record_type(o: Opportunity) -> str:
-        key = (o.sf_id or "").strip()
-        override = overrides.get(key) or (overrides.get(key[:15]) if len(key) >= 15 else None)
-        return (override or o.record_type_name or "").strip() or "—"
-
-    def _renewal_date(o) -> date | None:
-        return o.renewal_date if (getattr(o, "renewal_date", None) and o.renewal_date) else o.close_date
-
-    q = select(Opportunity).where(Opportunity.record_type_name.isnot(None))
-    r = await db.execute(q)
-    all_opps = [o for o in r.scalars().all() if _is_renewal_record_type(_effective_record_type(o))]
-    in_range = [o for o in all_opps if _renewal_date(o) and first_day <= _renewal_date(o) <= last_day]
-    if not in_range:
-        return 0.0, 0.0, 0.0, 0.0, 0.0, None
-
-    open_arr = 0.0
-    churned = 0.0
-    contracted = 0.0
-    renewed = 0.0
-    total = 0.0
-    for o in in_range:
-        ufr = _renewal_ufr_original_arr(o)
-        total += ufr
-        stage = (o.stage_name or "").strip()
-        if stage == "Closed Won":
-            r_amt = _renewal_renewed_arr_c(o)
-            renewed += r_amt
-            contracted += max(0.0, ufr - r_amt)
-        elif stage == "Closed Lost":
-            churned += ufr
-        else:
-            open_arr += ufr
-
-    total = round(total, 2)
-    renewed = round(renewed, 2)
-    open_arr = round(open_arr, 2)
-    churned = round(churned, 2)
-    contracted = round(contracted, 2)
-    renewal_rate_pct = (renewed / total * 100) if total > 0 else None
-    if renewal_rate_pct is not None:
-        renewal_rate_pct = round(renewal_rate_pct, 2)
-    return total, renewed, open_arr, churned, contracted, renewal_rate_pct
-
-
-def _renewals_period_row(mtd: float, plan_val: Optional[float], is_pct: bool = False) -> BookingsMTDRow:
-    """Build a row; for is_pct=True mtd/plan are percentages (renewal rate)."""
-    if is_pct:
-        achievement_pct = (mtd / plan_val * 100) if plan_val and plan_val != 0 else None
-        delta_k = (mtd - plan_val) if plan_val is not None else None  # percentage point delta
-    else:
-        achievement_pct = (mtd / plan_val * 100) if plan_val and plan_val != 0 else None
-        delta_k = (mtd - plan_val) / 1000.0 if plan_val is not None else None
-    return BookingsMTDRow(mtd=mtd, plan=plan_val, achievement_pct=achievement_pct, delta_k=delta_k)
-
-
 @app.get("/api/dashboard/bookings-mtd", response_model=BookingsMTDResponse)
 async def get_dashboard_bookings_mtd(db: AsyncSession = Depends(get_db)):
     """
@@ -3941,38 +3840,6 @@ async def _get_dashboard_bookings_mtd_impl(db: AsyncSession) -> BookingsMTDRespo
     )
 
 
-# ARR_Calculations_2026P: row 52 = renewal rate %, row 54 = contraction rate % (Jan..Dec = BU..CF; Q1..Q4 = X,Y,Z,AA). Churn plan = up for renewal - renewed plan - contraction plan.
-ARR_2026P_RENEWALS_PLAN_ROWS = (12, 13, 51)  # 0-based: row 13, 14, 52 -> churn $ (unused), contraction $ (unused), renewal_rate_pct
-ARR_2026P_ROW_CONTRACTION_RATE = 53  # 0-based row 54 = contraction rate %
-ARR_2026P_QUARTER_RR_COLUMNS = ("X", "Y", "Z", "AA")  # Q1..Q4 renewal rate and contraction rate in row 52 / 54
-
-
-def _safe_renewals_fallback(plan_message: str) -> dict:
-    """Minimal valid renewals JSON so frontend never gets 500/non-JSON."""
-    now_est = datetime.now(EST)
-    y, m = now_est.year, now_est.month
-    tm2 = m - 2
-    ty2 = y
-    while tm2 <= 0:
-        tm2 += 12
-        ty2 -= 1
-    prev2 = datetime(ty2, tm2, 1).strftime("%b %y")
-    prev = datetime(y - 1, 12, 1).strftime("%b %y") if m == 1 else datetime(y, m - 1, 1).strftime("%b %y")
-    cur = now_est.strftime("%b %y") + " MTD"
-    qm = ((m - 1) // 3) * 3 + 1
-    qtd = f"Q{(qm - 1) // 3 + 1} {str(y)[2:]} QTD"
-    row = {"mtd": 0.0, "plan": None, "achievement_pct": None, "delta_k": None}
-    per = lambda label: {"period_label": label, "total": row, "renewed": row, "open": row, "churn": row, "contraction": row, "renewal_rate": row}
-    return {
-        "two_months_ago": per(prev2),
-        "previous_month": per(prev),
-        "current_mtd": per(cur),
-        "qtd": per(qtd),
-        "plan_source": None,
-        "plan_message": plan_message,
-    }
-
-
 def _safe_cash_fallback(plan_message: str) -> dict:
     """Minimal valid cash JSON for exception handler so frontend never gets 500/non-JSON."""
     now_est = datetime.now(EST)
@@ -4023,155 +3890,6 @@ def _safe_bookings_fallback(plan_message: str) -> dict:
         "plan_source": None,
         "plan_message": plan_message,
     }
-
-
-@app.get("/api/dashboard/renewals-mtd", response_model=RenewalsMTDResponse)
-async def get_dashboard_renewals_mtd(db: AsyncSession = Depends(get_db)):
-    """Renewals metrics: previous month, MTD, QTD. On failure returns 200 + JSON so frontend never sees 500."""
-    try:
-        return await _get_dashboard_renewals_mtd_impl(db)
-    except Exception as e:
-        return JSONResponse(status_code=200, content=_safe_renewals_fallback(f"Error loading renewals: {str(e)[:100]}"))
-
-
-async def _get_dashboard_renewals_mtd_impl(db: AsyncSession) -> RenewalsMTDResponse:
-    """Renewals metrics: previous month, current MTD, QTD. Plan from sheet row 52/54."""
-    now_est = datetime.now(EST)
-    year, month = now_est.year, now_est.month
-    today = now_est.date()
-
-    if month == 1:
-        prev_first = date(year - 1, 12, 1)
-        prev_last = date(year - 1, 12, 31)
-        prev_label = datetime(year - 1, 12, 1).strftime("%b %y")
-    else:
-        prev_first = date(year, month - 1, 1)
-        prev_last = date(year, month - 1, 1) + timedelta(days=32)
-        prev_last = (prev_last.replace(day=1) - timedelta(days=1))
-        prev_label = datetime(year, month - 1, 1).strftime("%b %y")
-
-    # Two months ago date range (e.g. Jan when current month is Mar)
-    prev2_month = month - 2
-    prev2_year = year
-    while prev2_month <= 0:
-        prev2_month += 12
-        prev2_year -= 1
-    prev2_first = date(prev2_year, prev2_month, 1)
-    prev2_last = (prev2_first + timedelta(days=32)).replace(day=1) - timedelta(days=1)
-    prev2_label = datetime(prev2_year, prev2_month, 1).strftime("%b %y")
-
-    first_of_month = date(year, month, 1)
-    # Use full month range so cohort matches renewals overview (open + churn + renewed for the whole month)
-    last_of_month = (first_of_month + timedelta(days=32)).replace(day=1) - timedelta(days=1)
-    current_mtd_last = last_of_month
-    current_label = now_est.strftime("%b %y") + " MTD"
-
-    quarter_month = ((month - 1) // 3) * 3 + 1
-    qtd_first = date(year, quarter_month, 1)
-    # Full quarter range so QTD cohort matches quarter (like current month uses full month)
-    qtd_last = (date(year, quarter_month + 3, 1) - timedelta(days=1)) if quarter_month <= 9 else date(year, 12, 31)
-    qtd_label = f"Q{(quarter_month - 1) // 3 + 1} {str(year)[2:]} QTD"
-
-    # Plan: renewal_rate (row 52), contraction rate % (row 54) by month; churn plan = up for renewal - renewed plan - contraction plan
-    plan_renewal_rate_by_month: list[Optional[float]] = [None] * 12
-    plan_contraction_rate_by_month: list[Optional[float]] = [None] * 12
-    q_rr_plan: Optional[float] = None
-    q_cont_rate: Optional[float] = None
-    plan_source: Optional[str] = None
-    plan_message: Optional[str] = None
-    sheet_range = "ARR_Calculations_2026P!A1:ZZ1000"
-    r_snap = await db.execute(
-        select(SheetSnapshot).where(SheetSnapshot.range_name == sheet_range).order_by(SheetSnapshot.as_of.desc()).limit(1)
-    )
-    snap = r_snap.scalar_one_or_none()
-    if snap and snap.data_json:
-        data = json.loads(snap.data_json)
-        try:
-            # Sheets API returns variable-length rows (trailing empty cells omitted). Pad to max row
-            # length so we can read BU/BV (Jan/Feb) on row 52 same as row 11/12 for bookings.
-            max_cols = max(len(row) for row in data) if data else 0
-            if max_cols > 0:
-                data = [list(row) + [None] * (max_cols - len(row)) for row in data]
-            for m in range(12):
-                col_idx = _a1_col_to_index(ARR_2026P_MONTH_COLUMNS[m])
-                # Renewal rate % from row 52
-                rr_row = data[51] if len(data) > 51 else []
-                v = rr_row[col_idx] if col_idx < len(rr_row) else None
-                val = _to_float_sheet_pct(v)
-                plan_renewal_rate_by_month[m] = _normalize_renewal_rate_pct(val)
-                # Contraction rate % from row 54
-                cr_row = data[ARR_2026P_ROW_CONTRACTION_RATE] if len(data) > ARR_2026P_ROW_CONTRACTION_RATE else []
-                v_c = cr_row[col_idx] if col_idx < len(cr_row) else None
-                val_c = _to_float_sheet_pct(v_c)
-                norm_c = _normalize_renewal_rate_pct(val_c)
-                plan_contraction_rate_by_month[m] = (norm_c * -1) if norm_c is not None else None
-            # Q1..Q4 renewal rate and contraction rate from row 52 and 54: X, Y, Z, AA
-            q_num = (quarter_month - 1) // 3  # 0..3 for Q1..Q4
-            if q_num < len(ARR_2026P_QUARTER_RR_COLUMNS):
-                col_idx = _a1_col_to_index(ARR_2026P_QUARTER_RR_COLUMNS[q_num])
-                rr_row = data[51] if len(data) > 51 else []
-                if col_idx < len(rr_row):
-                    val = _to_float_sheet_pct(rr_row[col_idx])
-                    q_rr_plan = _normalize_renewal_rate_pct(val)
-                cr_row = data[ARR_2026P_ROW_CONTRACTION_RATE] if len(data) > ARR_2026P_ROW_CONTRACTION_RATE else []
-                if col_idx < len(cr_row):
-                    val_c = _to_float_sheet_pct(cr_row[col_idx])
-                    norm_c = _normalize_renewal_rate_pct(val_c)
-                    q_cont_rate = (norm_c * -1) if norm_c is not None else None
-            plan_source = "ARR_Calculations_2026P"
-        except (TypeError, ValueError, IndexError):
-            plan_message = "Could not read renewal plan from sheet."
-    else:
-        plan_message = "No sheet snapshot. Sync ARR_Calculations_2026P first."
-
-    # If renewal rate plan is missing but sheet loaded, hint that row 52 must extend to BU/BV (Jan/Feb)
-    if plan_message is None and plan_source and all(plan_renewal_rate_by_month[i] is None for i in range(12)) and q_rr_plan is None:
-        plan_message = "Renewal rate plan: add values in row 52 at BU (Jan), BV (Feb), X (Q1), then re-sync sheet."
-
-    rt_overrides = await _get_record_type_overrides(db)
-    kw = {"overrides": rt_overrides}
-    prev_t, prev_r, prev_o, prev_ch, prev_cont, prev_rr = await _renewals_metrics_in_range(db, prev_first, prev_last, **kw)
-    prev2_t, prev2_r, prev2_o, prev2_ch, prev2_cont, prev2_rr = await _renewals_metrics_in_range(db, prev2_first, prev2_last, **kw)
-    mtd_t, mtd_r, mtd_o, mtd_ch, mtd_cont, mtd_rr = await _renewals_metrics_in_range(db, first_of_month, current_mtd_last, **kw)
-    qtd_t, qtd_r, qtd_o, qtd_ch, qtd_cont, qtd_rr = await _renewals_metrics_in_range(db, qtd_first, qtd_last, **kw)
-
-    prev_m = (month - 2 + 12) % 12
-    prev2_m = (month - 3 + 12) % 12
-    c_m = month - 1
-    if q_rr_plan is None:
-        q_rr_vals = [plan_renewal_rate_by_month[i] for i in range(quarter_month - 1, min(quarter_month + 2, 12)) if plan_renewal_rate_by_month[i] is not None]
-        q_rr_plan = sum(q_rr_vals) / len(q_rr_vals) if q_rr_vals else None
-    if q_cont_rate is None:
-        q_cr_vals = [plan_contraction_rate_by_month[i] for i in range(quarter_month - 1, min(quarter_month + 2, 12)) if plan_contraction_rate_by_month[i] is not None]
-        q_cont_rate = sum(q_cr_vals) / len(q_cr_vals) if q_cr_vals else None
-
-    def period(
-        label: str,
-        t: float, r: float, o: float, ch: float, cont: float, rr: Optional[float],
-        cont_rate: Optional[float], rr_plan: Optional[float],
-    ) -> RenewalsMTDPeriod:
-        # Up for renewal plan = actual. Renewed plan = rr_plan × up for renewal. Contraction plan = cont_rate × up for renewal. Churn plan = up for renewal - renewed plan - contraction plan.
-        renewed_plan = (rr_plan / 100.0 * t) if rr_plan is not None else None
-        cont_plan = (cont_rate / 100.0 * t) if cont_rate is not None else None
-        ch_plan = (t - renewed_plan - cont_plan) if (renewed_plan is not None and cont_plan is not None) else None
-        return RenewalsMTDPeriod(
-            period_label=label,
-            total=_renewals_period_row(t, t),  # plan = actual
-            renewed=_renewals_period_row(r, renewed_plan),
-            open=_renewals_period_row(o, None),
-            churn=_renewals_period_row(ch, ch_plan),
-            contraction=_renewals_period_row(cont, cont_plan),
-            renewal_rate=_renewals_period_row(rr or 0, rr_plan, is_pct=True),
-        )
-
-    return RenewalsMTDResponse(
-        two_months_ago=period(prev2_label, prev2_t, prev2_r, prev2_o, prev2_ch, prev2_cont, prev2_rr, plan_contraction_rate_by_month[prev2_m], plan_renewal_rate_by_month[prev2_m]),
-        previous_month=period(prev_label, prev_t, prev_r, prev_o, prev_ch, prev_cont, prev_rr, plan_contraction_rate_by_month[prev_m], plan_renewal_rate_by_month[prev_m]),
-        current_mtd=period(current_label, mtd_t, mtd_r, mtd_o, mtd_ch, mtd_cont, mtd_rr, plan_contraction_rate_by_month[c_m], plan_renewal_rate_by_month[c_m]),
-        qtd=period(qtd_label, qtd_t, qtd_r, qtd_o, qtd_ch, qtd_cont, qtd_rr, q_cont_rate, q_rr_plan if q_rr_plan else None),
-        plan_source=plan_source,
-        plan_message=plan_message,
-    )
 
 
 # BS_2026P: Billings row 45 (index 44); Collections = sum rows 64,65,66 (indices 63,64,65). Same month columns as ARR (BU..CF = Jan..Dec).
@@ -5663,154 +5381,6 @@ async def get_closed_overview(
         "segments": sorted(segments_set),
         "stages": sorted(stages_set),
         "record_types": sorted(record_types_set),
-    }
-    base = os.getenv("SALESFORCE_BASE_URL", "").strip().rstrip("/")
-    if base and ("salesforce.com" in base or "lightning.force.com" in base):
-        out["salesforce_base_url"] = base
-    return out
-
-
-@app.get("/api/renewals-overview")
-async def get_renewals_overview(
-    db: AsyncSession = Depends(get_db),
-    segment: Optional[List[str]] = Query(None, description="Filter by segment"),
-    stage: Optional[List[str]] = Query(None, description="Filter by stage (e.g. Closed Won)"),
-    record_type: Optional[List[str]] = Query(None, description="Filter by record type"),
-    months: Optional[List[str]] = Query(None, description="Filter by renewal date (close date) month(s), e.g. 2026-02"),
-):
-    """
-    All renewal opportunities (open + Closed Won + Closed Lost). Record type = Renewal only.
-    Renewal date = Opportunity.renewal_date (if set) else close_date.
-    UFR = Original_ARR__c (original_acv). Renewed ARR = ARR__c (opportunity_arr) for Closed Won; 0 otherwise.
-    """
-    def _renewal_date(o) -> date | None:
-        return o.renewal_date if (getattr(o, "renewal_date", None) and o.renewal_date) else o.close_date
-
-    overrides = await _get_record_type_overrides(db)
-
-    def _effective_record_type(o: Opportunity) -> str:
-        key = (o.sf_id or "").strip()
-        override = overrides.get(key) or (overrides.get(key[:15]) if len(key) >= 15 else None)
-        return (override or o.record_type_name or "").strip() or "—"
-
-    q_renewals = select(Opportunity).where(
-        Opportunity.record_type_name.isnot(None),
-    ).order_by(Opportunity.close_date.desc().nullslast(), Opportunity.id.desc())
-    r = await db.execute(q_renewals)
-    renewal_opps_all = [o for o in r.scalars().all() if _is_renewal_record_type(_effective_record_type(o))]
-    account_ids_all = {o.account_id for o in renewal_opps_all if o.account_id}
-    account_segment: dict[str, str] = {}
-    if account_ids_all:
-        q_acc = select(Account.sf_id, Account.segment).where(Account.sf_id.in_(account_ids_all))
-        r_acc = await db.execute(q_acc)
-        for (sf_id, seg) in r_acc.all():
-            account_segment[sf_id] = (seg or "").strip() or DEFAULT_SEGMENT
-    segments_set: set[str] = set()
-    stages_set: set[str] = set()
-    record_types_set: set[str] = set()
-    available_months_set: set[str] = set()
-    for o in renewal_opps_all:
-        seg = account_segment.get(o.account_id) if o.account_id else DEFAULT_SEGMENT
-        segments_set.add(seg)
-        stages_set.add(o.stage_name or "—")
-        record_types_set.add(_effective_record_type(o))
-        rd = _renewal_date(o)
-        if rd:
-            available_months_set.add(rd.strftime("%Y-%m"))
-
-    def _norm(s: str) -> str:
-        return (s or "").strip().lower()
-
-    filter_segments = {_norm(s) for s in (segment or [])}
-    filter_stages = {_norm(s) for s in (stage or [])}
-    filter_record_types = {_norm(s) for s in (record_type or [])}
-
-    def _keep(o) -> bool:
-        seg = account_segment.get(o.account_id) if o.account_id else DEFAULT_SEGMENT
-        if filter_segments and _norm(seg) not in filter_segments:
-            return False
-        if filter_stages and _norm(o.stage_name or "") not in filter_stages:
-            return False
-        if filter_record_types and _norm(_effective_record_type(o)) not in filter_record_types:
-            return False
-        return True
-
-    if months:
-        month_ranges: list[tuple[date, date]] = []
-        for yyyy_mm in months:
-            parts = (yyyy_mm or "").strip().split("-")
-            if len(parts) != 2:
-                continue
-            try:
-                y, m = int(parts[0]), int(parts[1])
-                if 1 <= m <= 12:
-                    first = date(y, m, 1)
-                    if m == 12:
-                        last = date(y, 12, 31)
-                    else:
-                        last = date(y, m + 1, 1) - timedelta(days=1)
-                    month_ranges.append((first, last))
-            except (ValueError, TypeError):
-                continue
-        if month_ranges:
-            def _in_selected(d: date) -> bool:
-                return any(first <= d <= last for first, last in month_ranges)
-            renewal_opps = [o for o in renewal_opps_all if _keep(o) and _renewal_date(o) and _in_selected(_renewal_date(o))]
-        else:
-            renewal_opps = [o for o in renewal_opps_all if _keep(o)]
-    else:
-        renewal_opps = [o for o in renewal_opps_all if _keep(o)]
-    rows = []
-    grand_total = 0.0
-    for o in renewal_opps:
-        stage = (o.stage_name or "").strip()
-        rd = _renewal_date(o)
-        ufr = _renewal_ufr_original_arr(o)
-        ufr_arr = round(ufr, 2)
-        if stage == "Closed Won":
-            renewed_arr = round(_renewal_renewed_arr_c(o), 2)
-            renewal_change_arr = round(renewed_arr - ufr, 2)
-        elif stage == "Closed Lost":
-            renewed_arr = 0.0
-            renewal_change_arr = round(0.0 - ufr, 2)
-        else:
-            renewed_arr = 0.0
-            renewal_change_arr = round(0.0 - ufr, 2)
-        grand_total += renewed_arr
-        seg = account_segment.get(o.account_id) if o.account_id else DEFAULT_SEGMENT
-        rd = _renewal_date(o)
-        rows.append({
-            "account_id": o.account_id,
-            "account_name": o.account_name or "—",
-            "segment": seg,
-            "opportunity_sf_id": o.sf_id,
-            "opportunity_name": o.name or "—",
-            "stage_name": o.stage_name or "—",
-            "record_type_name": _effective_record_type(o),
-            "close_date": o.close_date.isoformat() if o.close_date else None,
-            "renewal_date": rd.isoformat() if rd else None,
-            "ufr_arr": ufr_arr,
-            "arr": renewed_arr,
-            "renewal_change_arr": renewal_change_arr,
-        })
-    # Sort by renewal date (newest first), then ARR desc; rows with no date last
-    def _sort_key(row: dict) -> tuple:
-        rdd = row.get("renewal_date") or row.get("close_date")
-        od = date.fromisoformat(rdd).toordinal() if rdd else (date.max.toordinal() + 1)
-        return (-od, -row["arr"])
-    rows.sort(key=_sort_key)
-    # Hint for UI: if no opp has renewal_date set, we're bucketing by close date (set SALESFORCE_RENEWAL_DATE_FIELD and sync for correct months)
-    any_renewal_date_set = any(
-        getattr(o, "renewal_date", None) and o.renewal_date for o in renewal_opps_all
-    )
-    out = {
-        "rows": rows,
-        "grand_total": round(grand_total, 2),
-        "available_months": sorted(available_months_set, reverse=True),
-        "segments": sorted(segments_set),
-        "stages": sorted(stages_set),
-        "record_types": sorted(record_types_set),
-        "renewal_date_used": any_renewal_date_set,
     }
     base = os.getenv("SALESFORCE_BASE_URL", "").strip().rstrip("/")
     if base and ("salesforce.com" in base or "lightning.force.com" in base):

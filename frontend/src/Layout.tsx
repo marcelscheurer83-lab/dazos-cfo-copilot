@@ -104,7 +104,7 @@ export default function Layout() {
   }, [location.pathname])
 
   return (
-    <div style={{ display: 'flex', minHeight: '100vh', zoom: 0.8 }}>
+    <div style={{ display: 'flex', minHeight: '100vh' }}>
       <aside
         style={{
           width: 220,

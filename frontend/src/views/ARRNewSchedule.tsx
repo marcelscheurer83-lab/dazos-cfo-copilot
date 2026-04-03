@@ -117,6 +117,7 @@ export default function ARRNewSchedule() {
     getNewScheduleAccounts()
       .then((res) => {
         setRows(res.rows ?? [])
+        if (res.month_columns && res.month_columns.length > 0) setMonthColumns(res.month_columns)
         const b = res.salesforce_base_url
         setSalesforceBaseUrl(
           b && (b.includes('salesforce.com') || b.includes('lightning.force.com')) ? b : undefined

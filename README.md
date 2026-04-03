@@ -1,6 +1,6 @@
-# Dazos CFO Copilot
+# Dazos CFO Cockpit
 
-A complete CFO Copilot for **Dazos** — financial dashboard, KPIs, statements, budget vs actuals, and an AI-assisted Copilot for natural-language questions.
+A complete CFO Cockpit for **Dazos** — financial dashboard, KPIs, statements, budget vs actuals, and an AI-assisted Copilot for natural-language questions.
 
 **Company & role context:** See [CONTEXT.md](CONTEXT.md) for Dazos background and the FP&A/RevOps analyst lens used when building this Copilot.  
 **Build plan:** See [ROADMAP.md](ROADMAP.md) for the phased roadmap (data layer → live dashboard → ARR schedule → reports → full analyst Copilot).

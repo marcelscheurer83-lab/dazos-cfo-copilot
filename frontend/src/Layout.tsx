@@ -10,18 +10,26 @@ function isSection(item: NavItem): item is NavSection {
 }
 
 const nav: NavItem[] = [
-  { to: '/dashboard', label: 'Dashboard' },
+  {
+    label: 'Dashboard',
+    children: [
+      { to: '/dashboard/current-overview', label: 'Current Overview' },
+      { to: '/dashboard/q2-2026', label: 'Q2 2026' },
+      { to: '/dashboard/q1-2026', label: 'Q1 2026' },
+    ],
+  },
   {
     label: 'Go-To-Market',
     children: [
       { to: '/bookings', label: 'Bookings' },
+      { to: '/renewals', label: 'Renewals' },
       { to: '/pipeline-overview', label: 'Pipeline' },
     ],
   },
   {
     label: 'ARR',
     children: [
-      { to: '/arr-schedule/active-arr', label: 'Schedule' },
+      { to: '/arr-schedule/new-schedule', label: 'Schedule' },
     ],
   },
   {
@@ -61,13 +69,14 @@ const subLinkStyle = (isActive: boolean) => ({
   fontSize: subLevelFontSize,
 })
 
-const GTM_PATHS = ['/bookings', '/pipeline-overview']
-const ARR_SCHEDULE_PATHS = ['/arr-schedule/active-arr']
+const GTM_PATHS = ['/bookings', '/renewals', '/pipeline-overview']
+const ARR_SCHEDULE_PATHS = ['/arr-schedule/new-schedule']
 const EXPORTS_PATHS = ['/products-purchased', '/customer-overview']
 const ANALYTICS_PATHS = ['/analytics', '/analytics/crm-seats']
 
 export default function Layout() {
   const location = useLocation()
+  const [dashboardExpanded, setDashboardExpanded] = useState(true)
   const [gtmExpanded, setGtmExpanded] = useState(true)
   const [arrScheduleExpanded, setArrScheduleExpanded] = useState(true)
   const [exportsExpanded, setExportsExpanded] = useState(true)
@@ -108,7 +117,7 @@ export default function Layout() {
       >
         <div style={{ padding: '0 1.25rem 1.25rem', borderBottom: '1px solid var(--border)', marginBottom: '1rem' }}>
           <div style={{ fontSize: '1.1rem', fontWeight: 700 }}>Dazos</div>
-          <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>CFO Copilot</div>
+          <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>CFO Cockpit</div>
         </div>
         <nav style={{ flex: 1 }}>
           {nav.map((item, idx) => {
@@ -117,7 +126,9 @@ export default function Layout() {
                 location.pathname === c.to || (c.to !== '/dashboard' && location.pathname.startsWith(c.to + '/'))
               )
               const isExpanded =
-                item.label === 'Go-To-Market'
+                item.label === 'Dashboard'
+                  ? dashboardExpanded
+                  : item.label === 'Go-To-Market'
                   ? gtmExpanded
                   : item.label === 'ARR'
                     ? arrScheduleExpanded
@@ -127,7 +138,9 @@ export default function Layout() {
                       ? analyticsExpanded
                       : true
               const setExpanded =
-                item.label === 'Go-To-Market'
+                item.label === 'Dashboard'
+                  ? (v: boolean) => setDashboardExpanded(v)
+                  : item.label === 'Go-To-Market'
                   ? (v: boolean) => setGtmExpanded(v)
                   : item.label === 'ARR'
                     ? (v: boolean) => setArrScheduleExpanded(v)

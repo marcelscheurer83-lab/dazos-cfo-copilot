@@ -17,7 +17,7 @@ Do these in order. Pause after each step and confirm it worked before continuing
 
 1. At the top of the page, click the **project dropdown** (it may say “Select a project” or show a current project name).
 2. Click **“New Project”**.
-3. **Project name:** type e.g. `Dazos CFO Copilot` (or any name you like).
+3. **Project name:** type e.g. `Dazos CFO Cockpit` (or any name you like).
 4. Leave “Organization” as is (or leave default).
 5. Click **“Create”**.
 6. Wait a few seconds; then use the project dropdown again and **select the project you just created**.

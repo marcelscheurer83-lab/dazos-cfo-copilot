@@ -4,7 +4,7 @@
  * Handles: `https://host`, `https://host/`, `https://host/api`, `https://host/api/`
  *
  * While running `npm run dev` (Vite dev server), we **always** use same-origin `/api` so the dev
- * proxy hits **local** :8000. Otherwise a stray `VITE_API_URL` (e.g. pointing at Railway) makes
+ * proxy hits **local** :8008 (see `vite.config.ts`). Otherwise a stray `VITE_API_URL` (e.g. pointing at Railway) makes
  * new endpoints 404. To call a remote API from the dev server, set:
  *   VITE_USE_REMOTE_API_IN_DEV=true
  */
@@ -28,11 +28,11 @@ function getStoredPassword(): string | null {
 }
 
 /**
- * Admin ARR breakdown only: in `npm run dev` on localhost, call FastAPI directly on :8000.
+ * Admin ARR breakdown only: in `npm run dev` on localhost, call FastAPI directly on :8008.
  * Some setups see the Vite proxy strip POST bodies or query strings, so active-arr?breakdown_q=
- * hits the server without the param and looks like an "old" backend. CORS already allows :5173 → :8000.
+ * hits the server without the param and looks like an "old" backend. CORS already allows :5173 → :8008.
  * Set `VITE_BREAKDOWN_USE_PROXY=true` to keep using `/api` through Vite. Optional `VITE_DEV_BACKEND_URL`
- * if the API is not on 127.0.0.1:8000.
+ * if the API is not on 127.0.0.1:8008.
  */
 function arrBreakdownApiUrl(pathWithLeadingSlash: string): string {
   const p = pathWithLeadingSlash.startsWith('/') ? pathWithLeadingSlash : `/${pathWithLeadingSlash}`
@@ -47,7 +47,7 @@ function arrBreakdownApiUrl(pathWithLeadingSlash: string): string {
     if (h === 'localhost' || h === '127.0.0.1') {
       const base =
         (import.meta.env.VITE_DEV_BACKEND_URL as string | undefined)?.trim().replace(/\/+$/, '') ||
-        'http://127.0.0.1:8000'
+        'http://127.0.0.1:8008'
       return `${base}/api${p}`
     }
   }
@@ -306,9 +306,9 @@ export type BookingsPeriod = {
   total: BookingsMTDRow
   new_business: BookingsMTDRow
   expansion: BookingsMTDRow
-  /** Booking ARR from closed won expansions (no plan/delta) */
+  /** Closed Won expansion — Expansion_ARR__c (no plan/delta) */
   expansion_mid_term?: number | null
-  /** Booking ARR from renewals (no plan/delta) */
+  /** Closed Won renewals — Expansion_ARR__c (no plan/delta) */
   expansion_upon_renewal?: number | null
   /** Total open pipeline ARR / shortfall to plan (MTD/QTD only) */
   pipe_coverage_total?: number | null
@@ -327,11 +327,50 @@ export type BookingsMTDResponse = {
   plan_message: string | null
 }
 
-export async function getDashboardBookingsMTD(): Promise<BookingsMTDResponse> {
+export type RenewalsMTDRow = {
+  mtd: number
+  plan: number | null
+  achievement_pct: number | null
+  delta_k: number | null
+  is_rate?: boolean
+}
+
+export type RenewalsPeriod = {
+  period_label: string
+  up_for_renewal: RenewalsMTDRow
+  renewed: RenewalsMTDRow
+  open: RenewalsMTDRow
+  churn: RenewalsMTDRow
+  contraction: RenewalsMTDRow
+  renewal_rate: RenewalsMTDRow
+  cancelled: RenewalsMTDRow
+}
+
+export type RenewalsMTDResponse = {
+  two_months_ago: RenewalsPeriod
+  previous_month: RenewalsPeriod
+  current_mtd: RenewalsPeriod
+  qtd: RenewalsPeriod
+  plan_source: string | null
+  plan_message: string | null
+}
+
+/** When set, MTD columns use fixed labels (Q1 2026 → Jan–Mar + Q1 26; Q2 2026 → Apr–Jun + Q2 26). */
+export type DashboardFixedPeriods = 'q1_2026' | 'q2_2026'
+
+function dashboardMtdQuery(fixedPeriods?: DashboardFixedPeriods): string {
+  if (fixedPeriods === 'q1_2026') return '?fixed_periods=q1_2026'
+  if (fixedPeriods === 'q2_2026') return '?fixed_periods=q2_2026'
+  return ''
+}
+
+export async function getDashboardBookingsMTD(options?: {
+  fixedPeriods?: DashboardFixedPeriods
+}): Promise<BookingsMTDResponse> {
   const BOOKINGS_ERR = 'Bookings — server returned invalid data. Check that the backend is running and try again.'
   let text: string
   try {
-    const r = await apiFetch('/dashboard/bookings-mtd')
+    const r = await apiFetch(`/dashboard/bookings-mtd${dashboardMtdQuery(options?.fixedPeriods)}`)
     text = await r.text()
     if (!r.ok) {
       try {
@@ -353,6 +392,39 @@ export async function getDashboardBookingsMTD(): Promise<BookingsMTDResponse> {
     return JSON.parse(text) as BookingsMTDResponse
   } catch {
     throw new Error(BOOKINGS_ERR)
+  }
+}
+
+const RENEWALS_ERR =
+  'Renewals — server returned invalid data. Check that the backend is running and try again.'
+
+export async function getDashboardRenewalsMTD(options?: {
+  fixedPeriods?: DashboardFixedPeriods
+}): Promise<RenewalsMTDResponse> {
+  let text: string
+  try {
+    const r = await apiFetch(`/dashboard/renewals-mtd${dashboardMtdQuery(options?.fixedPeriods)}`)
+    text = await r.text()
+    if (!r.ok) {
+      try {
+        const j = JSON.parse(text)
+        throw new Error(j.detail || j.error || `Failed to fetch renewals MTD (${r.status})`)
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : ''
+        if (/Unexpected token|not valid JSON|SyntaxError/i.test(msg)) throw new Error(RENEWALS_ERR)
+        if (e instanceof Error && /detail|error|Failed to fetch/.test(msg)) throw e
+        throw new Error(text?.slice(0, 80) || `Renewals endpoint error (${r.status})`)
+      }
+    }
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e)
+    if (/Unexpected token|not valid JSON|JSON\.parse|SyntaxError|Internal S/i.test(msg)) throw new Error(RENEWALS_ERR)
+    throw e
+  }
+  try {
+    return JSON.parse(text) as RenewalsMTDResponse
+  } catch {
+    throw new Error(RENEWALS_ERR)
   }
 }
 
@@ -380,10 +452,12 @@ export type CashMTDResponse = {
 
 const CASH_ERR = 'Cash — server returned invalid data. Check that the backend is running and try again.'
 
-export async function getDashboardCashMTD(): Promise<CashMTDResponse> {
+export async function getDashboardCashMTD(options?: {
+  fixedPeriods?: DashboardFixedPeriods
+}): Promise<CashMTDResponse> {
   let text: string
   try {
-    const r = await apiFetch('/dashboard/cash-mtd')
+    const r = await apiFetch(`/dashboard/cash-mtd${dashboardMtdQuery(options?.fixedPeriods)}`)
     text = await r.text()
     if (!r.ok) {
       try {
@@ -571,6 +645,68 @@ export async function getARRScheduleActiveARRByMonth(): Promise<ActiveARRByMonth
   return r.json()
 }
 
+export type NewScheduleAccountRow = {
+  account_id: string
+  account_name: string
+  /** Salesforce Account.Type — same as Schedule. */
+  type?: string | null
+  /** Salesforce Account status — same as Schedule. */
+  status?: string | null
+  /** Contract Start Date on the earliest closed-won NB opportunity (by close date), ISO YYYY-MM-DD. */
+  subscription_start_date?: string | null
+  /** See NEW SCHEDULE backend: CW NB+Renewal max contract end, overridden by Closed Lost Renewal + midterm cancel close date. */
+  subscription_end_date?: string | null
+  /** Sum of ARR__c on CW NB/Renewal/Expansion opps active today; 0 if CL Renewal + midterm cancel and today > that opp’s contract end. */
+  live_arr: number
+  /** Live ARR + sum of ARR__c on all Closed Won opps whose contract start is after today. */
+  contracted_arr: number
+  /** Same Live ARR rules as live_arr, evaluated on each month-end (YYYY-MM keys from month_columns). */
+  arr_by_month?: Record<string, number>
+}
+
+export type NewScheduleAccountsResponse = {
+  rows: NewScheduleAccountRow[]
+  /** Dec '25 … Dec '26 month keys for ``arr_by_month``. */
+  month_columns?: string[]
+  salesforce_base_url?: string
+}
+
+export type ExportNewScheduleResult = {
+  ok: boolean
+  spreadsheet_url?: string
+  spreadsheet_id?: string
+  sheet_gid?: number | null
+  rows_written?: number
+  account_count?: number
+  range_used?: string
+  message?: string
+  error?: string
+}
+
+export async function exportNewScheduleToSheet(): Promise<ExportNewScheduleResult> {
+  const r = await apiFetch('/export/new-schedule-to-google-sheet', { method: 'POST' })
+  const data = await r.json()
+  if (!r.ok) return { ok: false, error: data.error ?? data.detail ?? 'Export failed' }
+  return {
+    ok: data.ok ?? true,
+    spreadsheet_url: data.spreadsheet_url,
+    spreadsheet_id: data.spreadsheet_id,
+    sheet_gid: data.sheet_gid,
+    rows_written: data.rows_written,
+    account_count: data.account_count,
+    range_used: data.range_used,
+    message: data.message,
+    error: data.error,
+  }
+}
+
+/** Accounts with ≥1 Closed Won New Business opportunity (NEW SCHEDULE; no bookings owner exclusion). */
+export async function getNewScheduleAccounts(): Promise<NewScheduleAccountsResponse> {
+  const r = await apiFetch('/arr-schedule/new-schedule-accounts', { cache: 'no-store' })
+  if (!r.ok) throw new Error('Failed to fetch NEW SCHEDULE accounts')
+  return r.json()
+}
+
 export type ExportCopilotARRScheduleResult = {
   ok: boolean
   spreadsheet_url?: string
@@ -673,7 +809,103 @@ export async function getClosedOverview(filters?: ClosedOverviewFilters): Promis
   return r.json()
 }
 
-export async function syncSalesforce(): Promise<{
+export type RenewalsOverviewRow = {
+  account_id: string | null
+  account_name: string
+  opportunity_sf_id: string
+  opportunity_name: string
+  stage_name: string
+  renewal_date: string | null
+  /** "Yes" when Midterm_Cancellation__c is true; null when false. */
+  midterm_cancellation_after_stage: string | null
+  up_for_renewal_arr: number | null
+  renewed_arr: number | null
+  delta: number | null
+}
+
+export type RenewalsChartMonth = {
+  month: string
+  arr_open: number
+  arr_renewed: number
+  arr_churned: number
+  count_open: number
+  count_renewed: number
+  count_lost: number
+  arr_renewal_rate: number | null
+  /** closed won / (closed won + closed lost) among closed outcomes */
+  opp_renewal_rate: number | null
+  /** Up-for-renewal ARR sum for mid-term cancellation = Yes (separate from stacked bar) */
+  arr_midterm_cancellation?: number
+  count_midterm_cancellation?: number
+}
+
+export type RenewalsOverviewResponse = {
+  rows: RenewalsOverviewRow[]
+  grand_up_for_renewal_arr: number
+  grand_renewed_arr: number
+  grand_delta: number
+  stages: string[]
+  available_months: string[]
+  renewals_chart: RenewalsChartMonth[]
+  salesforce_base_url?: string
+}
+
+export type RenewalsOverviewFilters = {
+  stage?: string[]
+  months?: string[]
+  /** `yes` | `no` — matches backend midterm filter */
+  midterm?: string[]
+}
+
+export async function getRenewalsOverview(filters?: RenewalsOverviewFilters): Promise<RenewalsOverviewResponse> {
+  const params = new URLSearchParams()
+  if (filters?.stage?.length) filters.stage.forEach((s) => params.append('stage', s))
+  if (filters?.months?.length) filters.months.forEach((m) => params.append('months', m))
+  if (filters?.midterm?.length) filters.midterm.forEach((m) => params.append('midterm', m))
+  const qs = params.toString()
+  const r = await apiFetch(`/renewals-overview${qs ? `?${qs}` : ''}`)
+  if (!r.ok) throw new Error('Failed to fetch renewals overview')
+  return r.json()
+}
+
+export type DatasetStatus = {
+  /** UTC instant (ISO with Z). */
+  updated_at: string | null
+  /** Preformatted UTC string from the server (preferred for display). */
+  updated_at_utc: string | null
+  last_refresh_ok: boolean | null
+  last_error: string | null
+  steps: unknown[]
+  message?: string
+}
+
+export async function getDatasetStatus(): Promise<DatasetStatus> {
+  const r = await apiFetch('/dataset/status')
+  if (!r.ok) throw new Error('Failed to fetch dataset status')
+  return r.json()
+}
+
+/** Unified refresh: Salesforce, Google Sheets (DATASET_SHEET_RANGES), Chargebee when configured. QuickBooks is separate (POST /api/sync/quickbooks). Can take many minutes. */
+export async function refreshAppDataset(signal?: AbortSignal): Promise<{
+  ok: boolean
+  error?: string
+  steps?: unknown[]
+  message?: string
+}> {
+  const r = await apiFetch('/dataset/refresh', { method: 'POST', signal })
+  let data: { ok?: boolean; error?: string; steps?: unknown[]; message?: string }
+  try {
+    const text = await r.text()
+    data = text ? JSON.parse(text) : {}
+  } catch {
+    return { ok: false, error: 'Invalid response from server.' }
+  }
+  if (!r.ok) return { ok: false, error: data.error ?? 'Refresh failed' }
+  return data as { ok: boolean; error?: string; steps?: unknown[]; message?: string }
+}
+
+/** @deprecated Prefer refreshAppDataset() from the Dashboard. */
+export async function syncSalesforce(signal?: AbortSignal): Promise<{
   ok: boolean
   error?: string
   synced_opportunities?: number
@@ -683,7 +915,7 @@ export async function syncSalesforce(): Promise<{
   renewal_date_field_used?: boolean
   renewal_date_field_configured?: boolean
 }> {
-  const r = await apiFetch('/sync/salesforce', { method: 'POST' })
+  const r = await apiFetch('/sync/salesforce', { method: 'POST', signal })
   let data: { ok?: boolean; error?: string; detail?: unknown; renewal_date_field_used?: boolean; renewal_date_field_configured?: boolean }
   try {
     const text = await r.text()
@@ -692,40 +924,16 @@ export async function syncSalesforce(): Promise<{
     return { ok: false, error: r.ok ? 'Invalid response from server.' : 'Sync failed. Restart the backend and try again.' }
   }
   if (!r.ok) return { ok: false, error: data.error || (Array.isArray(data.detail) ? data.detail.map((d: { msg?: string }) => d.msg).join(' ') : String(data.detail ?? 'Sync failed')) }
-  return data as { ok: boolean; error?: string; synced_opportunities?: number; synced_line_items?: number; renewal_opportunities_count?: number; message?: string; renewal_date_field_used?: boolean; renewal_date_field_configured?: boolean }
-}
-
-export async function getEodSnapshots(): Promise<{
-  count: number
-  snapshots: Array<{ snapshot_date: string; snapshot_utc: string | null }>
-  message?: string
-}> {
-  const r = await apiFetch('/salesforce/eod-snapshots')
-  if (!r.ok) throw new Error('Failed to fetch EOD snapshots')
-  return r.json()
-}
-
-export async function takeEodSnapshotNow(): Promise<{ ok: boolean; message?: string; error?: string }> {
-  const r = await apiFetch('/salesforce/eod-snapshots/take', { method: 'POST' })
-  const data = await r.json().catch(() => ({}))
-  if (!r.ok) return { ok: false, error: data.detail ?? data.error ?? 'Failed to take snapshot' }
-  return { ok: true, message: data.message }
-}
-
-export async function getEodSnapshotContents(
-  snapshotDate: string,
-  full = false
-): Promise<{
-  snapshot_date: string
-  snapshot_utc: string | null
-  counts: { accounts: number; opportunities: number; opportunity_line_items: number }
-  carr_summary: { grand_total: number; accounts_with_arr: number }
-  payload?: unknown
-}> {
-  const path = `/salesforce/eod-snapshots/${encodeURIComponent(snapshotDate)}${full ? '?full=1' : ''}`
-  const r = await apiFetch(path)
-  if (!r.ok) throw new Error(r.status === 404 ? 'No snapshot for that date' : 'Failed to fetch snapshot')
-  return r.json()
+  return data as {
+    ok: boolean
+    error?: string
+    synced_opportunities?: number
+    synced_line_items?: number
+    renewal_opportunities_count?: number
+    message?: string
+    renewal_date_field_used?: boolean
+    renewal_date_field_configured?: boolean
+  }
 }
 
 /** Admin: Active vs Contracted ARR calculation steps (same engine as Products purchased schedule). */
@@ -837,7 +1045,7 @@ export async function getArrScheduleBreakdown(q = '12 south'): Promise<{
   if (sawFullActiveArrWithoutBreakdown) {
     throw new Error(
       `The API still returned the full Schedule without breakdown (missing breakdown_q / POST route). ` +
-        `In dev, breakdown calls http://127.0.0.1:8000 directly — if that is not your API, set VITE_DEV_BACKEND_URL. ` +
+        `In dev, breakdown calls http://127.0.0.1:8008 directly — if that is not your API, set VITE_DEV_BACKEND_URL. ` +
         `Otherwise run .\\backend\\start-backend.ps1 from this repo. Try POST ${postUrl} with {"q":"12 south"}.`
     )
   }
@@ -845,7 +1053,7 @@ export async function getArrScheduleBreakdown(q = '12 south'): Promise<{
   throw new Error(
     `ARR schedule breakdown failed (${lastStatus}${lastDetail ? `: ${lastDetail.slice(0, 200)}` : ''}). ` +
       `POST tried: ${postUrl}. ` +
-      `Confirm the process on port 8000 is this project (see start-backend.ps1 “Verified: main.py includes…” line).`
+      `Confirm the process on port 8008 is this project (see start-backend.ps1 “Verified: main.py includes…” line).`
   )
 }
 

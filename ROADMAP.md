@@ -1,4 +1,4 @@
-# Dazos CFO Copilot — Roadmap
+# Dazos CFO Cockpit — Roadmap
 
 This roadmap turns the [vision in CONTEXT.md](CONTEXT.md) into a phased build. Each phase delivers something you can use, and sets up the next.
 

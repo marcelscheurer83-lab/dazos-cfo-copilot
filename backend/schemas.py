@@ -20,13 +20,13 @@ class BookingsMTDRow(BaseModel):
 
 
 class BookingsPeriod(BaseModel):
-    """One period: label (e.g. Jan 26, Feb 26 MTD, Q1 26 QTD) and rows. Expansion breakdown: mid_term (closed won expansions), upon_renewal (renewals). Pipe coverage = open pipeline ARR / shortfall to plan (MTD/QTD only)."""
+    """One period: label and rows. Closed Lost = 0. NB = ARR__c; expansion / mid-term / upon renewal = Expansion_ARR__c as in API. Pipe coverage = open pipeline / shortfall (MTD/QTD only)."""
     period_label: str
     total: BookingsMTDRow
     new_business: BookingsMTDRow
-    expansion: BookingsMTDRow
-    expansion_mid_term: Optional[float] = None  # booking ARR from closed won expansions (no plan/delta)
-    expansion_upon_renewal: Optional[float] = None  # booking ARR from renewals (no plan/delta)
+    expansion: BookingsMTDRow  # mtd = mid-term + upon renewal; plan from sheet expansion column
+    expansion_mid_term: Optional[float] = None  # Closed Won Expansion record type only (Expansion_ARR__c)
+    expansion_upon_renewal: Optional[float] = None  # Closed Won renewal Expansion_ARR__c (no plan/delta)
     pipe_coverage_total: Optional[float] = None  # total open pipeline ARR / shortfall to plan (MTD/QTD only)
     pipe_coverage_new_business: Optional[float] = None  # open pipeline NB ARR / shortfall to plan (MTD/QTD only)
     pipe_coverage_expansion: Optional[float] = None  # open pipeline expansion ARR / shortfall to plan (MTD/QTD only)
@@ -64,6 +64,40 @@ class CashMTDResponse(BaseModel):
     plan_source: Optional[str] = None
     plan_message: Optional[str] = None
     chargebee_message: Optional[str] = None  # e.g. error or "No invoices in range"
+
+
+class RenewalsMTDRow(BaseModel):
+    """Renewals dashboard row: actual (mtd), plan, % = actual/plan, Δ = actual − plan (delta_k in $K for dollars; for rate row, mtd/plan are 0–1 and delta_k is percentage points)."""
+
+    mtd: float
+    plan: Optional[float] = None
+    achievement_pct: Optional[float] = None
+    delta_k: Optional[float] = None
+    is_rate: bool = False
+
+
+class RenewalsPeriod(BaseModel):
+    """Renewals vs plan for one period (same labels as Bookings MTD)."""
+
+    period_label: str
+    up_for_renewal: RenewalsMTDRow
+    renewed: RenewalsMTDRow
+    open: RenewalsMTDRow
+    churn: RenewalsMTDRow
+    contraction: RenewalsMTDRow
+    renewal_rate: RenewalsMTDRow
+    cancelled: RenewalsMTDRow
+
+
+class RenewalsMTDResponse(BaseModel):
+    """Renewals KPIs vs ARR_Calculations_2026P (UFR row + BU35/BU52/BU54). Same four periods as Bookings."""
+
+    two_months_ago: RenewalsPeriod
+    previous_month: RenewalsPeriod
+    current_mtd: RenewalsPeriod
+    qtd: RenewalsPeriod
+    plan_source: Optional[str] = None
+    plan_message: Optional[str] = None
 
 
 class KPISummary(BaseModel):
@@ -120,3 +154,45 @@ class CopilotRequest(BaseModel):
 class CopilotResponse(BaseModel):
     answer: str
     sources: Optional[list[str]] = None
+
+
+class RenewalsOverviewRow(BaseModel):
+    """One renewal opportunity: UFR from Original_ARR__c; Renewed from ARR__c when Closed Won / 0 when Closed Lost."""
+
+    account_id: Optional[str] = None
+    account_name: str
+    opportunity_sf_id: str
+    opportunity_name: str
+    stage_name: str
+    renewal_date: Optional[str] = None  # ISO date; dedicated Renewal Date when set, else Close Date
+    midterm_cancellation_after_stage: Optional[str] = None  # "Yes" when Midterm_Cancellation__c is true; null when false
+    up_for_renewal_arr: Optional[float] = None  # Original_ARR__c (stored as original_acv)
+    renewed_arr: Optional[float] = None  # Closed Won: ARR__c; Closed Lost: 0; open pipeline: null
+    delta: Optional[float] = None  # renewed_arr - up_for_renewal_arr when both sides defined
+
+
+class RenewalsChartMonth(BaseModel):
+    """Stacked chart bucket for one renewal month (excludes mid-term cancellation)."""
+
+    month: str  # YYYY-MM
+    arr_open: float  # sum of up-for-renewal ARR (original_acv) for open (non-closed) opps
+    arr_renewed: float  # UFR total − churned/contracted − open (residual; ≥ 0)
+    arr_churned: float  # positive magnitude: −sum(delta) over opps with delta < 0
+    count_open: int
+    count_renewed: int  # Closed Won
+    count_lost: int  # Closed Lost
+    arr_renewal_rate: Optional[float] = None  # (ufr on closed opps + sum(delta where delta<0)) / ufr on closed; open excluded
+    opp_renewal_rate: Optional[float] = None  # closed won / (closed won + closed lost)
+    arr_midterm_cancellation: float = 0.0  # sum of up-for-renewal ARR for mid-term cancellation = Yes (not in stack)
+    count_midterm_cancellation: int = 0  # opps with mid-term cancellation = Yes in that renewal month
+
+
+class RenewalsOverviewResponse(BaseModel):
+    rows: list[RenewalsOverviewRow]
+    grand_up_for_renewal_arr: float
+    grand_renewed_arr: float
+    grand_delta: float
+    stages: list[str]
+    available_months: list[str]  # YYYY-MM from renewal date (or close date fallback), for filter dropdown
+    renewals_chart: list[RenewalsChartMonth]  # ~6 months: 3 prior + current + 2 upcoming; excludes mid-term in stacks
+    salesforce_base_url: Optional[str] = None

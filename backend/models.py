@@ -1,4 +1,4 @@
-"""Financial data models for Dazos CFO Copilot."""
+"""Financial data models for Dazos CFO Cockpit."""
 from sqlalchemy import Column, Integer, String, Float, Date, DateTime, Text, UniqueConstraint
 from sqlalchemy.sql import func
 from database import Base
@@ -101,9 +101,21 @@ class ChargebeeSnapshot(Base):
     """Stored snapshot of Chargebee list API response for billing reconciliation."""
     __tablename__ = "chargebee_snapshots"
     id = Column(Integer, primary_key=True)
-    report_type = Column(String(32), nullable=False)  # subscriptions, invoices
+    report_type = Column(String(32), nullable=False)  # subscriptions, invoices, cash_invoices, cash_payments
     as_of = Column(DateTime, server_default=func.now())
     data_json = Column(Text, nullable=False)  # Full list response: { "list": [...], "next_offset": "..." }
+
+
+class AppDatasetState(Base):
+    """Singleton (id=1): last unified app dataset refresh from the Dashboard (Salesforce, Sheets, Chargebee)."""
+
+    __tablename__ = "app_dataset_state"
+    id = Column(Integer, primary_key=True)  # always 1
+    # UTC instant; SQLite stores ISO string. Prefer aware writes (datetime.now(timezone.utc)).
+    updated_at = Column(DateTime(timezone=True), nullable=True)
+    last_refresh_ok = Column(Integer, default=0)  # 1 = last run succeeded
+    last_error = Column(Text, nullable=True)
+    steps_json = Column(Text, nullable=True)  # JSON: [{ "step": "...", "ok": bool, "detail": ... }, ...]
 
 
 class Opportunity(Base):

@@ -3,12 +3,15 @@ import { Routes, Route, Navigate } from 'react-router-dom'
 import Layout from './Layout'
 import Login from './Login'
 import Dashboard from './views/Dashboard'
+import DashboardCurrentSummary from './views/DashboardCurrentSummary'
 import ARR from './views/ARR'
 import ARRScheduleActiveArr from './views/ARRScheduleActiveArr'
+import ARRNewSchedule from './views/ARRNewSchedule'
 import Analytics from './views/Analytics'
 import AnalyticsCRMSeats from './views/AnalyticsCRMSeats'
 import Pipeline from './views/Pipeline'
 import Closed from './views/Closed'
+import Renewals from './views/Renewals'
 import Placeholder from './views/Placeholder'
 import Admin from './views/Admin'
 
@@ -60,12 +63,20 @@ export default function App() {
     <Routes>
       <Route path="/" element={<Layout />}>
         <Route index element={<Navigate to="/dashboard" replace />} />
-        <Route path="dashboard" element={<Dashboard />} />
+        <Route path="dashboard" element={<Dashboard />}>
+          <Route index element={<Navigate to="current-overview" replace />} />
+          <Route path="current-overview" element={<DashboardCurrentSummary />} />
+          <Route path="current-summary" element={<Navigate to="/dashboard/current-overview" replace />} />
+          <Route path="q1-2026" element={<DashboardCurrentSummary title="Q1 2026" />} />
+          <Route path="q2-2026" element={<DashboardCurrentSummary title="Q2 2026" />} />
+        </Route>
         <Route path="bookings" element={<Closed />} />
+        <Route path="renewals" element={<Renewals />} />
         <Route path="pipeline-overview" element={<Pipeline />} />
         <Route path="products-purchased" element={<ARR />} />
         <Route path="customer-overview" element={<Navigate to="/products-purchased" replace />} />
         <Route path="arr-schedule/active-arr" element={<ARRScheduleActiveArr />} />
+        <Route path="arr-schedule/new-schedule" element={<ARRNewSchedule />} />
         <Route path="analytics" element={<Analytics />} />
         <Route path="analytics/crm-seats" element={<AnalyticsCRMSeats />} />
         <Route path="arr" element={<Navigate to="/products-purchased" replace />} />

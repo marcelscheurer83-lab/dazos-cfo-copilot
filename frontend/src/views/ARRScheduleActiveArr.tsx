@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { getARRScheduleActiveARRByMonth, syncSalesforce, exportCopilotARRScheduleToSheet, type ActiveARRByMonthRow } from '../api'
+import { getARRScheduleActiveARRByMonth, exportCopilotARRScheduleToSheet, type ActiveARRByMonthRow } from '../api'
 
 function fmtMoney(n: number) {
   return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(n)
@@ -22,8 +22,6 @@ export default function ARRScheduleActiveArrView() {
   const [grandTotal, setGrandTotal] = useState(0)
   const [salesforceBaseUrl, setSalesforceBaseUrl] = useState<string | undefined>(undefined)
   const [err, setErr] = useState<string | null>(null)
-  const [syncStatus, setSyncStatus] = useState<'idle' | 'loading' | 'ok' | 'error'>('idle')
-  const [syncMessage, setSyncMessage] = useState<string | null>(null)
   const [exportStatus, setExportStatus] = useState<'idle' | 'loading' | 'ok' | 'error'>('idle')
   const [exportMessage, setExportMessage] = useState<string | null>(null)
   const [exportSpreadsheetUrl, setExportSpreadsheetUrl] = useState<string | null>(null)
@@ -56,30 +54,6 @@ export default function ARRScheduleActiveArrView() {
       })
       .catch((e) => setErr(e.message))
   }, [])
-
-  const handleSyncSalesforce = useCallback(() => {
-    setSyncStatus('loading')
-    setSyncMessage(null)
-    syncSalesforce()
-      .then((res) => {
-        if (res.ok) {
-          setSyncStatus('ok')
-          setSyncMessage(
-            res.synced_opportunities != null && res.synced_line_items != null
-              ? `Synced ${res.synced_opportunities} opportunities, ${res.synced_line_items} product lines.`
-              : 'Sync complete.'
-          )
-          load()
-        } else {
-          setSyncStatus('error')
-          setSyncMessage(res.error ?? 'Sync failed')
-        }
-      })
-      .catch((e) => {
-        setSyncStatus('error')
-        setSyncMessage(e.message ?? 'Sync failed')
-      })
-  }, [load])
 
   const handleExportToSheet = useCallback(() => {
     setExportStatus('loading')
@@ -622,32 +596,16 @@ export default function ARRScheduleActiveArrView() {
       <p style={{ fontSize: '0.9rem', color: 'var(--text-muted)', marginBottom: '1rem' }}>
         <strong>Active ARR as of today</strong> = ARR from the period that contains today. The schedule includes
         <strong> all closed-won new business and renewal</strong> periods per account (e.g. ex-post-added past NB before a renewal).
-        Subscription start/end = earliest period start to latest period end.
+        Subscription start/end = earliest period start to latest period end. To pull fresh CRM data from Salesforce, use{' '}
+        <strong>Dashboard → Refresh app data</strong>.
       </p>
 
-      <p style={{ marginBottom: '1rem' }}>
-        <button
-          type="button"
-          onClick={handleSyncSalesforce}
-          disabled={syncStatus === 'loading'}
-          style={{
-            padding: '0.5rem 1rem',
-            fontSize: '0.9rem',
-            cursor: syncStatus === 'loading' ? 'wait' : 'pointer',
-            background: 'var(--surface)',
-            color: 'var(--text)',
-            border: '1px solid var(--border)',
-            borderRadius: 6,
-          }}
-        >
-          {syncStatus === 'loading' ? 'Syncing…' : 'Sync from Salesforce'}
-        </button>
+      <p style={{ marginBottom: '1rem', display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '0.5rem 0.75rem' }}>
         <button
           type="button"
           onClick={handleExportToSheet}
           disabled={exportStatus === 'loading' || rows.length === 0}
           style={{
-            marginLeft: '0.5rem',
             padding: '0.5rem 1rem',
             fontSize: '0.9rem',
             cursor: exportStatus === 'loading' || rows.length === 0 ? 'not-allowed' : 'pointer',
@@ -660,7 +618,7 @@ export default function ARRScheduleActiveArrView() {
         >
           {exportStatus === 'loading' ? 'Exporting…' : 'Export to Copilot ARR export'}
         </button>
-        <span style={{ marginLeft: '0.75rem', fontSize: '0.85rem', color: 'var(--text-muted)' }}>
+        <span style={{ fontSize: '0.85rem', color: 'var(--text-muted)' }}>
           Export writes to the &quot;Copilot ARR export&quot; tab in your financial model (create that tab if it doesn’t exist).
         </span>
         {hasActiveFilter && (
@@ -684,12 +642,6 @@ export default function ARRScheduleActiveArrView() {
           >
             Clear filter
           </button>
-        )}
-        {syncStatus === 'ok' && syncMessage && (
-          <span style={{ marginLeft: '0.75rem', fontSize: '0.9rem', color: 'var(--positive)' }}>{syncMessage}</span>
-        )}
-        {syncStatus === 'error' && syncMessage && (
-          <span style={{ marginLeft: '0.75rem', fontSize: '0.9rem', color: 'var(--negative)' }}>{syncMessage}</span>
         )}
         {exportStatus === 'ok' && exportMessage && (
           <span style={{ marginLeft: '0.75rem', fontSize: '0.9rem', color: 'var(--positive)' }}>
@@ -721,10 +673,9 @@ export default function ARRScheduleActiveArrView() {
       {rows.length > 0 && (
         <div
           style={{
-            overflow: 'auto',
-            maxHeight: 'calc(100vh - 12rem)',
             border: '1px solid var(--border)',
             borderRadius: 8,
+            minWidth: 0,
           }}
         >
           <table

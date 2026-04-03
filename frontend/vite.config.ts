@@ -11,8 +11,10 @@ export default defineConfig({
     port: 5173,
     proxy: {
       '/api': {
-        target: 'http://127.0.0.1:8000',
+        target: 'http://127.0.0.1:8008',
         changeOrigin: true,
+        timeout: 600_000,
+        proxyTimeout: 600_000,
         configure(proxy) {
           proxy.on('proxyReq', (proxyReq, req) => {
             const p = req.headers['x-app-password']
@@ -27,8 +29,10 @@ export default defineConfig({
     port: 4173,
     proxy: {
       '/api': {
-        target: 'http://127.0.0.1:8000',
+        target: 'http://127.0.0.1:8008',
         changeOrigin: true,
+        timeout: 600_000,
+        proxyTimeout: 600_000,
         configure(proxy) {
           proxy.on('proxyReq', (proxyReq, req) => {
             const p = req.headers['x-app-password']

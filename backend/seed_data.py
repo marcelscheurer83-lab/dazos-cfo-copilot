@@ -3,7 +3,7 @@ from datetime import date, timedelta
 from sqlalchemy import select, text, Date, DateTime, Integer, Float, String, Text, Boolean
 from sqlalchemy.exc import OperationalError
 from database import engine, AsyncSessionLocal
-from models import Base, Company, KPI, PnLLine, CashFlowLine, BudgetLine
+from models import Base, Company, KPI, PnLLine, CashFlowLine, BudgetLine, AppDatasetState
 
 
 def _sqlite_type(typ):
@@ -63,6 +63,10 @@ async def create_tables():
 
 async def seed():
     await create_tables()
+    async with AsyncSessionLocal() as session:
+        if not await session.get(AppDatasetState, 1):
+            session.add(AppDatasetState(id=1, updated_at=None, last_refresh_ok=0, last_error=None, steps_json=None))
+            await session.commit()
     async with AsyncSessionLocal() as session:
         if await session.scalar(select(Company).limit(1)):
             return  # already seeded

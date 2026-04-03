@@ -3,6 +3,7 @@ Google Sheets connector: read ranges from the financial model/plan sheet.
 Uses a service account; the sheet must be shared with the service account email.
 """
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -121,12 +122,28 @@ class GoogleSheetsConnector:
         self._drive_service = build("drive", "v3", credentials=self._credentials)
         return self._drive_service
 
-    def read_range(self, range_a1: str, spreadsheet_id: str | None = None) -> list[list[Any]]:
+    @staticmethod
+    def _align_values_to_requested_top_row(values: list[list[Any]], api_range: str | None) -> list[list[Any]]:
         """
-        Read a range from the sheet using A1 notation (e.g. "Plan!A1:Z100").
-        spreadsheet_id: if given, read from this spreadsheet; otherwise use self.sheet_id.
-        Returns a list of rows; each row is a list of cell values.
+        The Sheets API may omit leading **empty** rows from ``values``. Row 1 of the sheet must be ``values[0]``
+        for callers that index by Excel row (e.g. BU35 = row 35 → index 34). If the response ``range`` starts
+        at row N>1, prepend N-1 empty rows.
         """
+        if not values or not api_range:
+            return values
+        # Examples: 'ARR_Calculations_2026P'!A1:ZZ1000  or  Sheet!A35:ZZ1000
+        m = re.search(r"!([A-Z]+)(\d+)(?::|$)", api_range.replace("'", ""))
+        if not m:
+            return values
+        start_row = int(m.group(2))
+        if start_row <= 1:
+            return values
+        pad = [[] for _ in range(start_row - 1)]
+        return pad + values
+
+    def _fetch_values(
+        self, range_a1: str, spreadsheet_id: str | None = None
+    ) -> tuple[list[list[Any]], str | None]:
         sid = spreadsheet_id or self.sheet_id
         if not sid:
             raise ValueError("spreadsheet_id or GOOGLE_SHEET_ID is required for read")
@@ -135,8 +152,26 @@ class GoogleSheetsConnector:
         result = sheet.values().get(
             spreadsheetId=sid,
             range=range_a1,
+            valueRenderOption="UNFORMATTED_VALUE",
         ).execute()
-        return result.get("values", [])
+        return result.get("values", []), result.get("range")
+
+    def read_range_values_raw(self, range_a1: str, spreadsheet_id: str | None = None) -> list[list[Any]]:
+        """
+        Values exactly as returned by the API (no row padding). Use when merging a single cell
+        (e.g. ``BU35:BU35``) into a larger grid: padded reads would leave column BU at the wrong index.
+        """
+        values, _ = self._fetch_values(range_a1, spreadsheet_id)
+        return values
+
+    def read_range(self, range_a1: str, spreadsheet_id: str | None = None) -> list[list[Any]]:
+        """
+        Read a range from the sheet using A1 notation (e.g. "Plan!A1:Z100").
+        spreadsheet_id: if given, read from this spreadsheet; otherwise use self.sheet_id.
+        Returns a list of rows; each row is a list of cell values.
+        """
+        values, api_range = self._fetch_values(range_a1, spreadsheet_id)
+        return self._align_values_to_requested_top_row(values, api_range)
 
     def get_sheet_gid_by_title(
         self,

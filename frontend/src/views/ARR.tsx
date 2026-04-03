@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { createPortal } from 'react-dom'
-import { getARRByAccountProduct, getSalesforceUserNamesByIds, syncSalesforce, type ARRByAccountProductResponse } from '../api'
+import { getARRByAccountProduct, getSalesforceUserNamesByIds, type ARRByAccountProductResponse } from '../api'
 
 const menuItemStyle: React.CSSProperties = {
   display: 'block',
@@ -44,8 +44,6 @@ export default function ARR() {
   const [data, setData] = useState<ARRByAccountProductResponse | null>(null)
   const [csmNameById, setCsmNameById] = useState<Record<string, string>>({})
   const [err, setErr] = useState<string | null>(null)
-  const [syncStatus, setSyncStatus] = useState<'idle' | 'loading' | 'ok' | 'error'>('idle')
-  const [syncMessage, setSyncMessage] = useState<string | null>(null)
   const [sortKey, setSortKey] = useState<SortKey>('account_name')
   const [sortDir, setSortDir] = useState<SortDir>('asc')
   const [columnFilter, setColumnFilter] = useState<Record<string, ColumnFilterMode>>({})
@@ -81,28 +79,6 @@ export default function ARR() {
       .then((map) => setCsmNameById(map))
       .catch(() => setCsmNameById({}))
   }, [data])
-
-  const handleSyncSalesforce = () => {
-    setSyncStatus('loading')
-    setSyncMessage(null)
-    syncSalesforce()
-      .then((res) => {
-        if (res.ok) {
-          setSyncStatus('ok')
-          setSyncMessage(
-            `Synced ${res.synced_opportunities ?? 0} opportunities, ${res.synced_line_items ?? 0} product lines. ${res.renewal_opportunities_count ?? 0} open renewal(s) for CARR.`
-          )
-          loadData()
-        } else {
-          setSyncStatus('error')
-          setSyncMessage(res.error ?? 'Sync failed')
-        }
-      })
-      .catch((e) => {
-        setSyncStatus('error')
-        setSyncMessage(e.message ?? 'Sync failed')
-      })
-  }
 
   // Derive data for table (safe when data is null) — must be before any early return so hooks below run every time
   const apiProducts = Array.isArray(data?.products) ? data.products : []
@@ -379,29 +355,9 @@ export default function ARR() {
         >
           Refresh data
         </button>
-        <button
-          type="button"
-          onClick={handleSyncSalesforce}
-          disabled={syncStatus === 'loading'}
-          style={{
-            padding: '0.5rem 1rem',
-            fontSize: '0.9rem',
-            fontWeight: 600,
-            cursor: syncStatus === 'loading' ? 'wait' : 'pointer',
-            background: 'var(--bg)',
-            color: 'var(--text)',
-            border: '1px solid var(--border)',
-            borderRadius: 6,
-          }}
-        >
-          {syncStatus === 'loading' ? 'Syncing…' : 'Sync from Salesforce'}
-        </button>
-        {syncStatus === 'ok' && syncMessage && (
-          <span style={{ fontSize: '0.9rem', color: 'var(--positive)' }}>{syncMessage}</span>
-        )}
-        {syncStatus === 'error' && syncMessage && (
-          <span style={{ fontSize: '0.9rem', color: 'var(--negative)' }}>{syncMessage}</span>
-        )}
+        <span style={{ fontSize: '0.85rem', color: 'var(--text-muted)' }}>
+          To update Salesforce, Sheets, and Chargebee from sources, use <strong>Dashboard → Refresh app data</strong>.
+        </span>
         {Object.keys(columnFilter).length > 0 && (
           <>
             <span style={{ fontSize: '0.9rem', color: 'var(--text-muted)' }}>

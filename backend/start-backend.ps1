@@ -1,19 +1,48 @@
-# Stop any process listening on port 8000, then start one backend (Python 3.12).
+# Stop any process listening on the backend port, then start one backend (Python 3.12).
 # Run from repo root: .\backend\start-backend.ps1
 # Or from backend: .\start-backend.ps1
+#
+# Default port is 8008 (not 8000): on some Windows setups multiple listeners on 8000 can yield a
+# stale/incomplete app (fewer routes in OpenAPI). Override: $env:BACKEND_PORT = 8000
 
 $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
 
-$port = 8000
-$pids = Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -Unique
-if ($pids) {
+$port = 8008
+if ($env:BACKEND_PORT -match '^\d+$') { $port = [int]$env:BACKEND_PORT }
+elseif ($env:PORT -match '^\d+$') { $port = [int]$env:PORT }
+
+function Get-PidsListeningOnPort {
+  param([int]$Port)
+  $conns = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
+  return @($conns | Select-Object -ExpandProperty OwningProcess -Unique | Where-Object { $_ -and $_ -gt 0 })
+}
+
+for ($round = 0; $round -lt 4; $round++) {
+  $pids = Get-PidsListeningOnPort -Port $port
+  if ($pids.Count -eq 0) { break }
   foreach ($procId in $pids) {
     Write-Host "Stopping process $procId (was using port $port)..."
+    # /T = child workers (uvicorn --reload uses a parent + server process)
+    # cmd so a stale PID does not abort the script ($ErrorActionPreference = Stop)
+    cmd /c "taskkill /F /T /PID $procId 2>nul" | Out-Null
     Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue
   }
   Start-Sleep -Seconds 2
 }
+if ((Get-PidsListeningOnPort -Port $port).Count -gt 0) {
+  Write-Host "WARNING: port $port may still be in use. Close other terminals using Uvicorn or run as Administrator."
+}
+Start-Sleep -Seconds 1
+
+# Second pass: kill any Python still running uvicorn on this port (duplicate consoles / mixed interpreters).
+Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+  $_.CommandLine -and $_.CommandLine -match 'uvicorn' -and ($_.CommandLine -like "*--port $port*" -or $_.CommandLine -like "*-port $port*")
+} | ForEach-Object {
+  Write-Host "Stopping uvicorn PID $($_.ProcessId)..."
+  cmd /c "taskkill /F /T /PID $($_.ProcessId) 2>nul" | Out-Null
+}
+Start-Sleep -Seconds 2
 
 $python = Join-Path $PSScriptRoot ".venv312\Scripts\python.exe"
 if (-not (Test-Path $python)) {

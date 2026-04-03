@@ -54,3 +54,59 @@ button {
 .arr-filter-menu button:hover {
   background: var(--surface-hover);
 }
+
+/* NEW SCHEDULE ARR table — DM Sans, dark deck (#0a0c10), subtle cyan text glow */
+.new-schedule-arr-table {
+  font-family: var(--font-sans);
+  font-size: 0.9rem;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+  line-height: 1.45;
+  -webkit-font-smoothing: antialiased;
+  background: #0a0c10;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: rgba(230, 233, 240, 0.96);
+}
+.new-schedule-arr-table table {
+  font-size: inherit;
+  color: inherit;
+}
+.new-schedule-arr-table th,
+.new-schedule-arr-table td {
+  font-size: inherit;
+  text-shadow: 0 0 1px rgba(34, 211, 238, 0.35), -1px 0 2px rgba(56, 189, 248, 0.22);
+}
+.new-schedule-arr-table thead tr {
+  background: transparent;
+  border-bottom: 1px solid var(--border);
+}
+.new-schedule-arr-table tbody tr {
+  border-bottom: 1px solid var(--border);
+}
+/* Match account links on Closed / Renewals / Active ARR schedule (var(--accent)) */
+.new-schedule-arr-table a {
+  color: var(--accent);
+  text-decoration: none;
+}
+.new-schedule-arr-table button {
+  font-family: inherit;
+  font-size: inherit;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+}
+.new-schedule-arr-table select,
+.new-schedule-arr-table option {
+  font-family: inherit;
+  font-size: inherit;
+}
+.new-schedule-arr-table > p {
+  font-size: inherit;
+}
+.new-schedule-arr-table .ns-id-cell {
+  font-variant-numeric: tabular-nums;
+}
+.new-schedule-arr-table > p,
+.new-schedule-arr-table > p span {
+  text-shadow: 0 0 1px rgba(34, 211, 238, 0.35), -1px 0 2px rgba(56, 189, 248, 0.22);
+}

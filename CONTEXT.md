@@ -1,4 +1,4 @@
-# Dazos CFO Copilot — Company & role context
+# Dazos CFO Cockpit — Company & role context
 
 Use this context to keep the Copilot, analytics, and any AI assistance aligned with Dazos and with an FP&A / Revenue Operations lens.
 

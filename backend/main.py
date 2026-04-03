@@ -1,7 +1,7 @@
 """
-Dazos CFO Copilot — FastAPI backend.
+Dazos CFO Cockpit — FastAPI backend.
 Dashboard, P&L, cash flow, budget vs actuals, and Copilot Q&A.
-All scheduled times (hourly sync, EOD snapshot) use America/New_York (EST/EDT).
+Background jobs use America/New_York (EST/EDT): optional hourly Salesforce sync; daily EOD snapshot at 23:59:59 EST from current DB (Salesforce rows reflect Dashboard → Refresh app data unless hourly sync is enabled).
 """
 import asyncio
 import calendar
@@ -11,7 +11,7 @@ import time
 import os
 import re
 from contextlib import asynccontextmanager
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 from typing import Any, List, Optional
@@ -23,10 +23,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
-from sqlalchemy import select, delete, func, or_
+from sqlalchemy import select, delete, func, or_, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import get_db, AsyncSessionLocal
+
+# Serialize unified dataset refresh (Salesforce + Sheets + Chargebee); commit inside lock to avoid overlapping SQLite writes.
+_dataset_refresh_lock = asyncio.Lock()
+# Backwards-compatible alias (scheduled job / comments)
+_salesforce_sync_lock = _dataset_refresh_lock
 from models import (
     Company,
     KPI,
@@ -41,6 +46,7 @@ from models import (
     ActiveARRAccountOverride,
     QuickBooksReportSnapshot,
     ChargebeeSnapshot,
+    AppDatasetState,
     SalesforceEODSnapshot,
     ARRScheduleDaily,
     ARRSchedulePeriod,
@@ -58,6 +64,12 @@ from schemas import (
     BookingsPeriod,
     CashMTDResponse,
     CashPeriod,
+    RenewalsMTDResponse,
+    RenewalsMTDRow,
+    RenewalsPeriod,
+    RenewalsChartMonth,
+    RenewalsOverviewRow,
+    RenewalsOverviewResponse,
 )
 from seed_data import seed
 
@@ -126,6 +138,105 @@ APP_PASSWORD = (_app_password_raw or "").strip().strip('"').strip("'") or None
 
 EST = ZoneInfo("America/New_York")
 
+
+def _app_dataset_updated_at_as_utc(dt: datetime) -> datetime:
+    """Interpret stored refresh time as a UTC instant (legacy rows may be naive UTC)."""
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _format_updated_at_utc_display(dt: datetime) -> str:
+    """Human-readable UTC for dashboard (stored instant is UTC)."""
+    utc = _app_dataset_updated_at_as_utc(dt)
+    hm = utc.strftime("%I:%M %p")
+    if len(hm) >= 2 and hm[0] == "0":
+        hm = hm[1:]
+    return f"{utc.strftime('%b %d, %Y')}, {hm} UTC"
+
+
+def _step_is_unified_quickbooks(s: dict) -> bool:
+    """Legacy unified refresh used step 'quickbooks'; tolerate casing/variants."""
+    st = str(s.get("step", "") or "").strip().lower()
+    return st == "quickbooks" or st.startswith("quickbooks:") or "quickbook" in st
+
+
+def _is_quickbooks_only_dataset_error(err: str) -> bool:
+    """Errors that can no longer occur in Refresh app data (QB removed from pipeline)."""
+    if not err:
+        return False
+    if "QuickBooks" in err:
+        return True
+    return "ProfitAndLoss" in err and "failed" in err.lower()
+
+
+async def _scrub_legacy_quickbooks_from_dataset_state(db: AsyncSession, row: AppDatasetState) -> None:
+    """Remove legacy QuickBooks steps/errors from app_dataset_state (unified refresh no longer syncs QB)."""
+    try:
+        steps = json.loads(row.steps_json or "[]")
+    except json.JSONDecodeError:
+        steps = []
+    if not isinstance(steps, list):
+        steps = []
+    new_steps = [s for s in steps if not (isinstance(s, dict) and _step_is_unified_quickbooks(s))]
+    had_qb = len(new_steps) != len(steps)
+    err = row.last_error or ""
+    qb_err_only = _is_quickbooks_only_dataset_error(err)
+    if not had_qb and not qb_err_only:
+        return
+    if had_qb:
+        row.steps_json = json.dumps(new_steps)
+    other_failed = any(s.get("ok") is False for s in new_steps if isinstance(s, dict))
+    if qb_err_only:
+        row.last_error = None
+    row.last_refresh_ok = 0 if other_failed else 1
+    await db.commit()
+
+
+async def _force_clear_quickbooks_dataset_error(db: AsyncSession, row: AppDatasetState) -> None:
+    """Last resort: clear last_error if it still mentions QuickBooks/ProfitAndLoss (legacy token errors)."""
+    err = row.last_error or ""
+    if not err:
+        return
+    el = err.lower().replace(" ", "")
+    if "quickbooks" not in err.lower() and "profitandloss" not in el:
+        return
+    try:
+        steps = json.loads(row.steps_json or "[]")
+    except json.JSONDecodeError:
+        steps = []
+    if not isinstance(steps, list):
+        steps = []
+    new_steps = [s for s in steps if not (isinstance(s, dict) and _step_is_unified_quickbooks(s))]
+    if len(new_steps) != len(steps):
+        row.steps_json = json.dumps(new_steps)
+    other_failed = any(s.get("ok") is False for s in new_steps if isinstance(s, dict))
+    row.last_error = None
+    row.last_refresh_ok = 0 if other_failed else 1
+    await db.commit()
+
+
+async def _scrub_app_dataset_quickbooks_legacy_on_startup() -> None:
+    """One-time cleanup of legacy QuickBooks failures in app_dataset_state (unified refresh no longer calls QB)."""
+    try:
+        async with AsyncSessionLocal() as db:
+            row = await db.get(AppDatasetState, 1)
+            if row:
+                await _scrub_legacy_quickbooks_from_dataset_state(db, row)
+                row = await db.get(AppDatasetState, 1)
+                if row:
+                    await _force_clear_quickbooks_dataset_error(db, row)
+    except Exception:
+        logging.getLogger(__name__).exception("Startup QuickBooks dataset scrub failed")
+
+
+def _scheduled_background_jobs_wanted() -> bool:
+    """Run the background scheduler if scheduled EOD and/or hourly Salesforce sync is enabled."""
+    eod = os.getenv("ENABLE_SCHEDULED_EOD_SNAPSHOT", "1").lower() not in ("0", "false", "no")
+    hourly = os.getenv("ENABLE_SCHEDULED_BACKGROUND_SYNC", "").lower() in ("1", "true", "yes")
+    return eod or hourly
+
+
 # One-time cleanup of Ascension/Ascend overrides when active-ARR is first requested (in case lifespan didn't run on deploy).
 _ascension_ascend_cleanup_done = False
 
@@ -133,20 +244,23 @@ _ascension_ascend_cleanup_done = False
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await seed()
+    await _scrub_app_dataset_quickbooks_legacy_on_startup()
     await asyncio.to_thread(_init_api_timing_log_file_on_startup)
     await _remove_ascension_ascend_overrides()
     await _remove_ascension_ascend_record_type_overrides()
-    # Background task: hourly Salesforce sync at :59 EST (ARR + pipeline); daily EOD snapshot at 23:59 EST (for historical ARR + pipeline)
-    task = asyncio.create_task(_scheduled_salesforce_jobs())
+    # Scheduled EOD at 23:59 EST (default on): snapshots current SQLite CRM data (typically last Dashboard → Refresh app data).
+    # Optional hourly Salesforce sync: ENABLE_SCHEDULED_BACKGROUND_SYNC=true (otherwise CRM updates are manual refresh only).
+    task = asyncio.create_task(_scheduled_salesforce_jobs()) if _scheduled_background_jobs_wanted() else None
     yield
-    task.cancel()
-    try:
-        await task
-    except asyncio.CancelledError:
-        pass
+    if task:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
 
-app = FastAPI(title="Dazos CFO Copilot API", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="Dazos CFO Cockpit API", version="1.0.0", lifespan=lifespan)
 _cors_origins = os.getenv("CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").strip().split(",")
 app.add_middleware(
     CORSMiddleware,
@@ -579,6 +693,7 @@ async def sync_google_sheets(
     try:
         # Run the blocking Google API call in a thread so we don't block the event loop
         data = await asyncio.to_thread(connector.read_range, range_name)
+        data = await asyncio.to_thread(_merge_arr_2026p_bu35_from_direct_cell, connector, range_name, data)
     except Exception as e:
         err_msg = str(e)
         # Common Google Sheets misconfigurations → turn into actionable guidance instead of raw HttpError
@@ -896,6 +1011,18 @@ def _is_closed_won_stage(stage_name: str | None) -> bool:
         return True
     # Fallback: "Closed Won" with odd characters or spelling
     if "closed" in s and "won" in s and "lost" not in s:
+        return True
+    return False
+
+
+def _is_closed_lost_stage(stage_name: str | None) -> bool:
+    """True if stage is Closed Lost (case-insensitive, whitespace normalized). Prefer over exact ``==`` for SF variants."""
+    if not stage_name:
+        return False
+    s = re.sub(r"[\s\u00A0\-_]+", " ", (stage_name or "").strip()).strip().lower()
+    if s == "closed lost":
+        return True
+    if "closed" in s and "lost" in s and "won" not in s:
         return True
     return False
 
@@ -1587,16 +1714,22 @@ async def _run_salesforce_sync(db: AsyncSession) -> dict:
 
 
 @app.post("/api/sync/salesforce")
-async def sync_salesforce(db: AsyncSession = Depends(get_db)):
+async def sync_salesforce():
     """
-    Sync opportunities and accounts from Salesforce into the app.
+    Salesforce-only sync (for scripts / debugging). From the app UI use **POST /api/dataset/refresh** on the Dashboard instead.
     Requires SALESFORCE_USERNAME, SALESFORCE_PASSWORD, and SALESFORCE_SECURITY_TOKEN in .env.
+    Uses a dedicated session and commits inside the sync lock so SQLite is not mid-transaction when the next sync starts.
     """
     try:
-        result = await _run_salesforce_sync(db)
-        return result
+        async with _salesforce_sync_lock:
+            async with AsyncSessionLocal() as db:
+                result = await _run_salesforce_sync(db)
+                if result.get("ok"):
+                    await db.commit()
+                else:
+                    await db.rollback()
+                return result
     except Exception as e:
-        await db.rollback()
         return JSONResponse(
             status_code=200,
             content={"ok": False, "error": f"Sync failed: {e}"},
@@ -1606,8 +1739,8 @@ async def sync_salesforce(db: AsyncSession = Depends(get_db)):
 @app.get("/api/salesforce/eod-snapshots")
 async def list_eod_snapshots(db: AsyncSession = Depends(get_db)):
     """
-    List all EOD snapshot dates (for verifying the daily 23:59 EST job on Railway).
-    Snapshots are stored in the DB table salesforce_eod_snapshots.
+    List EOD snapshot dates. Daily EOD runs at 23:59:59 EST when the scheduler is enabled (ENABLE_SCHEDULED_EOD_SNAPSHOT, default on).
+    Each snapshot reflects SQLite state at that time (CRM data from last manual app refresh unless hourly SF sync is on).
     """
     r = await db.execute(
         select(SalesforceEODSnapshot.snapshot_date, SalesforceEODSnapshot.snapshot_utc)
@@ -1617,7 +1750,7 @@ async def list_eod_snapshots(db: AsyncSession = Depends(get_db)):
     return {
         "count": len(rows),
         "snapshots": [{"snapshot_date": d.isoformat(), "snapshot_utc": (t.isoformat() if t else None)} for d, t in rows],
-        "message": "EOD snapshots are taken daily at 23:59:59 EST when the backend is running.",
+        "message": "EOD snapshots run daily at 23:59:59 EST (unless ENABLE_SCHEDULED_EOD_SNAPSHOT=0). They capture current DB state—refresh CRM data from the Dashboard before EOD if you rely on manual sync only.",
     }
 
 
@@ -2590,6 +2723,248 @@ async def get_arr_schedule_active_arr_by_month(db: AsyncSession = Depends(get_db
     return out
 
 
+@app.get("/api/arr-schedule/new-schedule-accounts")
+async def get_new_schedule_accounts(db: AsyncSession = Depends(get_db)):
+    """
+    Distinct accounts that have **at least one** Closed Won **New Business** opportunity (record type, with
+    overrides). Used by the NEW SCHEDULE view: Account name, **type** and **status** from ``Account`` (same as
+    Schedule), **subscription_start_date** = ``contract_start_date`` on the **first** such opportunity by
+    ``close_date`` (earliest closed-won NB); **subscription_end_date** = latest ``contract_end_date`` among
+    closed-won **New Business or Renewal** opportunities — unless there is a **Closed Lost Renewal** with
+    ``Midterm_Cancellation__c`` true (``midterm_cancellation`` = 1), in which case use that opportunity’s
+    **close_date** (latest if several) instead of contract ends from closed-won opps;     **live_arr** = sum of
+    ``ARR__c`` on Closed Won New Business / Renewal / Expansion opps whose contract window contains **today**
+    (America/New_York), **unless** there is a Closed Lost Renewal with midterm cancellation whose
+    ``contract_end_date`` is **before** today — then **live_arr** = **0**; plus 18-digit SFDC Account Id.
+    **contracted_arr** = **live_arr** + sum of ``ARR__c`` on **all** Closed Won opportunities whose
+    ``contract_start_date`` is strictly **after** today (America/New_York calendar date).
+    **arr_by_month** maps ``YYYY-MM`` (``month_columns``) to the same **Live ARR** definition as **live_arr**,
+    evaluated on the **last calendar day** of that month (America/New_York date context): sum of ``ARR__c`` on
+    Closed Won New Business / Renewal / Expansion opps whose contract window contains that day, **unless** the
+    midterm closed-lost renewal rule zeros ARR for that ``as_of`` date (same as **live_arr** with ``today`` =
+    month-end).
+    **Bookings owner exclusion** (``BOOKINGS_EXCLUDED_OWNER_NAMES``) does **not** apply anywhere on this endpoint.
+    """
+    overrides = await _get_record_type_overrides(db)
+
+    def _effective_record_type(o: Opportunity) -> str:
+        key = (o.sf_id or "").strip()
+        override = overrides.get(key) or (overrides.get(key[:15]) if len(key) >= 15 else None)
+        return (override or o.record_type_name or "").strip() or "—"
+
+    def _first_nb_subscription_start_iso(opps: list[Opportunity]) -> str | None:
+        """Contract Start Date from the closed-won NB opportunity with the earliest ``close_date`` (nulls last)."""
+        if not opps:
+            return None
+
+        def sort_key(o: Opportunity) -> tuple:
+            cd = o.close_date
+            return (cd is None, cd or date.max, (o.sf_id or ""))
+
+        first = sorted(opps, key=sort_key)[0]
+        cs = first.contract_start_date
+        return cs.isoformat() if cs else None
+
+    def _furthest_nb_renewal_contract_end_iso(opps: list[Opportunity]) -> str | None:
+        """Latest ``contract_end_date`` among closed-won NB + Renewal opps (nulls ignored)."""
+        ends = [o.contract_end_date for o in opps if o.contract_end_date is not None]
+        if not ends:
+            return None
+        return max(ends).isoformat()
+
+    def _midterm_lost_renewal_close_iso(
+        opps: list[Opportunity],
+    ) -> str | None:
+        """
+        Latest ``close_date`` among Closed Lost Renewal opps with ``midterm_cancellation`` = 1
+        (``Midterm_Cancellation__c``). None if no qualifying opportunity with a close date.
+        Does **not** apply bookings owner exclusion.
+        """
+        candidates: list[date] = []
+        for o in opps:
+            if not _is_closed_lost_stage(o.stage_name):
+                continue
+            if getattr(o, "midterm_cancellation", 0) != 1:
+                continue
+            if not _is_renewal_record_type(_effective_record_type(o)):
+                continue
+            if o.close_date is not None:
+                candidates.append(o.close_date)
+        if not candidates:
+            return None
+        return max(candidates).isoformat()
+
+    def _live_arr_sum_arr_c_as_of(opps: list[Opportunity], as_of: date) -> float:
+        """
+        Sum of ``ARR__c`` (``opportunity_arr``) for Closed Won New Business, Renewal, or Expansion opps where
+        ``contract_start_date`` and ``contract_end_date`` are set and ``as_of`` lies in that window (inclusive).
+        Does **not** apply bookings owner exclusion.
+        """
+        total = 0.0
+        for o in opps:
+            if not _is_closed_won_stage(o.stage_name):
+                continue
+            rt = _effective_record_type(o)
+            if not (
+                _is_new_business_record_type(rt)
+                or _is_renewal_record_type(rt)
+                or _is_expansion_record_type(rt)
+            ):
+                continue
+            cs = o.contract_start_date
+            ce = o.contract_end_date
+            if cs is None or ce is None:
+                continue
+            if not (cs <= as_of <= ce):
+                continue
+            if o.opportunity_arr is not None:
+                total += float(o.opportunity_arr)
+        return round(total, 2)
+
+    def _live_arr_zero_after_midterm_lost_renewal_end(opps: list[Opportunity], as_of: date) -> bool:
+        """
+        True when **any** Closed Lost **Renewal** with ``midterm_cancellation`` = 1 (Midterm_Cancellation__c) has a
+        ``contract_end_date`` and ``as_of`` is **strictly after** that date — Live ARR for the account is **0**
+        (overrides the closed-won sum). Does **not** apply bookings owner exclusion.
+        """
+        for o in opps:
+            if not _is_closed_lost_stage(o.stage_name):
+                continue
+            if getattr(o, "midterm_cancellation", 0) != 1:
+                continue
+            if not _is_renewal_record_type(_effective_record_type(o)):
+                continue
+            ce = o.contract_end_date
+            if ce is None:
+                continue
+            if as_of > ce:
+                return True
+        return False
+
+    def _cw_future_contract_start_arr_sum(opps: list[Opportunity], today: date) -> float:
+        """
+        Sum of ``ARR__c`` (``opportunity_arr``) for Closed Won opportunities whose ``contract_start_date`` is
+        strictly after ``today``. All record types; does **not** apply bookings owner exclusion.
+        """
+        total = 0.0
+        for o in opps:
+            if not _is_closed_won_stage(o.stage_name):
+                continue
+            cs = o.contract_start_date
+            if cs is None or cs <= today:
+                continue
+            if o.opportunity_arr is not None:
+                total += float(o.opportunity_arr)
+        return round(total, 2)
+
+    q_cw = select(Opportunity).where(
+        or_(
+            Opportunity.stage_name.in_(CLOSED_STAGES),
+            func.lower(func.trim(Opportunity.stage_name)) == "closed won",
+        )
+    )
+    r = await db.execute(q_cw)
+    all_closed_opps = list(r.scalars().all())
+    closed_won_opps = [o for o in all_closed_opps if _is_closed_won_stage(o.stage_name)]
+
+    # All accounts with ≥1 Closed Won opp (any record type); NB opps tracked separately for sub_start.
+    by_account: dict[str, str] = {}
+    nb_opps_by_account: dict[str, list[Opportunity]] = {}
+    for o in closed_won_opps:
+        aid = (o.account_id or "").strip()
+        if not aid:
+            continue
+        name = (o.account_name or "").strip() or "—"
+        if aid not in by_account:
+            by_account[aid] = name
+        elif by_account[aid] == "—" and name != "—":
+            by_account[aid] = name
+        if _is_new_business_record_type(_effective_record_type(o)):
+            nb_opps_by_account.setdefault(aid, []).append(o)
+
+    nb_renewal_opps_by_account: dict[str, list[Opportunity]] = {}
+    for o in closed_won_opps:
+        rt = _effective_record_type(o)
+        if not (_is_new_business_record_type(rt) or _is_renewal_record_type(rt)):
+            continue
+        aid = (o.account_id or "").strip()
+        if not aid or aid not in by_account:
+            continue
+        nb_renewal_opps_by_account.setdefault(aid, []).append(o)
+
+    midterm_lost_opps_by_account: dict[str, list[Opportunity]] = {}
+    for o in all_closed_opps:
+        aid = (o.account_id or "").strip()
+        if not aid or aid not in by_account:
+            continue
+        midterm_lost_opps_by_account.setdefault(aid, []).append(o)
+
+    account_ids_list = list(by_account.keys())
+    account_type_map: dict[str, str | None] = {}
+    account_status_raw: dict[str, str | None] = {}
+    if account_ids_list:
+        q_acc = select(Account.sf_id, Account.type, Account.status).where(Account.sf_id.in_(account_ids_list))
+        r_acc = await db.execute(q_acc)
+        for sf_id, typ, st in r_acc.all():
+            account_type_map[sf_id] = typ
+            account_status_raw[sf_id] = st
+
+    today_est = datetime.now(EST).date()
+    month_keys = _new_schedule_month_keys()
+    month_end_dates: dict[str, date] = {}
+    for mk in month_keys:
+        y, mo = int(mk[:4]), int(mk[5:7])
+        _, last_d = calendar.monthrange(y, mo)
+        month_end_dates[mk] = date(y, mo, last_d)
+
+    rows: list[dict] = []
+    for aid, nm in by_account.items():
+        typ = account_type_map.get(aid) if aid else None
+        status = (account_status_raw.get(aid) if aid else None) or ""
+        status = (status or "").strip() or None
+        nb_list = nb_opps_by_account.get(aid) or []
+        sub_start = _first_nb_subscription_start_iso(nb_list)
+        if sub_start is None:
+            # No NB opp: fall back to earliest CW opp of any type
+            sub_start = _first_nb_subscription_start_iso(
+                [o for o in closed_won_opps if (o.account_id or "").strip() == aid]
+            )
+        nb_ren_list = nb_renewal_opps_by_account.get(aid) or []
+        midterm_iso = _midterm_lost_renewal_close_iso(midterm_lost_opps_by_account.get(aid) or [])
+        sub_end = midterm_iso if midterm_iso is not None else _furthest_nb_renewal_contract_end_iso(nb_ren_list)
+        account_opps = [o for o in all_closed_opps if (o.account_id or "").strip() == aid]
+        live_arr = _live_arr_sum_arr_c_as_of(account_opps, today_est)
+        if _live_arr_zero_after_midterm_lost_renewal_end(account_opps, today_est):
+            live_arr = 0.0
+        future_start_arr = _cw_future_contract_start_arr_sum(account_opps, today_est)
+        contracted_arr = round(live_arr + future_start_arr, 2)
+        arr_by_month: dict[str, float] = {}
+        for mk in month_keys:
+            as_of_m = month_end_dates[mk]
+            v = _live_arr_sum_arr_c_as_of(account_opps, as_of_m)
+            if _live_arr_zero_after_midterm_lost_renewal_end(account_opps, as_of_m):
+                v = 0.0
+            arr_by_month[mk] = v
+        rows.append(
+            {
+                "account_id": aid,
+                "account_name": nm,
+                "type": typ,
+                "status": status,
+                "subscription_start_date": sub_start,
+                "subscription_end_date": sub_end,
+                "live_arr": live_arr,
+                "contracted_arr": contracted_arr,
+                "arr_by_month": arr_by_month,
+            }
+        )
+    rows.sort(key=lambda x: (x["account_name"].lower(), x["account_id"]))
+
+    base = os.getenv("SALESFORCE_BASE_URL", "").strip().rstrip("/")
+    sf_url = base if base and ("salesforce.com" in base or "lightning.force.com" in base) else None
+    return {"rows": rows, "month_columns": month_keys, "salesforce_base_url": sf_url}
+
+
 @app.get("/api/analytics/active-arr-by-product")
 async def get_active_arr_by_product(
     as_of: Optional[date] = Query(
@@ -2851,14 +3226,8 @@ async def get_active_arr_by_product(
     return JSONResponse(content=resp)
 
 
-async def _get_active_arr_by_month_data(
-    db: AsyncSession,
-) -> tuple[list[dict], list[str], dict[str, float], Optional[str]]:
-    """
-    Returns (rows with by_month filled, months list, totals_by_month, base_url) for the ARR schedule.
-    Used by active-arr-by-month GET and by the Copilot ARR export to Google Sheet.
-    """
-    out_rows, base_url = await _compute_active_arr_rows(db, apply_alleva_retained_arr_adjustment=True)
+def _default_schedule_by_month_keys() -> list[str]:
+    """Month columns for the original Schedule view: Dec '24 through Dec '26."""
     months: list[str] = []
     for year in (2024, 2025, 2026):
         for month in range(1, 13):
@@ -2867,6 +3236,19 @@ async def _get_active_arr_by_month_data(
             if year == 2026 and month > 12:
                 break
             months.append(f"{year}-{month:02d}")
+    return months
+
+
+def _new_schedule_month_keys() -> list[str]:
+    """Month columns for NEW SCHEDULE: Dec '25 through Dec '26 (active ARR on each month-end)."""
+    return ["2025-12"] + [f"2026-{m:02d}" for m in range(1, 13)]
+
+
+def _apply_active_arr_by_month(out_rows: list[dict], months: list[str]) -> dict[str, float]:
+    """
+    Mutates each row with ``by_month`` for the given month keys. Same rules as the Schedule export.
+    Returns ``totals_by_month`` (sum across rows).
+    """
     totals_by_month: dict[str, float] = {m: 0.0 for m in months}
     for row in out_rows:
         sub_start_s = row.get("subscription_start_date")
@@ -2884,9 +3266,7 @@ async def _get_active_arr_by_month_data(
                     alleva_factor = float(raw_factor)
                 except (TypeError, ValueError):
                     alleva_factor = None
-        # Prefer periods (all closed-won NB + renewal terms) for by_month when present
         periods = row.get("periods") or []
-        # Optional pre-anchor NB term (fallback when no periods)
         pre_start_s = row.get("pre_anchor_start")
         pre_end_s = row.get("pre_anchor_end")
         pre_base = float(row.get("pre_anchor_base_arr") or 0.0)
@@ -2902,7 +3282,6 @@ async def _get_active_arr_by_month_data(
 
             val = 0.0
             if periods:
-                # Use period that contains this month's end date (reflects both closed-won NB and renewals)
                 for p in periods:
                     try:
                         p_start = date.fromisoformat(p["start"]) if isinstance(p.get("start"), str) else p.get("start")
@@ -2916,7 +3295,6 @@ async def _get_active_arr_by_month_data(
                             val = 0.0
                         break
             elif pre_start is not None and pre_end is not None and pre_base > 0 and pre_start <= month_end <= pre_end:
-                # Case 1: within a pre-anchor NB term → use NB ARR + pre-renewal expansions only.
                 pre_exp_sum = 0.0
                 for exp in pre_exps:
                     cd = exp.get("close_date")
@@ -2931,7 +3309,6 @@ async def _get_active_arr_by_month_data(
                             continue
                 val = round(pre_base + pre_exp_sum, 2)
             else:
-                # Case 2: regular anchor logic (renewal/New Business anchor + all expansions)
                 if sub_start is not None and month_end < sub_start:
                     val = 0.0
                 elif sub_end is not None and month_end > sub_end:
@@ -2949,6 +3326,19 @@ async def _get_active_arr_by_month_data(
             by_month[month_key] = val
             totals_by_month[month_key] = round(totals_by_month[month_key] + val, 2)
         row["by_month"] = by_month
+    return totals_by_month
+
+
+async def _get_active_arr_by_month_data(
+    db: AsyncSession,
+) -> tuple[list[dict], list[str], dict[str, float], Optional[str]]:
+    """
+    Returns (rows with by_month filled, months list, totals_by_month, base_url) for the ARR schedule.
+    Used by active-arr-by-month GET and by the Copilot ARR export to Google Sheet.
+    """
+    out_rows, base_url = await _compute_active_arr_rows(db, apply_alleva_retained_arr_adjustment=True)
+    months = _default_schedule_by_month_keys()
+    totals_by_month = _apply_active_arr_by_month(out_rows, months)
     return (out_rows, months, totals_by_month, base_url)
 
 
@@ -3020,7 +3410,7 @@ async def get_eod_snapshot_contents(
 @app.post("/api/salesforce/eod-snapshots/take")
 async def take_eod_snapshot_now(db: AsyncSession = Depends(get_db)):
     """
-    Take an EOD snapshot now (for testing persistence). Uses current Salesforce data in DB.
+    Capture an EOD snapshot from current SQLite CRM state (same shape as the scheduled 23:59 job).
     Requires X-App-Password if APP_PASSWORD is set.
     """
     try:
@@ -3057,7 +3447,8 @@ async def backfill_arr_schedule(db: AsyncSession = Depends(get_db)):
 
 
 async def _take_salesforce_eod_snapshot(db: AsyncSession) -> None:
-    """Store end-of-day snapshot of all Salesforce data (EST date, UTC timestamp). Caller must commit.
+    """Store end-of-day snapshot of CRM tables as they exist in SQLite (EST calendar date, UTC timestamp). Caller must commit.
+    Data matches whatever was last loaded into the DB (Dashboard → Refresh app data), not a live Salesforce pull in this call.
     Captures applicable Salesforce IDs: account_sf_id for accounts, opportunity_sf_id and account_sf_id for opportunities, opportunity_sf_id for line items."""
     from datetime import timezone
 
@@ -3133,7 +3524,10 @@ async def _take_salesforce_eod_snapshot(db: AsyncSession) -> None:
 
 
 async def _scheduled_salesforce_jobs() -> None:
-    """Run hourly Salesforce sync at :59:59 EST (updates ARR and pipeline); EOD snapshot at 23:59:59 EST (for historical ARR and pipeline)."""
+    """Hourly Salesforce sync only if ENABLE_SCHEDULED_BACKGROUND_SYNC; daily EOD at 23:59:59 EST if ENABLE_SCHEDULED_EOD_SNAPSHOT (default on).
+    EOD snapshots whatever is already in SQLite (typically last Dashboard → Refresh app data)."""
+    scheduled_eod = os.getenv("ENABLE_SCHEDULED_EOD_SNAPSHOT", "1").lower() not in ("0", "false", "no")
+    scheduled_hourly_sf = os.getenv("ENABLE_SCHEDULED_BACKGROUND_SYNC", "").lower() in ("1", "true", "yes")
     last_sync_hour: Optional[tuple[date, int]] = None  # (date_est, hour_est)
     last_eod_date: Optional[date] = None
 
@@ -3141,30 +3535,35 @@ async def _scheduled_salesforce_jobs() -> None:
         try:
             now_est = datetime.now(EST)
             today_est = now_est.date()
-            run_hourly = now_est.minute == 59 and now_est.second >= 59
-            run_eod = now_est.hour == 23 and now_est.minute == 59
+            run_hourly = scheduled_hourly_sf and now_est.minute == 59 and now_est.second >= 59
+            run_eod = scheduled_eod and now_est.hour == 23 and now_est.minute == 59
 
             if run_hourly and (last_sync_hour is None or last_sync_hour != (today_est, now_est.hour)):
-                async with AsyncSessionLocal() as session:
-                    result = await _run_salesforce_sync(session)
-                    if result.get("ok"):
-                        await session.commit()
-                        last_sync_hour = (today_est, now_est.hour)
-                    else:
-                        await session.rollback()
+                async with _salesforce_sync_lock:
+                    async with AsyncSessionLocal() as session:
+                        result = await _run_salesforce_sync(session)
+                        if result.get("ok"):
+                            await session.commit()
+                            last_sync_hour = (today_est, now_est.hour)
+                        else:
+                            await session.rollback()
 
             if run_eod and (last_eod_date is None or last_eod_date != today_est):
-                async with AsyncSessionLocal() as session:
-                    try:
-                        await _take_salesforce_eod_snapshot(session)
-                        await session.commit()
-                        last_eod_date = today_est
-                        import logging
-                        logging.getLogger(__name__).info("EOD snapshot taken for %s", today_est.isoformat())
-                    except Exception as e:
-                        await session.rollback()
-                        import logging
-                        logging.getLogger(__name__).exception("EOD snapshot failed for %s: %s", today_est.isoformat(), e)
+                async with _salesforce_sync_lock:
+                    async with AsyncSessionLocal() as session:
+                        try:
+                            await _take_salesforce_eod_snapshot(session)
+                            await session.commit()
+                            last_eod_date = today_est
+                            logging.getLogger(__name__).info(
+                                "EOD snapshot taken for %s (SQLite CRM state; use Dashboard refresh for manual sync)",
+                                today_est.isoformat(),
+                            )
+                        except Exception as e:
+                            await session.rollback()
+                            logging.getLogger(__name__).exception(
+                                "EOD snapshot failed for %s: %s", today_est.isoformat(), e
+                            )
 
         except asyncio.CancelledError:
             raise
@@ -3336,14 +3735,421 @@ def _bookings_row(mtd: float, plan_val: Optional[float]) -> BookingsMTDRow:
     return BookingsMTDRow(mtd=mtd, plan=plan_val, achievement_pct=achievement_pct, delta_k=delta_k)
 
 
-# Owner names to exclude from bookings (e.g. internal / admin). Case-insensitive match.
+def _renewals_row_dollars(mtd: float, plan_val: Optional[float]) -> RenewalsMTDRow:
+    achievement_pct = (mtd / plan_val * 100) if plan_val is not None and plan_val != 0 else None
+    delta_k = (mtd - plan_val) / 1000.0 if plan_val is not None else None
+    return RenewalsMTDRow(mtd=mtd, plan=plan_val, achievement_pct=achievement_pct, delta_k=delta_k, is_rate=False)
+
+
+def _renewals_row_open(mtd: float) -> RenewalsMTDRow:
+    return RenewalsMTDRow(mtd=mtd, plan=None, achievement_pct=None, delta_k=None, is_rate=False)
+
+
+def _renewals_row_rate(mtd: float, plan_val: Optional[float]) -> RenewalsMTDRow:
+    achievement_pct = (mtd / plan_val * 100) if plan_val is not None and plan_val != 0 else None
+    delta_k = (mtd - plan_val) * 100.0 if plan_val is not None else None  # percentage points
+    return RenewalsMTDRow(mtd=mtd, plan=plan_val, achievement_pct=achievement_pct, delta_k=delta_k, is_rate=True)
+
+
+def _renewals_row_rate_optional(mtd: Optional[float], plan_val: Optional[float]) -> RenewalsMTDRow:
+    if mtd is None:
+        return RenewalsMTDRow(mtd=0.0, plan=plan_val, achievement_pct=None, delta_k=None, is_rate=True)
+    return _renewals_row_rate(mtd, plan_val)
+
+
+def _sheet_rate_fraction(x: Optional[float]) -> Optional[float]:
+    """Sheet may store 0.85 or 85 for renewal rate."""
+    if x is None:
+        return None
+    if x > 1.0:
+        return x / 100.0
+    return float(x)
+
+
+def _bu54_percent_to_fraction(x: Optional[float]) -> Optional[float]:
+    """
+    BU54 (BV54, …) is a **percentage** in the ARR model: ``12`` = 12%, ``-3`` = −3%.
+    Google Sheets may also send decimals: ``0.12`` = 12% (already a fraction); leave as-is when |x| ≤ 1.
+    """
+    if x is None:
+        return None
+    v = float(x)
+    if abs(v) > 1.0:
+        return v / 100.0
+    return v
+
+
+def _renewal_effective_date(o: Opportunity) -> Optional[date]:
+    return o.renewal_date if o.renewal_date is not None else o.close_date
+
+
+def _renewal_delta_for_opp(o: Opportunity) -> tuple[Optional[float], Optional[float]]:
+    """Up-for-renewal ARR and delta (renewed − UFR) for closed opps; same as renewals-overview."""
+    up = float(o.original_acv) if o.original_acv is not None else None
+    st = (o.stage_name or "").strip()
+    renewed: Optional[float] = None
+    delta: Optional[float] = None
+    if _is_closed_lost_stage(st):
+        renewed = 0.0
+        if up is not None:
+            delta = round(renewed - float(up), 2)
+    elif _is_closed_won_stage(st):
+        if o.opportunity_arr is not None:
+            renewed = round(float(o.opportunity_arr), 2)
+        if up is not None and renewed is not None:
+            delta = round(float(renewed) - float(up), 2)
+    return up, delta
+
+
+def _plan_dollars_match_bookings(plan_val: Optional[float], actual: float) -> Optional[float]:
+    """Normalize sheet plan units to dollars (same heuristic as dashboard bookings MTD)."""
+    if plan_val is None:
+        return None
+    if actual > 0 and 0 < plan_val < actual / 100:
+        return plan_val * 1000.0
+    if actual == 0 and 0 < plan_val < 10000:
+        return plan_val * 1000.0
+    return plan_val
+
+
+def _sheet_cell_float(data: list, row_0: int, col_idx: int) -> Optional[float]:
+    if row_0 < 0 or row_0 >= len(data):
+        return None
+    row = data[row_0]
+    if col_idx < 0 or col_idx >= len(row):
+        return None
+    return _to_float_sheet(row[col_idx])
+
+
+def _sheet_cell_a1(data: list, a1: str, *, pct: bool = False) -> Optional[float]:
+    """Read one cell from a grid snapshot (Excel row 1 = ``data[0]``). ``a1`` e.g. ``BU52`` = column BU, row 52."""
+    m = re.match(r"^([A-Z]+)(\d+)$", (a1 or "").strip().upper())
+    if not m:
+        return None
+    letters, row_s = m.group(1), m.group(2)
+    row_0 = int(row_s) - 1
+    if row_0 < 0 or row_0 >= len(data):
+        return None
+    col_0 = _a1_col_to_index(letters)
+    row = data[row_0]
+    if col_0 < 0 or col_0 >= len(row):
+        return None
+    raw = row[col_0]
+    return _to_float_sheet_pct(raw) if pct else _to_float_sheet(raw)
+
+
+def _patch_sheet_cell_a1(data: list, a1: str, value: Any) -> list:
+    """Write one cell into a grid snapshot (Excel row 1 = ``data[0]``). Mutates and returns ``data``."""
+    m = re.match(r"^([A-Z]+)(\d+)$", (a1 or "").strip().upper())
+    if not m:
+        return data
+    letters, row_s = m.group(1), m.group(2)
+    row_0 = int(row_s) - 1
+    col_0 = _a1_col_to_index(letters)
+    while len(data) <= row_0:
+        data.append([])
+    row = list(data[row_0])
+    while len(row) <= col_0:
+        row.append(None)
+    row[col_0] = value
+    data[row_0] = row
+    return data
+
+
+def _merge_arr_2026p_bu35_from_direct_cell(connector: Any, range_name: str, data: list) -> list:
+    """
+    After a full-tab A1 read, stamp BU35 from a direct ``!BU35:BU35`` fetch (raw cell value;
+    cancelled plan applies ``−BU35`` when computing MTD/QTD).
+    """
+    if "ARR_Calculations_2026P" not in range_name or "!A1" not in range_name.upper():
+        return data
+    m = re.match(r"^([^!]+)!", range_name)
+    if not m:
+        return data
+    sheet = m.group(1).strip()
+    mini = f"{sheet}!BU35:BU35"
+    try:
+        small = connector.read_range_values_raw(mini)
+        if not small or not small[0]:
+            return data
+        val = small[0][0]
+    except Exception:
+        return data
+    return _patch_sheet_cell_a1(data, "BU35", val)
+
+
+def _pad_sheet_snapshot_for_renewals_plan(data: list) -> list:
+    """
+    Google Sheets JSON exports are often **jagged** (short rows omit trailing empty cells).
+    Renewals reads need row 35 / column BU (BU35) and rows 33,52,54 through column CF — pad so those cells exist.
+    """
+    if not isinstance(data, list) or not data:
+        return data
+    month_cols = ARR_2026P_MONTH_COLUMNS
+    max_col = max(_a1_col_to_index(c) for c in month_cols)
+    # Excel rows 33 (UFR), 35 (cancelled BU35), 52 (BU52), 54 (BU54) → 0-based indices
+    row_indices = (
+        ARR_2026P_RENEWALS_UFR_ROW,
+        RENEWALS_CANCELLED_PLAN_ROW - 1,
+        51,
+        53,
+    )
+    need_len = max(row_indices) + 1
+    out = list(data)
+    while len(out) < need_len:
+        out.append([])
+    for row_0 in row_indices:
+        if row_0 < len(out):
+            r = list(out[row_0])
+            while len(r) <= max_col:
+                r.append(None)
+            out[row_0] = r
+    return out
+
+
+def _renewals_read_month_raw(
+    data: list,
+    month_idx: int,
+) -> tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
+    """UFR from fixed row; BU52/BU54/BU35 (Jan = BU…). BU54 is %; cancelled plan uses −BU35 (Jan = BU35 cell)."""
+    col_letters = ARR_2026P_MONTH_COLUMNS[month_idx]
+    col_idx = _a1_col_to_index(col_letters)
+    ufr = _sheet_cell_float(data, ARR_2026P_RENEWALS_UFR_ROW, col_idx)
+    bu52 = _sheet_cell_a1(data, f"{col_letters}52", pct=True)
+    bu54 = _sheet_cell_a1(data, f"{col_letters}54", pct=True)
+    # Cancelled plan $ = −cell on row 35 (Jan **BU35**; Feb BV35, …).
+    if month_idx == 0:
+        bu35 = _sheet_cell_a1(data, "BU35", pct=False)
+    else:
+        bu35 = _sheet_cell_a1(data, f"{col_letters}{RENEWALS_CANCELLED_PLAN_ROW}", pct=False)
+    return ufr, bu52, bu54, bu35
+
+
+def _renewals_qtd_ufr_by_month(
+    renewal_opps: list,
+    year: int,
+    qtd_first: date,
+    qtd_last: date,
+    month_indices: list[int],
+) -> dict[int, float]:
+    """Actual UFR per sheet month index (0=Jan..11=Dec) for months in the quarter, renewal date in [qtd_first, qtd_last]."""
+    out: dict[int, float] = {}
+    for mi in month_indices:
+        cal_m = mi + 1
+
+        def _pf(rd: date, cm: int = cal_m) -> bool:
+            return rd.year == year and rd.month == cm and qtd_first <= rd <= qtd_last
+
+        ufr, *_ = _aggregate_renewals_actuals(renewal_opps, _pf)
+        out[mi] = ufr
+    return out
+
+
+def _renewals_plan_bundle(
+    data: list,
+    month_idx: int,
+    act_ufr: float,
+    act_churn: float,
+    act_contraction: float,
+    act_cancelled: float,
+    act_renewed: float,
+) -> tuple[
+    Optional[float],
+    Optional[float],
+    Optional[float],
+    Optional[float],
+    Optional[float],
+    Optional[float],
+]:
+    """Plan values for one month (dollars / rate 0–1). UFR plan = actual UFR; open plan omitted at caller."""
+    _, bu52_raw, bu54_raw, bu35_raw = _renewals_read_month_raw(data, month_idx)
+    ufr_p = round(float(act_ufr), 2)
+    bu52 = _sheet_rate_fraction(bu52_raw)
+    bu54 = _bu54_percent_to_fraction(bu54_raw)
+    churn_p: Optional[float] = None
+    contr_p: Optional[float] = None
+    renewed_p: Optional[float] = None
+    rate_p: Optional[float] = bu52
+    # Cancelled plan $ = −BU35 (sheet cell is signed opposite to how we display plan vs actual).
+    canc_p = _plan_dollars_match_bookings(
+        -float(bu35_raw) if bu35_raw is not None else None,
+        act_cancelled,
+    )
+
+    if ufr_p is not None and bu52 is not None:
+        churn_p = round((1.0 - bu52) * ufr_p, 2)
+    # Contraction plan: model cell BU54 (e.g. Jan = BU54) — plan $ = −BU54 × up for renewal (rate from sheet).
+    if ufr_p is not None and bu54 is not None:
+        contr_p = round(-bu54 * ufr_p, 2)
+    if ufr_p is not None and churn_p is not None and contr_p is not None:
+        renewed_p = round(ufr_p - churn_p - contr_p, 2)
+    elif ufr_p is not None and churn_p is not None and contr_p is None:
+        renewed_p = round(ufr_p - churn_p, 2)
+    elif ufr_p is not None and churn_p is None and contr_p is not None:
+        renewed_p = round(ufr_p - contr_p, 2)
+
+    return ufr_p, churn_p, contr_p, renewed_p, rate_p, canc_p
+
+
+def _renewals_plan_bundle_qtd(
+    data: list,
+    month_indices: list[int],
+    act_ufr: float,
+    act_churn: float,
+    act_contraction: float,
+    act_cancelled: float,
+    act_renewed: float,
+    act_ufr_by_month: dict[int, float],
+) -> tuple[
+    Optional[float],
+    Optional[float],
+    Optional[float],
+    Optional[float],
+    Optional[float],
+    Optional[float],
+]:
+    """QTD plan: UFR plan = actual UFR; churn/contraction per month; cancelled plan $ = −sum of row-35 cells (BV35…); rate UFR-weighted."""
+    if not month_indices:
+        return None, None, None, None, None, None
+
+    sum_churn_raw = 0.0
+    sum_contr_raw = 0.0
+    sum_canc_raw = 0.0
+    rate_num = 0.0
+    rate_den = 0.0
+
+    for mi in month_indices:
+        _, bu52_raw, bu54_raw, bu35_raw = _renewals_read_month_raw(data, mi)
+        ufr_v = float(act_ufr_by_month.get(mi, 0.0))
+        bu52 = _sheet_rate_fraction(bu52_raw)
+        bu54 = _bu54_percent_to_fraction(bu54_raw)
+        if bu52 is not None:
+            sum_churn_raw += (1.0 - bu52) * ufr_v
+            rate_num += bu52 * ufr_v
+            rate_den += ufr_v
+        if bu54 is not None:
+            sum_contr_raw += -bu54 * ufr_v
+        sum_canc_raw -= bu35_raw or 0.0  # −BU35 per month
+
+    ufr_p = round(float(act_ufr), 2)
+    churn_p = _plan_dollars_match_bookings(sum_churn_raw, act_churn)
+    contr_p = _plan_dollars_match_bookings(sum_contr_raw, act_contraction)
+    canc_p = _plan_dollars_match_bookings(sum_canc_raw, act_cancelled)
+    rate_p = round(rate_num / rate_den, 6) if rate_den and rate_den > 0 else None
+    renewed_p: Optional[float] = None
+    if ufr_p is not None and churn_p is not None and contr_p is not None:
+        renewed_p = round(ufr_p - churn_p - contr_p, 2)
+    elif ufr_p is not None and churn_p is not None:
+        renewed_p = round(ufr_p - churn_p, 2)
+    elif ufr_p is not None and contr_p is not None:
+        renewed_p = round(ufr_p - contr_p, 2)
+
+    return ufr_p, churn_p, contr_p, renewed_p, rate_p, canc_p
+
+
+def _aggregate_renewals_actuals(
+    renewal_opps: list,
+    period_filter,
+) -> tuple[float, float, float, float, float, Optional[float], float]:
+    """Returns (ufr, open_ufr, churn_ufr, contraction_mag, renewed, rate_or_none, cancelled_ufr). Excludes mid-term from main metrics."""
+    ufr = 0.0
+    open_ufr = 0.0
+    churn_ufr = 0.0
+    contraction_mag = 0.0
+    cancelled_ufr = 0.0
+
+    for o in renewal_opps:
+        rd = _renewal_effective_date(o)
+        if rd is None or not period_filter(rd):
+            continue
+        mid = getattr(o, "midterm_cancellation", 0) == 1
+        st = (o.stage_name or "").strip()
+        up, delta = _renewal_delta_for_opp(o)
+
+        if mid:
+            if _is_closed_lost_stage(st) and up is not None:
+                cancelled_ufr += float(up)
+            continue
+
+        if up is None:
+            continue
+        ufr += float(up)
+
+        if _is_closed_lost_stage(st):
+            churn_ufr += float(up)
+        elif _is_closed_won_stage(st):
+            if delta is not None and delta < 0:
+                contraction_mag += -float(delta)
+        else:
+            open_ufr += float(up)
+
+    rate: Optional[float] = None
+    if ufr > 0:
+        rate = round((ufr - churn_ufr - contraction_mag) / ufr, 6)
+
+    renewed = round(max(0.0, ufr - open_ufr - churn_ufr - contraction_mag), 2)
+    return (
+        round(ufr, 2),
+        round(open_ufr, 2),
+        round(churn_ufr, 2),
+        round(contraction_mag, 2),
+        renewed,
+        rate,
+        round(cancelled_ufr, 2),
+    )
+
+
+# Owner names to exclude from bookings **for New Business opportunities only** (e.g. internal / admin).
+# Case-insensitive match; use ``_is_excluded_from_bookings_nb_only`` in opportunity flows.
 BOOKINGS_EXCLUDED_OWNER_NAMES = frozenset({"marcel scheurer"})
 
 
 def _is_excluded_from_bookings(o: Opportunity) -> bool:
-    """True if this opportunity should be excluded from bookings (e.g. owned by excluded owner)."""
+    """True if this opportunity's owner is on ``BOOKINGS_EXCLUDED_OWNER_NAMES`` (case-insensitive)."""
     name = (o.owner_name or "").strip()
     return name.lower() in BOOKINGS_EXCLUDED_OWNER_NAMES
+
+
+def _is_excluded_from_bookings_nb_only(o: Opportunity, record_type_name: Optional[str]) -> bool:
+    """Owner exclusion list applies only to **New Business** opportunities (effective record type)."""
+    if not _is_new_business_record_type(record_type_name):
+        return False
+    return _is_excluded_from_bookings(o)
+
+
+def _booking_arr_expansion_or_arr_c(o: Opportunity) -> float:
+    """Booking slice that uses ``Expansion_ARR__c``; if null after sync, fall back to ``ARR__c`` (often identical on SF). Never derive from MRR × 12."""
+    if getattr(o, "expansion_arr", None) is not None:
+        return max(0.0, float(o.expansion_arr))
+    if o.opportunity_arr is not None:
+        return max(0.0, float(o.opportunity_arr))
+    return 0.0
+
+
+def _closed_overview_arr_from_opportunity(o: Opportunity, effective_rt: str) -> float:
+    """Booking-style ARR from Salesforce Opportunity fields only (no line-item rollup).
+
+    Shared by ``GET /api/closed-overview`` and dashboard bookings (``_closed_won_arr_in_range``).
+
+    Closed Won **New Business** → ``opportunity_arr`` (``ARR__c``).
+    Closed Won **Expansion**, **Renewal**, or **Amendment** → ``Expansion_ARR__c``, else ``ARR__c`` if expansion field missing.
+    Closed Lost → 0.
+    """
+    stage = (o.stage_name or "").strip()
+    if _is_closed_lost_stage(stage):
+        return 0.0
+    if not _is_closed_won_stage(stage):
+        return 0.0
+    rt = effective_rt
+    # Renewal / amendment before expansion so record-type names that include both keywords are unambiguous.
+    if _is_renewal_record_type(rt) or _is_amendment_record_type(rt):
+        return _booking_arr_expansion_or_arr_c(o)
+    if _is_expansion_record_type(rt):
+        return _booking_arr_expansion_or_arr_c(o)
+    if _is_new_business_record_type(rt):
+        val = float(o.opportunity_arr) if o.opportunity_arr is not None else 0.0
+        return max(0.0, val)
+    return 0.0
 
 
 async def _closed_won_arr_in_range(
@@ -3351,7 +4157,18 @@ async def _closed_won_arr_in_range(
     first_day: date,
     last_day: date,
 ) -> tuple[float, float, float]:
-    """Return (total, new_business, expansion) ARR for Closed Won, New Business + Expansion in [first_day, last_day]."""
+    """Return ``(total, new_business, expansion_mid_term)`` for Closed Won **pipeline** opps in the date window.
+
+    **New Business** → ``opportunity_arr`` (``ARR__c``); **Expansion** → ``expansion_arr`` (``Expansion_ARR__c``).
+    Record-type overrides apply. Renewals are excluded here (see ``_closed_won_renewal_expansion_arr_in_range``).
+    """
+    overrides = await _get_record_type_overrides(db)
+
+    def _effective_record_type(o: Opportunity) -> str:
+        key = (o.sf_id or "").strip()
+        override = overrides.get(key) or (overrides.get(key[:15]) if len(key) >= 15 else None)
+        return (override or o.record_type_name or "").strip() or "—"
+
     q_closed = select(Opportunity).where(
         Opportunity.stage_name == "Closed Won",
         Opportunity.close_date.isnot(None),
@@ -3359,31 +4176,22 @@ async def _closed_won_arr_in_range(
         Opportunity.close_date <= last_day,
     )
     r = await db.execute(q_closed)
-    closed_opps = [o for o in r.scalars().all() if _is_pipeline_record_type(o.record_type_name) and not _is_excluded_from_bookings(o)]
-    closed_sf_ids = {o.sf_id for o in closed_opps}
-    opp_to_arr: dict[str, float] = {}
-    if closed_sf_ids:
-        q_lines = select(OpportunityLineItem).where(
-            OpportunityLineItem.opportunity_sf_id.in_(closed_sf_ids)
-        )
-        r_lines = await db.execute(q_lines)
-        for li in r_lines.scalars().all():
-            raw = _normalized_product_name(li.product_name)
-            if not _include_line_item_in_arr(raw, li.product_name):
-                continue
-            opp_sf_id = li.opportunity_sf_id
-            mrr = _line_item_effective_total(li)
-            opp_to_arr[opp_sf_id] = opp_to_arr.get(opp_sf_id, 0) + mrr * PIPELINE_ARR_MULTIPLIER
-    # ARR from product line items only (excl iVerify/Kipu), consistent with ARR overview
+    closed_opps = [
+        o
+        for o in r.scalars().all()
+        if _is_pipeline_record_type(_effective_record_type(o))
+        and not _is_excluded_from_bookings_nb_only(o, _effective_record_type(o))
+    ]
     nb, exp = 0.0, 0.0
     for o in closed_opps:
-        arr = opp_to_arr.get(o.sf_id, 0)
-        rt = (o.record_type_name or "").strip().lower()
-        if rt == "new business":
+        rt = _effective_record_type(o)
+        arr = _closed_overview_arr_from_opportunity(o, rt)
+        rt_l = rt.strip().lower()
+        if rt_l == "new business":
             nb += arr
-        elif rt == "expansion":
+        elif rt_l == "expansion":
             exp += arr
-    return nb + exp, nb, exp
+    return round(nb + exp, 2), round(nb, 2), round(exp, 2)
 
 
 def _earliest_included_line_start_for_opp(o, lines: list) -> date | None:
@@ -3403,7 +4211,7 @@ def _earliest_included_line_start_for_opp(o, lines: list) -> date | None:
 
 
 def _closed_won_pipeline_opp_arr_from_lines(opp_sf_id: str, lines: list) -> float:
-    """ARR from product lines (same filter as bookings closed-won)."""
+    """ARR from product lines (used for future-start / contracted cohort math; dashboard bookings use Opportunity fields)."""
     t = 0.0
     for li in lines:
         if li.opportunity_sf_id != opp_sf_id:
@@ -3438,14 +4246,21 @@ async def _future_start_closed_won_nb_exp_arr_by_account(
     else contract_start_date) is strictly after ``as_of`` (America/New_York calendar date).
     Returns (total ARR, per-account map keyed by (account_id, account_name)).
     """
+    overrides = await _get_record_type_overrides(db)
+
+    def _effective_record_type(o: Opportunity) -> str:
+        key = (o.sf_id or "").strip()
+        override = overrides.get(key) or (overrides.get(key[:15]) if len(key) >= 15 else None)
+        return (override or o.record_type_name or "").strip() or "—"
+
     q = select(Opportunity).where(Opportunity.stage_name.isnot(None))
     r = await db.execute(q)
     closed_won_opps = [
         o
         for o in r.scalars().all()
         if _is_closed_won_stage(o.stage_name)
-        and _is_pipeline_record_type(o.record_type_name)
-        and not _is_excluded_from_bookings(o)
+        and _is_pipeline_record_type(_effective_record_type(o))
+        and not _is_excluded_from_bookings_nb_only(o, _effective_record_type(o))
     ]
     if not closed_won_opps:
         return 0.0, {}
@@ -3484,14 +4299,21 @@ async def _future_start_closed_won_nb_exp_crm_seats_by_account(
     Same Closed Won New Business + Expansion cohort as future ARR (service start after ``as_of``),
     but sum CRM seats from line items (Additional CRM Seats qty + 5 per Platform Includes 5 Seats).
     """
+    overrides = await _get_record_type_overrides(db)
+
+    def _effective_record_type(o: Opportunity) -> str:
+        key = (o.sf_id or "").strip()
+        override = overrides.get(key) or (overrides.get(key[:15]) if len(key) >= 15 else None)
+        return (override or o.record_type_name or "").strip() or "—"
+
     q = select(Opportunity).where(Opportunity.stage_name.isnot(None))
     r = await db.execute(q)
     closed_won_opps = [
         o
         for o in r.scalars().all()
         if _is_closed_won_stage(o.stage_name)
-        and _is_pipeline_record_type(o.record_type_name)
-        and not _is_excluded_from_bookings(o)
+        and _is_pipeline_record_type(_effective_record_type(o))
+        and not _is_excluded_from_bookings_nb_only(o, _effective_record_type(o))
     ]
     if not closed_won_opps:
         return 0, {}
@@ -3596,10 +4418,9 @@ async def _closed_won_renewal_expansion_arr_in_range(
     first_day: date,
     last_day: date,
 ) -> float:
-    """Return sum of renewal expansion ARR for Closed Won renewals in [first_day, last_day].
+    """Return sum of **Upon renewal** booking ARR: Closed Won **renewal** opps in range, using Expansion_ARR__c only.
 
-    Simplified logic: use Opportunity.Expansion_ARR__c (stored in Opportunity.expansion_arr) directly,
-    instead of recomputing uplift from line items + UFR baseline.
+    Stored as ``Opportunity.expansion_arr`` (Salesforce ``Expansion_ARR__c``). Closed Lost contributes 0 (not queried).
     """
     overrides = await _get_record_type_overrides(db)
 
@@ -3615,32 +4436,352 @@ async def _closed_won_renewal_expansion_arr_in_range(
         Opportunity.close_date <= last_day,
     )
     r = await db.execute(q)
-    closed = [o for o in r.scalars().all() if _is_renewal_record_type(_effective_record_type(o)) and not _is_excluded_from_bookings(o)]
+    closed = [
+        o
+        for o in r.scalars().all()
+        if _is_renewal_record_type(_effective_record_type(o))
+        and not _is_excluded_from_bookings_nb_only(o, _effective_record_type(o))
+    ]
     if not closed:
         return 0.0
     total = 0.0
     for o in closed:
-        # Field is already a MAX(..., 0) in Salesforce formula, but clamp defensively.
-        exp_val = float(o.expansion_arr) if getattr(o, "expansion_arr", None) is not None else 0.0
-        total += max(0.0, exp_val)
+        total += _booking_arr_expansion_or_arr_c(o)
     return round(total, 2)
 
 
 @app.get("/api/dashboard/bookings-mtd", response_model=BookingsMTDResponse)
-async def get_dashboard_bookings_mtd(db: AsyncSession = Depends(get_db)):
+async def get_dashboard_bookings_mtd(
+    db: AsyncSession = Depends(get_db),
+    fixed_periods: Optional[str] = Query(
+        None,
+        description="q1_2026 = Jan–Mar + Q1 26; q2_2026 = Apr–Jun + Q2 26 (calendar Q2 2026).",
+    ),
+):
     """
-    Previous month, current month MTD, and current quarter-to-date Closed Won bookings (New Business + Expansion) vs plan.
-    ARR from product line items only (excl. iVerify/Kipu), consistent with ARR overview.
-    Plan from sheet ARR_Calculations_2026P: row 11 = new business, row 12 = expansion; columns BU..CF = Jan..Dec.
+    Bookings vs plan: Closed Lost = 0. Closed Won **New Business** = ``ARR__c`` (NB row). **Expansion** row actual =
+    mid-term + upon renewal (``Expansion_ARR__c`` on Expansion vs Renewal opps). Sub-rows split the two slices.
+    **Total** = NB + mid-term + upon renewal. Plan from ARR_Calculations_2026P rows 11–12 (expansion plan vs combined actual).
     On any failure returns 200 + JSON so frontend never sees 500/non-JSON.
     """
     try:
-        return await _get_dashboard_bookings_mtd_impl(db)
+        return await _get_dashboard_bookings_mtd_impl(db, fixed_periods=fixed_periods)
     except Exception as e:
         return JSONResponse(status_code=200, content=_safe_bookings_fallback(f"Error loading bookings: {str(e)[:100]}"))
 
 
-async def _get_dashboard_bookings_mtd_impl(db: AsyncSession) -> BookingsMTDResponse:
+async def _bookings_mtd_q1_2026(db: AsyncSession) -> BookingsMTDResponse:
+    """Fixed columns: Jan 26, Feb 26, Mar 26, Q1 26 — full calendar months and full Q1 2026."""
+    jan_first, jan_last = date(2026, 1, 1), date(2026, 1, 31)
+    feb_first, feb_last = date(2026, 2, 1), date(2026, 2, 28)
+    mar_first, mar_last = date(2026, 3, 1), date(2026, 3, 31)
+    qtd_first = date(2026, 1, 1)
+    last_day_quarter = date(2026, 3, 31)
+    quarter_month = 1
+
+    prev2_label = "Jan 26"
+    prev_label = "Feb 26"
+    current_label = "Mar 26"
+    qtd_label = "Q1 26"
+
+    plan_by_month: list[tuple[Optional[float], Optional[float]]] = [(None, None)] * 12
+    plan_source: Optional[str] = None
+    plan_message: Optional[str] = None
+    sheet_range = "ARR_Calculations_2026P!A1:ZZ1000"
+    r_snap = await db.execute(
+        select(SheetSnapshot).where(SheetSnapshot.range_name == sheet_range).order_by(SheetSnapshot.as_of.desc()).limit(1)
+    )
+    snap = r_snap.scalar_one_or_none()
+    if snap and snap.data_json:
+        data = json.loads(snap.data_json)
+        row_11 = data[10] if len(data) > 10 else []
+        row_12 = data[11] if len(data) > 11 else []
+        try:
+            for m in range(12):
+                col_idx = _a1_col_to_index(ARR_2026P_MONTH_COLUMNS[m])
+                v11 = row_11[col_idx] if col_idx < len(row_11) else None
+                v12 = row_12[col_idx] if col_idx < len(row_12) else None
+                plan_by_month[m] = (_to_float_sheet(v11), _to_float_sheet(v12))
+            plan_source = "ARR_Calculations_2026P"
+        except (TypeError, ValueError, IndexError):
+            plan_message = "Could not read plan from sheet."
+    else:
+        plan_message = "No sheet snapshot. Sync ARR_Calculations_2026P first."
+
+    prev2_total, prev2_nb, prev2_exp = await _closed_won_arr_in_range(db, jan_first, jan_last)
+    prev_total, prev_nb, prev_exp = await _closed_won_arr_in_range(db, feb_first, feb_last)
+    mtd_total, mtd_nb, mtd_exp = await _closed_won_arr_in_range(db, mar_first, mar_last)
+    qtd_total, qtd_nb, qtd_exp = await _closed_won_arr_in_range(db, qtd_first, last_day_quarter)
+    prev2_renewal_exp = await _closed_won_renewal_expansion_arr_in_range(db, jan_first, jan_last)
+    prev_renewal_exp = await _closed_won_renewal_expansion_arr_in_range(db, feb_first, feb_last)
+    mtd_renewal_exp = await _closed_won_renewal_expansion_arr_in_range(db, mar_first, mar_last)
+    qtd_renewal_exp = await _closed_won_renewal_expansion_arr_in_range(db, qtd_first, last_day_quarter)
+    prev2_exp_mid_term, prev2_exp_upon_renewal = prev2_exp, prev2_renewal_exp
+    prev_exp_mid_term, prev_exp_upon_renewal = prev_exp, prev_renewal_exp
+    mtd_exp_mid_term, mtd_exp_upon_renewal = mtd_exp, mtd_renewal_exp
+    qtd_exp_mid_term, qtd_exp_upon_renewal = qtd_exp, qtd_renewal_exp
+    prev2_exp_combined = prev2_exp + prev2_renewal_exp
+    prev_exp_combined = prev_exp + prev_renewal_exp
+    mtd_exp_combined = mtd_exp + mtd_renewal_exp
+    qtd_exp_combined = qtd_exp + qtd_renewal_exp
+    prev2_total += prev2_renewal_exp
+    prev_total += prev_renewal_exp
+    mtd_total += mtd_renewal_exp
+    qtd_total += qtd_renewal_exp
+
+    p2_nb, p2_exp = plan_by_month[0]
+    p2_tot = (p2_nb or 0) + (p2_exp or 0) if (p2_nb is not None or p2_exp is not None) else None
+    p_nb, p_exp = plan_by_month[1]
+    p_tot = (p_nb or 0) + (p_exp or 0) if (p_nb is not None or p_exp is not None) else None
+    c_nb, c_exp = plan_by_month[2]
+    c_tot = (c_nb or 0) + (c_exp or 0) if (c_nb is not None or c_exp is not None) else None
+    q_nb = sum(plan_by_month[i][0] or 0 for i in range(0, 3))
+    q_exp = sum(plan_by_month[i][1] or 0 for i in range(0, 3))
+    q_tot = q_nb + q_exp
+
+    first_of_month = mar_first
+    last_day_month = mar_last
+    pipeline_mtd_nb, pipeline_mtd_exp = await _open_pipeline_arr_by_record_type_in_range(db, first_of_month, last_day_month)
+    pipeline_mtd_tot = pipeline_mtd_nb + pipeline_mtd_exp
+    pipeline_qtd_nb, pipeline_qtd_exp = await _open_pipeline_arr_by_record_type_in_range(db, qtd_first, last_day_quarter)
+    pipeline_qtd_tot = pipeline_qtd_nb + pipeline_qtd_exp
+
+    def _plan_dollars(plan_val: Optional[float], actual: float) -> float:
+        if plan_val is None:
+            return 0.0
+        if actual > 0 and 0 < plan_val < actual / 100:
+            return plan_val * 1000.0
+        if actual == 0 and 0 < plan_val < 10000:
+            return plan_val * 1000.0
+        return plan_val
+
+    c_tot_d = _plan_dollars(c_tot, mtd_total)
+    c_nb_d = _plan_dollars(c_nb, mtd_nb)
+    c_exp_d = _plan_dollars(c_exp, mtd_exp_combined)
+    q_tot_d = _plan_dollars(q_tot, qtd_total)
+    q_nb_d = _plan_dollars(q_nb, qtd_nb)
+    q_exp_d = _plan_dollars(q_exp, qtd_exp_combined)
+    shortfall_mtd_tot = max(0, c_tot_d - mtd_total)
+    shortfall_mtd_nb = max(0, c_nb_d - mtd_nb)
+    shortfall_mtd_exp = max(0, c_exp_d - mtd_exp_combined)
+    shortfall_qtd_tot = max(0, q_tot_d - qtd_total)
+    shortfall_qtd_nb = max(0, q_nb_d - qtd_nb)
+    shortfall_qtd_exp = max(0, q_exp_d - qtd_exp_combined)
+    pipe_cov_mtd_tot = round(pipeline_mtd_tot / shortfall_mtd_tot, 2) if shortfall_mtd_tot > 0 else None
+    pipe_cov_mtd_nb = round(pipeline_mtd_nb / shortfall_mtd_nb, 2) if shortfall_mtd_nb > 0 else None
+    pipe_cov_mtd_exp = round(pipeline_mtd_exp / shortfall_mtd_exp, 2) if shortfall_mtd_exp > 0 else None
+    pipe_cov_qtd_tot = round(pipeline_qtd_tot / shortfall_qtd_tot, 2) if shortfall_qtd_tot > 0 else None
+    pipe_cov_qtd_nb = round(pipeline_qtd_nb / shortfall_qtd_nb, 2) if shortfall_qtd_nb > 0 else None
+    pipe_cov_qtd_exp = round(pipeline_qtd_exp / shortfall_qtd_exp, 2) if shortfall_qtd_exp > 0 else None
+
+    return BookingsMTDResponse(
+        two_months_ago=BookingsPeriod(
+            period_label=prev2_label,
+            total=_bookings_row(prev2_total, p2_tot),
+            new_business=_bookings_row(prev2_nb, p2_nb),
+            expansion=_bookings_row(prev2_exp_combined, p2_exp),
+            expansion_mid_term=prev2_exp_mid_term,
+            expansion_upon_renewal=prev2_exp_upon_renewal,
+            pipe_coverage_total=None,
+            pipe_coverage_new_business=None,
+            pipe_coverage_expansion=None,
+        ),
+        previous_month=BookingsPeriod(
+            period_label=prev_label,
+            total=_bookings_row(prev_total, p_tot),
+            new_business=_bookings_row(prev_nb, p_nb),
+            expansion=_bookings_row(prev_exp_combined, p_exp),
+            expansion_mid_term=prev_exp_mid_term,
+            expansion_upon_renewal=prev_exp_upon_renewal,
+            pipe_coverage_total=None,
+            pipe_coverage_new_business=None,
+            pipe_coverage_expansion=None,
+        ),
+        current_mtd=BookingsPeriod(
+            period_label=current_label,
+            total=_bookings_row(mtd_total, c_tot),
+            new_business=_bookings_row(mtd_nb, c_nb),
+            expansion=_bookings_row(mtd_exp_combined, c_exp),
+            expansion_mid_term=mtd_exp_mid_term,
+            expansion_upon_renewal=mtd_exp_upon_renewal,
+            pipe_coverage_total=pipe_cov_mtd_tot,
+            pipe_coverage_new_business=pipe_cov_mtd_nb,
+            pipe_coverage_expansion=pipe_cov_mtd_exp,
+        ),
+        qtd=BookingsPeriod(
+            period_label=qtd_label,
+            total=_bookings_row(qtd_total, q_tot),
+            new_business=_bookings_row(qtd_nb, q_nb),
+            expansion=_bookings_row(qtd_exp_combined, q_exp),
+            expansion_mid_term=qtd_exp_mid_term,
+            expansion_upon_renewal=qtd_exp_upon_renewal,
+            pipe_coverage_total=pipe_cov_qtd_tot,
+            pipe_coverage_new_business=pipe_cov_qtd_nb,
+            pipe_coverage_expansion=pipe_cov_qtd_exp,
+        ),
+        plan_source=plan_source,
+        plan_message=plan_message,
+    )
+
+
+async def _bookings_mtd_q2_2026(db: AsyncSession) -> BookingsMTDResponse:
+    """Fixed columns: Apr 26, May 26, Jun 26, Q2 26 — full months; Q2 = calendar Q2 2026 (Apr+May+Jun)."""
+    apr_first, apr_last = date(2026, 4, 1), date(2026, 4, 30)
+    may_first, may_last = date(2026, 5, 1), date(2026, 5, 31)
+    jun_first, jun_last = date(2026, 6, 1), date(2026, 6, 30)
+    qtd_first = date(2026, 4, 1)
+    last_day_quarter = date(2026, 6, 30)
+
+    prev2_label = "Apr 26"
+    prev_label = "May 26"
+    current_label = "Jun 26"
+    qtd_label = "Q2 26"
+
+    plan_by_month: list[tuple[Optional[float], Optional[float]]] = [(None, None)] * 12
+    plan_source: Optional[str] = None
+    plan_message: Optional[str] = None
+    sheet_range = "ARR_Calculations_2026P!A1:ZZ1000"
+    r_snap = await db.execute(
+        select(SheetSnapshot).where(SheetSnapshot.range_name == sheet_range).order_by(SheetSnapshot.as_of.desc()).limit(1)
+    )
+    snap = r_snap.scalar_one_or_none()
+    if snap and snap.data_json:
+        data = json.loads(snap.data_json)
+        row_11 = data[10] if len(data) > 10 else []
+        row_12 = data[11] if len(data) > 11 else []
+        try:
+            for m in range(12):
+                col_idx = _a1_col_to_index(ARR_2026P_MONTH_COLUMNS[m])
+                v11 = row_11[col_idx] if col_idx < len(row_11) else None
+                v12 = row_12[col_idx] if col_idx < len(row_12) else None
+                plan_by_month[m] = (_to_float_sheet(v11), _to_float_sheet(v12))
+            plan_source = "ARR_Calculations_2026P"
+        except (TypeError, ValueError, IndexError):
+            plan_message = "Could not read plan from sheet."
+    else:
+        plan_message = "No sheet snapshot. Sync ARR_Calculations_2026P first."
+
+    prev2_total, prev2_nb, prev2_exp = await _closed_won_arr_in_range(db, apr_first, apr_last)
+    prev_total, prev_nb, prev_exp = await _closed_won_arr_in_range(db, may_first, may_last)
+    mtd_total, mtd_nb, mtd_exp = await _closed_won_arr_in_range(db, jun_first, jun_last)
+    qtd_total, qtd_nb, qtd_exp = await _closed_won_arr_in_range(db, qtd_first, last_day_quarter)
+    prev2_renewal_exp = await _closed_won_renewal_expansion_arr_in_range(db, apr_first, apr_last)
+    prev_renewal_exp = await _closed_won_renewal_expansion_arr_in_range(db, may_first, may_last)
+    mtd_renewal_exp = await _closed_won_renewal_expansion_arr_in_range(db, jun_first, jun_last)
+    qtd_renewal_exp = await _closed_won_renewal_expansion_arr_in_range(db, qtd_first, last_day_quarter)
+    prev2_exp_mid_term, prev2_exp_upon_renewal = prev2_exp, prev2_renewal_exp
+    prev_exp_mid_term, prev_exp_upon_renewal = prev_exp, prev_renewal_exp
+    mtd_exp_mid_term, mtd_exp_upon_renewal = mtd_exp, mtd_renewal_exp
+    qtd_exp_mid_term, qtd_exp_upon_renewal = qtd_exp, qtd_renewal_exp
+    prev2_exp_combined = prev2_exp + prev2_renewal_exp
+    prev_exp_combined = prev_exp + prev_renewal_exp
+    mtd_exp_combined = mtd_exp + mtd_renewal_exp
+    qtd_exp_combined = qtd_exp + qtd_renewal_exp
+    prev2_total += prev2_renewal_exp
+    prev_total += prev_renewal_exp
+    mtd_total += mtd_renewal_exp
+    qtd_total += qtd_renewal_exp
+
+    p2_nb, p2_exp = plan_by_month[3]
+    p2_tot = (p2_nb or 0) + (p2_exp or 0) if (p2_nb is not None or p2_exp is not None) else None
+    p_nb, p_exp = plan_by_month[4]
+    p_tot = (p_nb or 0) + (p_exp or 0) if (p_nb is not None or p_exp is not None) else None
+    c_nb, c_exp = plan_by_month[5]
+    c_tot = (c_nb or 0) + (c_exp or 0) if (c_nb is not None or c_exp is not None) else None
+    q_nb = sum(plan_by_month[i][0] or 0 for i in range(3, 6))
+    q_exp = sum(plan_by_month[i][1] or 0 for i in range(3, 6))
+    q_tot = q_nb + q_exp
+
+    first_of_month = jun_first
+    last_day_month = jun_last
+    pipeline_mtd_nb, pipeline_mtd_exp = await _open_pipeline_arr_by_record_type_in_range(db, first_of_month, last_day_month)
+    pipeline_mtd_tot = pipeline_mtd_nb + pipeline_mtd_exp
+    pipeline_qtd_nb, pipeline_qtd_exp = await _open_pipeline_arr_by_record_type_in_range(db, qtd_first, last_day_quarter)
+    pipeline_qtd_tot = pipeline_qtd_nb + pipeline_qtd_exp
+
+    def _plan_dollars(plan_val: Optional[float], actual: float) -> float:
+        if plan_val is None:
+            return 0.0
+        if actual > 0 and 0 < plan_val < actual / 100:
+            return plan_val * 1000.0
+        if actual == 0 and 0 < plan_val < 10000:
+            return plan_val * 1000.0
+        return plan_val
+
+    c_tot_d = _plan_dollars(c_tot, mtd_total)
+    c_nb_d = _plan_dollars(c_nb, mtd_nb)
+    c_exp_d = _plan_dollars(c_exp, mtd_exp_combined)
+    q_tot_d = _plan_dollars(q_tot, qtd_total)
+    q_nb_d = _plan_dollars(q_nb, qtd_nb)
+    q_exp_d = _plan_dollars(q_exp, qtd_exp_combined)
+    shortfall_mtd_tot = max(0, c_tot_d - mtd_total)
+    shortfall_mtd_nb = max(0, c_nb_d - mtd_nb)
+    shortfall_mtd_exp = max(0, c_exp_d - mtd_exp_combined)
+    shortfall_qtd_tot = max(0, q_tot_d - qtd_total)
+    shortfall_qtd_nb = max(0, q_nb_d - qtd_nb)
+    shortfall_qtd_exp = max(0, q_exp_d - qtd_exp_combined)
+    pipe_cov_mtd_tot = round(pipeline_mtd_tot / shortfall_mtd_tot, 2) if shortfall_mtd_tot > 0 else None
+    pipe_cov_mtd_nb = round(pipeline_mtd_nb / shortfall_mtd_nb, 2) if shortfall_mtd_nb > 0 else None
+    pipe_cov_mtd_exp = round(pipeline_mtd_exp / shortfall_mtd_exp, 2) if shortfall_mtd_exp > 0 else None
+    pipe_cov_qtd_tot = round(pipeline_qtd_tot / shortfall_qtd_tot, 2) if shortfall_qtd_tot > 0 else None
+    pipe_cov_qtd_nb = round(pipeline_qtd_nb / shortfall_qtd_nb, 2) if shortfall_qtd_nb > 0 else None
+    pipe_cov_qtd_exp = round(pipeline_qtd_exp / shortfall_qtd_exp, 2) if shortfall_qtd_exp > 0 else None
+
+    return BookingsMTDResponse(
+        two_months_ago=BookingsPeriod(
+            period_label=prev2_label,
+            total=_bookings_row(prev2_total, p2_tot),
+            new_business=_bookings_row(prev2_nb, p2_nb),
+            expansion=_bookings_row(prev2_exp_combined, p2_exp),
+            expansion_mid_term=prev2_exp_mid_term,
+            expansion_upon_renewal=prev2_exp_upon_renewal,
+            pipe_coverage_total=None,
+            pipe_coverage_new_business=None,
+            pipe_coverage_expansion=None,
+        ),
+        previous_month=BookingsPeriod(
+            period_label=prev_label,
+            total=_bookings_row(prev_total, p_tot),
+            new_business=_bookings_row(prev_nb, p_nb),
+            expansion=_bookings_row(prev_exp_combined, p_exp),
+            expansion_mid_term=prev_exp_mid_term,
+            expansion_upon_renewal=prev_exp_upon_renewal,
+            pipe_coverage_total=None,
+            pipe_coverage_new_business=None,
+            pipe_coverage_expansion=None,
+        ),
+        current_mtd=BookingsPeriod(
+            period_label=current_label,
+            total=_bookings_row(mtd_total, c_tot),
+            new_business=_bookings_row(mtd_nb, c_nb),
+            expansion=_bookings_row(mtd_exp_combined, c_exp),
+            expansion_mid_term=mtd_exp_mid_term,
+            expansion_upon_renewal=mtd_exp_upon_renewal,
+            pipe_coverage_total=pipe_cov_mtd_tot,
+            pipe_coverage_new_business=pipe_cov_mtd_nb,
+            pipe_coverage_expansion=pipe_cov_mtd_exp,
+        ),
+        qtd=BookingsPeriod(
+            period_label=qtd_label,
+            total=_bookings_row(qtd_total, q_tot),
+            new_business=_bookings_row(qtd_nb, q_nb),
+            expansion=_bookings_row(qtd_exp_combined, q_exp),
+            expansion_mid_term=qtd_exp_mid_term,
+            expansion_upon_renewal=qtd_exp_upon_renewal,
+            pipe_coverage_total=pipe_cov_qtd_tot,
+            pipe_coverage_new_business=pipe_cov_qtd_nb,
+            pipe_coverage_expansion=pipe_cov_qtd_exp,
+        ),
+        plan_source=plan_source,
+        plan_message=plan_message,
+    )
+
+
+async def _get_dashboard_bookings_mtd_impl(db: AsyncSession, *, fixed_periods: Optional[str] = None) -> BookingsMTDResponse:
+    if fixed_periods == "q1_2026":
+        return await _bookings_mtd_q1_2026(db)
+    if fixed_periods == "q2_2026":
+        return await _bookings_mtd_q2_2026(db)
     now_est = datetime.now(EST)
     year, month = now_est.year, now_est.month
     today = now_est.date()
@@ -3657,16 +4798,6 @@ async def _get_dashboard_bookings_mtd_impl(db: AsyncSession) -> BookingsMTDRespo
         prev_label = datetime(year, month - 1, 1).strftime("%b %y")
 
     # Two months ago date range
-    prev2_month = month - 2
-    prev2_year = year
-    while prev2_month <= 0:
-        prev2_month += 12
-        prev2_year -= 1
-    prev2_first = date(prev2_year, prev2_month, 1)
-    prev2_last = (prev2_first + timedelta(days=32)).replace(day=1) - timedelta(days=1)
-    prev2_label = datetime(prev2_year, prev2_month, 1).strftime("%b %y")
-
-    # Two months ago date range (e.g. Jan when current month is Mar)
     prev2_month = month - 2
     prev2_year = year
     while prev2_month <= 0:
@@ -3715,7 +4846,7 @@ async def _get_dashboard_bookings_mtd_impl(db: AsyncSession) -> BookingsMTDRespo
     else:
         plan_message = "No sheet snapshot. Sync ARR_Calculations_2026P first."
 
-    # Actuals for each period (pipeline NB + Expansion); add Closed Won renewal positive delta to expansion
+    # Actuals: NB + expansion mid-term + upon renewal. Expansion **row** mtd = mid-term + upon renewal (same components as Total − NB).
     prev_total, prev_nb, prev_exp = await _closed_won_arr_in_range(db, prev_first, prev_last)
     prev2_total, prev2_nb, prev2_exp = await _closed_won_arr_in_range(db, prev2_first, prev2_last)
     mtd_total, mtd_nb, mtd_exp = await _closed_won_arr_in_range(db, first_of_month, today)
@@ -3728,13 +4859,13 @@ async def _get_dashboard_bookings_mtd_impl(db: AsyncSession) -> BookingsMTDRespo
     prev2_exp_mid_term, prev2_exp_upon_renewal = prev2_exp, prev2_renewal_exp
     mtd_exp_mid_term, mtd_exp_upon_renewal = mtd_exp, mtd_renewal_exp
     qtd_exp_mid_term, qtd_exp_upon_renewal = qtd_exp, qtd_renewal_exp
-    prev_exp += prev_renewal_exp
+    prev_exp_combined = prev_exp + prev_renewal_exp
+    prev2_exp_combined = prev2_exp + prev2_renewal_exp
+    mtd_exp_combined = mtd_exp + mtd_renewal_exp
+    qtd_exp_combined = qtd_exp + qtd_renewal_exp
     prev_total += prev_renewal_exp
-    prev2_exp += prev2_renewal_exp
     prev2_total += prev2_renewal_exp
-    mtd_exp += mtd_renewal_exp
     mtd_total += mtd_renewal_exp
-    qtd_exp += qtd_renewal_exp
     qtd_total += qtd_renewal_exp
 
     # Plan for previous month (month index 0-based)
@@ -3773,16 +4904,16 @@ async def _get_dashboard_bookings_mtd_impl(db: AsyncSession) -> BookingsMTDRespo
 
     c_tot_d = _plan_dollars(c_tot, mtd_total)
     c_nb_d = _plan_dollars(c_nb, mtd_nb)
-    c_exp_d = _plan_dollars(c_exp, mtd_exp)
+    c_exp_d = _plan_dollars(c_exp, mtd_exp_combined)
     q_tot_d = _plan_dollars(q_tot, qtd_total)
     q_nb_d = _plan_dollars(q_nb, qtd_nb)
-    q_exp_d = _plan_dollars(q_exp, qtd_exp)
+    q_exp_d = _plan_dollars(q_exp, qtd_exp_combined)
     shortfall_mtd_tot = max(0, c_tot_d - mtd_total)
     shortfall_mtd_nb = max(0, c_nb_d - mtd_nb)
-    shortfall_mtd_exp = max(0, c_exp_d - mtd_exp)
+    shortfall_mtd_exp = max(0, c_exp_d - mtd_exp_combined)
     shortfall_qtd_tot = max(0, q_tot_d - qtd_total)
     shortfall_qtd_nb = max(0, q_nb_d - qtd_nb)
-    shortfall_qtd_exp = max(0, q_exp_d - qtd_exp)
+    shortfall_qtd_exp = max(0, q_exp_d - qtd_exp_combined)
     pipe_cov_mtd_tot = round(pipeline_mtd_tot / shortfall_mtd_tot, 2) if shortfall_mtd_tot > 0 else None
     pipe_cov_mtd_nb = round(pipeline_mtd_nb / shortfall_mtd_nb, 2) if shortfall_mtd_nb > 0 else None
     pipe_cov_mtd_exp = round(pipeline_mtd_exp / shortfall_mtd_exp, 2) if shortfall_mtd_exp > 0 else None
@@ -3795,7 +4926,7 @@ async def _get_dashboard_bookings_mtd_impl(db: AsyncSession) -> BookingsMTDRespo
             period_label=prev2_label,
             total=_bookings_row(prev2_total, p2_tot),
             new_business=_bookings_row(prev2_nb, p2_nb),
-            expansion=_bookings_row(prev2_exp, p2_exp),
+            expansion=_bookings_row(prev2_exp_combined, p2_exp),
             expansion_mid_term=prev2_exp_mid_term,
             expansion_upon_renewal=prev2_exp_upon_renewal,
             pipe_coverage_total=None,
@@ -3806,7 +4937,7 @@ async def _get_dashboard_bookings_mtd_impl(db: AsyncSession) -> BookingsMTDRespo
             period_label=prev_label,
             total=_bookings_row(prev_total, p_tot),
             new_business=_bookings_row(prev_nb, p_nb),
-            expansion=_bookings_row(prev_exp, p_exp),
+            expansion=_bookings_row(prev_exp_combined, p_exp),
             expansion_mid_term=prev_exp_mid_term,
             expansion_upon_renewal=prev_exp_upon_renewal,
             pipe_coverage_total=None,
@@ -3817,7 +4948,7 @@ async def _get_dashboard_bookings_mtd_impl(db: AsyncSession) -> BookingsMTDRespo
             period_label=current_label,
             total=_bookings_row(mtd_total, c_tot),
             new_business=_bookings_row(mtd_nb, c_nb),
-            expansion=_bookings_row(mtd_exp, c_exp),
+            expansion=_bookings_row(mtd_exp_combined, c_exp),
             expansion_mid_term=mtd_exp_mid_term,
             expansion_upon_renewal=mtd_exp_upon_renewal,
             pipe_coverage_total=pipe_cov_mtd_tot,
@@ -3828,7 +4959,7 @@ async def _get_dashboard_bookings_mtd_impl(db: AsyncSession) -> BookingsMTDRespo
             period_label=qtd_label,
             total=_bookings_row(qtd_total, q_tot),
             new_business=_bookings_row(qtd_nb, q_nb),
-            expansion=_bookings_row(qtd_exp, q_exp),
+            expansion=_bookings_row(qtd_exp_combined, q_exp),
             expansion_mid_term=qtd_exp_mid_term,
             expansion_upon_renewal=qtd_exp_upon_renewal,
             pipe_coverage_total=pipe_cov_qtd_tot,
@@ -3838,6 +4969,453 @@ async def _get_dashboard_bookings_mtd_impl(db: AsyncSession) -> BookingsMTDRespo
         plan_source=plan_source,
         plan_message=plan_message,
     )
+
+
+@app.get("/api/dashboard/renewals-mtd", response_model=RenewalsMTDResponse)
+async def get_dashboard_renewals_mtd(
+    db: AsyncSession = Depends(get_db),
+    fixed_periods: Optional[str] = Query(None, description="q1_2026 or q2_2026 fixed quarter columns (same pattern as Bookings)."),
+):
+    """
+    Renewals vs plan: four periods aligned with Bookings labels. **Current MTD** uses the **full**
+    ongoing calendar month; **QTD** uses the **full** calendar quarter (renewal date from quarter start through
+    quarter end, not truncated to today). **Up for renewal plan** = actual UFR for that period; other plan rows
+    use ARR_Calculations_2026P (BU35/BU52/BU54). On failure returns 200 + JSON.
+    """
+    try:
+        return await _get_dashboard_renewals_mtd_impl(db, fixed_periods=fixed_periods)
+    except Exception as e:
+        return JSONResponse(
+            status_code=200,
+            content=_safe_renewals_fallback(f"Error loading renewals: {str(e)[:100]}"),
+        )
+
+
+async def _renewals_mtd_q1_2026(db: AsyncSession) -> RenewalsMTDResponse:
+    """Fixed columns: Jan 26, Feb 26, Mar 26, Q1 26 — full months / full Q1 2026."""
+    jan_first, jan_last = date(2026, 1, 1), date(2026, 1, 31)
+    feb_first, feb_last = date(2026, 2, 1), date(2026, 2, 28)
+    mar_first, mar_last = date(2026, 3, 1), date(2026, 3, 31)
+    qtd_first = date(2026, 1, 1)
+    last_day_quarter = date(2026, 3, 31)
+    prev2_label = "Jan 26"
+    prev_label = "Feb 26"
+    current_label = "Mar 26"
+    qtd_label = "Q1 26"
+    prev2_first, prev2_last = jan_first, jan_last
+    prev_first, prev_last = feb_first, feb_last
+    first_of_month = mar_first
+    last_of_month = mar_last
+    prev2_m = 0
+    prev_m = 1
+    cur_m = 2
+    q_month_indices = [0, 1, 2]
+    year = 2026
+
+    overrides = await _get_record_type_overrides(db)
+
+    def _effective_record_type(o: Opportunity) -> str:
+        key = (o.sf_id or "").strip()
+        override = overrides.get(key) or (overrides.get(key[:15]) if len(key) >= 15 else None)
+        return (override or o.record_type_name or "").strip() or "—"
+
+    q = select(Opportunity).where(Opportunity.stage_name.isnot(None))
+    r = await db.execute(q)
+    all_opps = [o for o in r.scalars().all() if not _is_excluded_from_bookings_nb_only(o, _effective_record_type(o))]
+    renewal_opps = [o for o in all_opps if _is_renewal_record_type(_effective_record_type(o))]
+
+    def _pf_prev2(rd: date) -> bool:
+        return prev2_first <= rd <= prev2_last
+
+    def _pf_prev(rd: date) -> bool:
+        return prev_first <= rd <= prev_last
+
+    def _pf_mtd(rd: date) -> bool:
+        return first_of_month <= rd <= last_of_month
+
+    def _pf_qtd(rd: date) -> bool:
+        return qtd_first <= rd <= last_day_quarter
+
+    a_prev2 = _aggregate_renewals_actuals(renewal_opps, _pf_prev2)
+    a_prev = _aggregate_renewals_actuals(renewal_opps, _pf_prev)
+    a_mtd = _aggregate_renewals_actuals(renewal_opps, _pf_mtd)
+    a_qtd = _aggregate_renewals_actuals(renewal_opps, _pf_qtd)
+
+    sheet_range = "ARR_Calculations_2026P!A1:ZZ1000"
+    r_snap = await db.execute(
+        select(SheetSnapshot).where(SheetSnapshot.range_name == sheet_range).order_by(SheetSnapshot.as_of.desc()).limit(1)
+    )
+    snap = r_snap.scalar_one_or_none()
+    plan_source: Optional[str] = None
+    plan_message: Optional[str] = None
+    data: list = []
+    if snap and snap.data_json:
+        try:
+            data = json.loads(snap.data_json)
+            data = _pad_sheet_snapshot_for_renewals_plan(data)
+            plan_source = "ARR_Calculations_2026P"
+        except (TypeError, ValueError, json.JSONDecodeError):
+            plan_message = "Could not read renewals plan from sheet."
+    else:
+        plan_message = "No sheet snapshot. Sync ARR_Calculations_2026P first."
+
+    def _period(
+        label: str,
+        tup: tuple,
+        month_idx: Optional[int],
+        q_indices: Optional[list[int]],
+    ) -> RenewalsPeriod:
+        ufr, o_open, churn, contr, renewed, rate, canc = tup
+        if not data:
+            p_ufr = p_ch = p_co = p_re = p_ra = p_ca = None
+        elif q_indices is not None:
+            by_m = _renewals_qtd_ufr_by_month(renewal_opps, year, qtd_first, last_day_quarter, q_indices)
+            p_ufr, p_ch, p_co, p_re, p_ra, p_ca = _renewals_plan_bundle_qtd(
+                data,
+                q_indices,
+                ufr,
+                churn,
+                contr,
+                canc,
+                renewed,
+                by_m,
+            )
+        elif month_idx is not None:
+            p_ufr, p_ch, p_co, p_re, p_ra, p_ca = _renewals_plan_bundle(
+                data,
+                month_idx,
+                ufr,
+                churn,
+                contr,
+                canc,
+                renewed,
+            )
+        else:
+            p_ufr = p_ch = p_co = p_re = p_ra = p_ca = None
+
+        return RenewalsPeriod(
+            period_label=label,
+            up_for_renewal=_renewals_row_dollars(ufr, p_ufr),
+            renewed=_renewals_row_dollars(renewed, p_re),
+            open=_renewals_row_open(o_open),
+            churn=_renewals_row_dollars(churn, p_ch),
+            contraction=_renewals_row_dollars(contr, p_co),
+            renewal_rate=_renewals_row_rate_optional(rate, p_ra),
+            cancelled=_renewals_row_dollars(canc, p_ca),
+        )
+
+    return RenewalsMTDResponse(
+        two_months_ago=_period(prev2_label, a_prev2, prev2_m, None),
+        previous_month=_period(prev_label, a_prev, prev_m, None),
+        current_mtd=_period(current_label, a_mtd, cur_m, None),
+        qtd=_period(qtd_label, a_qtd, None, q_month_indices),
+        plan_source=plan_source,
+        plan_message=plan_message,
+    )
+
+
+async def _renewals_mtd_q2_2026(db: AsyncSession) -> RenewalsMTDResponse:
+    """Fixed columns: Apr 26, May 26, Jun 26, Q2 26 — full months; Q2 = calendar Q2 2026 (Apr+May+Jun)."""
+    apr_first, apr_last = date(2026, 4, 1), date(2026, 4, 30)
+    may_first, may_last = date(2026, 5, 1), date(2026, 5, 31)
+    jun_first, jun_last = date(2026, 6, 1), date(2026, 6, 30)
+    qtd_first = date(2026, 4, 1)
+    last_day_quarter = date(2026, 6, 30)
+    prev2_label = "Apr 26"
+    prev_label = "May 26"
+    current_label = "Jun 26"
+    qtd_label = "Q2 26"
+    prev2_first, prev2_last = apr_first, apr_last
+    prev_first, prev_last = may_first, may_last
+    first_of_month = jun_first
+    last_of_month = jun_last
+    prev2_m = 3
+    prev_m = 4
+    cur_m = 5
+    q_month_indices = [3, 4, 5]
+    year = 2026
+
+    overrides = await _get_record_type_overrides(db)
+
+    def _effective_record_type(o: Opportunity) -> str:
+        key = (o.sf_id or "").strip()
+        override = overrides.get(key) or (overrides.get(key[:15]) if len(key) >= 15 else None)
+        return (override or o.record_type_name or "").strip() or "—"
+
+    q = select(Opportunity).where(Opportunity.stage_name.isnot(None))
+    r = await db.execute(q)
+    all_opps = [o for o in r.scalars().all() if not _is_excluded_from_bookings_nb_only(o, _effective_record_type(o))]
+    renewal_opps = [o for o in all_opps if _is_renewal_record_type(_effective_record_type(o))]
+
+    def _pf_prev2(rd: date) -> bool:
+        return prev2_first <= rd <= prev2_last
+
+    def _pf_prev(rd: date) -> bool:
+        return prev_first <= rd <= prev_last
+
+    def _pf_mtd(rd: date) -> bool:
+        return first_of_month <= rd <= last_of_month
+
+    def _pf_qtd(rd: date) -> bool:
+        return qtd_first <= rd <= last_day_quarter
+
+    a_prev2 = _aggregate_renewals_actuals(renewal_opps, _pf_prev2)
+    a_prev = _aggregate_renewals_actuals(renewal_opps, _pf_prev)
+    a_mtd = _aggregate_renewals_actuals(renewal_opps, _pf_mtd)
+    a_qtd = _aggregate_renewals_actuals(renewal_opps, _pf_qtd)
+
+    sheet_range = "ARR_Calculations_2026P!A1:ZZ1000"
+    r_snap = await db.execute(
+        select(SheetSnapshot).where(SheetSnapshot.range_name == sheet_range).order_by(SheetSnapshot.as_of.desc()).limit(1)
+    )
+    snap = r_snap.scalar_one_or_none()
+    plan_source: Optional[str] = None
+    plan_message: Optional[str] = None
+    data: list = []
+    if snap and snap.data_json:
+        try:
+            data = json.loads(snap.data_json)
+            data = _pad_sheet_snapshot_for_renewals_plan(data)
+            plan_source = "ARR_Calculations_2026P"
+        except (TypeError, ValueError, json.JSONDecodeError):
+            plan_message = "Could not read renewals plan from sheet."
+    else:
+        plan_message = "No sheet snapshot. Sync ARR_Calculations_2026P first."
+
+    def _period(
+        label: str,
+        tup: tuple,
+        month_idx: Optional[int],
+        q_indices: Optional[list[int]],
+    ) -> RenewalsPeriod:
+        ufr, o_open, churn, contr, renewed, rate, canc = tup
+        if not data:
+            p_ufr = p_ch = p_co = p_re = p_ra = p_ca = None
+        elif q_indices is not None:
+            by_m = _renewals_qtd_ufr_by_month(renewal_opps, year, qtd_first, last_day_quarter, q_indices)
+            p_ufr, p_ch, p_co, p_re, p_ra, p_ca = _renewals_plan_bundle_qtd(
+                data,
+                q_indices,
+                ufr,
+                churn,
+                contr,
+                canc,
+                renewed,
+                by_m,
+            )
+        elif month_idx is not None:
+            p_ufr, p_ch, p_co, p_re, p_ra, p_ca = _renewals_plan_bundle(
+                data,
+                month_idx,
+                ufr,
+                churn,
+                contr,
+                canc,
+                renewed,
+            )
+        else:
+            p_ufr = p_ch = p_co = p_re = p_ra = p_ca = None
+
+        return RenewalsPeriod(
+            period_label=label,
+            up_for_renewal=_renewals_row_dollars(ufr, p_ufr),
+            renewed=_renewals_row_dollars(renewed, p_re),
+            open=_renewals_row_open(o_open),
+            churn=_renewals_row_dollars(churn, p_ch),
+            contraction=_renewals_row_dollars(contr, p_co),
+            renewal_rate=_renewals_row_rate_optional(rate, p_ra),
+            cancelled=_renewals_row_dollars(canc, p_ca),
+        )
+
+    return RenewalsMTDResponse(
+        two_months_ago=_period(prev2_label, a_prev2, prev2_m, None),
+        previous_month=_period(prev_label, a_prev, prev_m, None),
+        current_mtd=_period(current_label, a_mtd, cur_m, None),
+        qtd=_period(qtd_label, a_qtd, None, q_month_indices),
+        plan_source=plan_source,
+        plan_message=plan_message,
+    )
+
+
+async def _get_dashboard_renewals_mtd_impl(db: AsyncSession, *, fixed_periods: Optional[str] = None) -> RenewalsMTDResponse:
+    if fixed_periods == "q1_2026":
+        return await _renewals_mtd_q1_2026(db)
+    if fixed_periods == "q2_2026":
+        return await _renewals_mtd_q2_2026(db)
+    now_est = datetime.now(EST)
+    year, month = now_est.year, now_est.month
+    today = now_est.date()
+
+    if month == 1:
+        prev_first = date(year - 1, 12, 1)
+        prev_last = date(year - 1, 12, 31)
+        prev_label = datetime(year - 1, 12, 1).strftime("%b %y")
+    else:
+        prev_first = date(year, month - 1, 1)
+        prev_last = date(year, month - 1, 1) + timedelta(days=32)
+        prev_last = prev_last.replace(day=1) - timedelta(days=1)
+        prev_label = datetime(year, month - 1, 1).strftime("%b %y")
+
+    prev2_month = month - 2
+    prev2_year = year
+    while prev2_month <= 0:
+        prev2_month += 12
+        prev2_year -= 1
+    prev2_first = date(prev2_year, prev2_month, 1)
+    prev2_last = (prev2_first + timedelta(days=32)).replace(day=1) - timedelta(days=1)
+    prev2_label = datetime(prev2_year, prev2_month, 1).strftime("%b %y")
+
+    first_of_month = date(year, month, 1)
+    last_of_month = (first_of_month + timedelta(days=32)).replace(day=1) - timedelta(days=1)
+    current_label = now_est.strftime("%b %y") + " MTD"
+
+    quarter_month = ((month - 1) // 3) * 3 + 1
+    qtd_first = date(year, quarter_month, 1)
+    last_day_quarter = (date(year, quarter_month + 3, 1) - timedelta(days=1)) if quarter_month <= 9 else date(year, 12, 31)
+    qtd_label = f"Q{(quarter_month - 1) // 3 + 1} {str(year)[2:]} QTD"
+
+    prev_m = (month - 2 + 12) % 12
+    prev2_m = (month - 3 + 12) % 12
+    cur_m = month - 1
+    q_month_indices = list(range(quarter_month - 1, min(quarter_month + 2, 12)))
+
+    overrides = await _get_record_type_overrides(db)
+
+    def _effective_record_type(o: Opportunity) -> str:
+        key = (o.sf_id or "").strip()
+        override = overrides.get(key) or (overrides.get(key[:15]) if len(key) >= 15 else None)
+        return (override or o.record_type_name or "").strip() or "—"
+
+    q = select(Opportunity).where(Opportunity.stage_name.isnot(None))
+    r = await db.execute(q)
+    all_opps = [o for o in r.scalars().all() if not _is_excluded_from_bookings_nb_only(o, _effective_record_type(o))]
+    renewal_opps = [o for o in all_opps if _is_renewal_record_type(_effective_record_type(o))]
+
+    def _pf_prev2(rd: date) -> bool:
+        return prev2_first <= rd <= prev2_last
+
+    def _pf_prev(rd: date) -> bool:
+        return prev_first <= rd <= prev_last
+
+    def _pf_mtd(rd: date) -> bool:
+        # Renewals: full ongoing calendar month (all opps with renewal in this month), not truncated to today.
+        return first_of_month <= rd <= last_of_month
+
+    def _pf_qtd(rd: date) -> bool:
+        return qtd_first <= rd <= last_day_quarter
+
+    a_prev2 = _aggregate_renewals_actuals(renewal_opps, _pf_prev2)
+    a_prev = _aggregate_renewals_actuals(renewal_opps, _pf_prev)
+    a_mtd = _aggregate_renewals_actuals(renewal_opps, _pf_mtd)
+    a_qtd = _aggregate_renewals_actuals(renewal_opps, _pf_qtd)
+
+    sheet_range = "ARR_Calculations_2026P!A1:ZZ1000"
+    r_snap = await db.execute(
+        select(SheetSnapshot).where(SheetSnapshot.range_name == sheet_range).order_by(SheetSnapshot.as_of.desc()).limit(1)
+    )
+    snap = r_snap.scalar_one_or_none()
+    plan_source: Optional[str] = None
+    plan_message: Optional[str] = None
+    data: list = []
+    if snap and snap.data_json:
+        try:
+            data = json.loads(snap.data_json)
+            data = _pad_sheet_snapshot_for_renewals_plan(data)
+            plan_source = "ARR_Calculations_2026P"
+        except (TypeError, ValueError, json.JSONDecodeError):
+            plan_message = "Could not read renewals plan from sheet."
+    else:
+        plan_message = "No sheet snapshot. Sync ARR_Calculations_2026P first."
+
+    def _period(
+        label: str,
+        tup: tuple,
+        month_idx: Optional[int],
+        q_indices: Optional[list[int]],
+    ) -> RenewalsPeriod:
+        ufr, o_open, churn, contr, renewed, rate, canc = tup
+        if not data:
+            p_ufr = p_ch = p_co = p_re = p_ra = p_ca = None
+        elif q_indices is not None:
+            by_m = _renewals_qtd_ufr_by_month(renewal_opps, year, qtd_first, last_day_quarter, q_indices)
+            p_ufr, p_ch, p_co, p_re, p_ra, p_ca = _renewals_plan_bundle_qtd(
+                data,
+                q_indices,
+                ufr,
+                churn,
+                contr,
+                canc,
+                renewed,
+                by_m,
+            )
+        elif month_idx is not None:
+            p_ufr, p_ch, p_co, p_re, p_ra, p_ca = _renewals_plan_bundle(
+                data,
+                month_idx,
+                ufr,
+                churn,
+                contr,
+                canc,
+                renewed,
+            )
+        else:
+            p_ufr = p_ch = p_co = p_re = p_ra = p_ca = None
+
+        return RenewalsPeriod(
+            period_label=label,
+            up_for_renewal=_renewals_row_dollars(ufr, p_ufr),
+            renewed=_renewals_row_dollars(renewed, p_re),
+            open=_renewals_row_open(o_open),
+            churn=_renewals_row_dollars(churn, p_ch),
+            contraction=_renewals_row_dollars(contr, p_co),
+            renewal_rate=_renewals_row_rate_optional(rate, p_ra),
+            cancelled=_renewals_row_dollars(canc, p_ca),
+        )
+
+    return RenewalsMTDResponse(
+        two_months_ago=_period(prev2_label, a_prev2, prev2_m, None),
+        previous_month=_period(prev_label, a_prev, prev_m, None),
+        current_mtd=_period(current_label, a_mtd, cur_m, None),
+        qtd=_period(qtd_label, a_qtd, None, q_month_indices),
+        plan_source=plan_source,
+        plan_message=plan_message,
+    )
+
+
+def _safe_renewals_fallback(plan_message: str) -> dict:
+    """Minimal valid renewals JSON for exception handler so frontend never gets 500/non-JSON."""
+    now_est = datetime.now(EST)
+    y, m = now_est.year, now_est.month
+    tm2 = m - 2
+    ty2 = y
+    while tm2 <= 0:
+        tm2 += 12
+        ty2 -= 1
+    prev2 = datetime(ty2, tm2, 1).strftime("%b %y")
+    prev = datetime(y - 1, 12, 1).strftime("%b %y") if m == 1 else datetime(y, m - 1, 1).strftime("%b %y")
+    cur = now_est.strftime("%b %y") + " MTD"
+    qm = ((m - 1) // 3) * 3 + 1
+    qtd = f"Q{(qm - 1) // 3 + 1} {str(y)[2:]} QTD"
+    row = {"mtd": 0.0, "plan": None, "achievement_pct": None, "delta_k": None, "is_rate": False}
+    row_r = {"mtd": 0.0, "plan": None, "achievement_pct": None, "delta_k": None, "is_rate": True}
+    per = lambda label: {
+        "period_label": label,
+        "up_for_renewal": row.copy(),
+        "renewed": row.copy(),
+        "open": row.copy(),
+        "churn": row.copy(),
+        "contraction": row.copy(),
+        "renewal_rate": row_r.copy(),
+        "cancelled": row.copy(),
+    }
+    return {
+        "two_months_ago": per(prev2),
+        "previous_month": per(prev),
+        "current_mtd": per(cur),
+        "qtd": per(qtd),
+        "plan_source": None,
+        "plan_message": plan_message,
+    }
 
 
 def _safe_cash_fallback(plan_message: str) -> dict:
@@ -3881,7 +5459,17 @@ def _safe_bookings_fallback(plan_message: str) -> dict:
     qm = ((m - 1) // 3) * 3 + 1
     qtd = f"Q{(qm - 1) // 3 + 1} {str(y)[2:]} QTD"
     row = {"mtd": 0.0, "plan": None, "achievement_pct": None, "delta_k": None}
-    per = lambda label: {"period_label": label, "total": row, "new_business": row, "expansion": row}
+    per = lambda label: {
+        "period_label": label,
+        "total": row,
+        "new_business": row,
+        "expansion": row,
+        "expansion_mid_term": 0.0,
+        "expansion_upon_renewal": 0.0,
+        "pipe_coverage_total": None,
+        "pipe_coverage_new_business": None,
+        "pipe_coverage_expansion": None,
+    }
     return {
         "two_months_ago": per(prev2),
         "previous_month": per(prev),
@@ -3897,12 +5485,29 @@ BS_2026P_BILLINGS_ROW = 44
 BS_2026P_COLLECTIONS_ROWS = (63, 64, 65)
 
 
+def _chargebee_cash_fetch_bounds(now_est: datetime) -> tuple[int, int]:
+    """Start/end unix timestamps for Chargebee cash fetches. Matches dashboard Cash MTD (prev2 month → now)."""
+    if now_est.tzinfo is None:
+        now_est = now_est.replace(tzinfo=EST)
+    year, month = now_est.year, now_est.month
+    prev2_month = month - 2
+    prev2_year = year
+    while prev2_month <= 0:
+        prev2_month += 12
+        prev2_year -= 1
+    prev2_first = datetime(prev2_year, prev2_month, 1, 0, 0, 0, tzinfo=EST)
+    return int(prev2_first.timestamp()), int(now_est.timestamp())
+
+
 @app.get("/api/dashboard/cash-mtd", response_model=CashMTDResponse)
-async def get_dashboard_cash_mtd(db: AsyncSession = Depends(get_db)):
+async def get_dashboard_cash_mtd(
+    db: AsyncSession = Depends(get_db),
+    fixed_periods: Optional[str] = Query(None, description="q1_2026 or q2_2026 fixed quarter columns."),
+):
     """
     Cash KPIs: Billings and Collections. Same layout as Bookings: previous month, MTD, QTD.
     Plan from sheet BS_2026P: row 45 = Billings by month (BU..CF = Jan..Dec), rows 64–66 sum = Collections by month.
-    Actuals from Chargebee (invoices = billings, payments = collections).
+    Actuals from Chargebee (invoices = billings, payments = collections). Uses SQLite cash_invoices/cash_payments snapshots from Refresh app data when present; otherwise calls the Chargebee API once.
     On any failure returns 200 + JSON with plan_message set so the frontend never sees 500 or non-JSON.
     """
     def _empty_period(label: str) -> CashPeriod:
@@ -3934,11 +5539,12 @@ async def get_dashboard_cash_mtd(db: AsyncSession = Depends(get_db)):
         current_label = now_est.strftime("%b %y") + " MTD"
         quarter_month = ((month - 1) // 3) * 3 + 1
         qtd_label = f"Q{(quarter_month - 1) // 3 + 1} {str(year)[2:]} QTD"
+        p2 = _empty_period(prev2_label)
         p = _empty_period(prev_label)
         c = _empty_period(current_label)
         q = _empty_period(qtd_label)
         return {
-            "two_months_ago": {**empty, "period_label": prev2_label},
+            "two_months_ago": p2.model_dump(),
             "previous_month": p.model_dump(),
             "current_mtd": c.model_dump(),
             "qtd": q.model_dump(),
@@ -3948,7 +5554,7 @@ async def get_dashboard_cash_mtd(db: AsyncSession = Depends(get_db)):
         }
 
     try:
-        return await _get_dashboard_cash_mtd_impl(db)
+        return await _get_dashboard_cash_mtd_impl(db, fixed_periods=fixed_periods)
     except Exception as e:
         err_msg = str(e)[:120]
         try:
@@ -3980,7 +5586,429 @@ async def get_dashboard_cash_mtd(db: AsyncSession = Depends(get_db)):
             })
 
 
-async def _get_dashboard_cash_mtd_impl(db: AsyncSession) -> CashMTDResponse:
+async def _load_latest_chargebee_cash_from_cache(db: AsyncSession) -> Optional[tuple[list, list, Optional[datetime]]]:
+    """Latest cash_invoices + cash_payments snapshots from Refresh app data. Returns (invoices, payments, as_of)."""
+    r1 = await db.execute(
+        select(ChargebeeSnapshot)
+        .where(ChargebeeSnapshot.report_type == "cash_invoices")
+        .order_by(ChargebeeSnapshot.as_of.desc())
+        .limit(1)
+    )
+    r2 = await db.execute(
+        select(ChargebeeSnapshot)
+        .where(ChargebeeSnapshot.report_type == "cash_payments")
+        .order_by(ChargebeeSnapshot.as_of.desc())
+        .limit(1)
+    )
+    ci = r1.scalar_one_or_none()
+    cp = r2.scalar_one_or_none()
+    if not ci or not cp or not ci.data_json or not cp.data_json:
+        return None
+    try:
+        jd_i = json.loads(ci.data_json)
+        jd_p = json.loads(cp.data_json)
+        invoices = jd_i.get("invoices") or []
+        payments = jd_p.get("payments") or []
+    except (json.JSONDecodeError, TypeError):
+        return None
+    return (invoices, payments, ci.as_of)
+
+
+async def _cash_mtd_q1_2026(db: AsyncSession) -> CashMTDResponse:
+    """Fixed columns: Jan 26, Feb 26, Mar 26, Q1 26 — full months / full Q1 2026; Chargebee QTD through Mar 31."""
+    prev2_label = "Jan 26"
+    prev_label = "Feb 26"
+    current_label = "Mar 26"
+    qtd_label = "Q1 26"
+    quarter_month = 1
+
+    sheet_range = "BS_2026P!A1:ZZ1000"
+    plan_source: Optional[str] = None
+    plan_message: Optional[str] = None
+    billings_by_month: list[Optional[float]] = [None] * 12
+    collections_by_month: list[Optional[float]] = [None] * 12
+
+    r_snap = await db.execute(
+        select(SheetSnapshot).where(SheetSnapshot.range_name == sheet_range).order_by(SheetSnapshot.as_of.desc()).limit(1)
+    )
+    snap = r_snap.scalar_one_or_none()
+    if snap and snap.data_json:
+        data = json.loads(snap.data_json)
+        try:
+            row_billings = data[BS_2026P_BILLINGS_ROW] if len(data) > BS_2026P_BILLINGS_ROW else []
+            for m in range(12):
+                col_idx = _a1_col_to_index(ARR_2026P_MONTH_COLUMNS[m])
+                v = row_billings[col_idx] if col_idx < len(row_billings) else None
+                billings_by_month[m] = _to_float_sheet(v)
+            for m in range(12):
+                col_idx = _a1_col_to_index(ARR_2026P_MONTH_COLUMNS[m])
+                coll = 0.0
+                for ri in BS_2026P_COLLECTIONS_ROWS:
+                    if len(data) > ri:
+                        row = data[ri]
+                        if col_idx < len(row):
+                            v = _to_float_sheet(row[col_idx])
+                            if v is not None:
+                                coll += v
+                collections_by_month[m] = coll if coll else None
+            plan_source = "BS_2026P"
+        except (TypeError, ValueError, IndexError):
+            plan_message = "Could not read Cash plan from sheet."
+    else:
+        plan_message = "No sheet snapshot. Sync BS_2026P first."
+
+    prev2_m = 0
+    prev_m = 1
+    c_m = 2
+    prev_b = billings_by_month[prev_m]
+    prev_c = collections_by_month[prev_m]
+    prev2_b = billings_by_month[prev2_m]
+    prev2_c = collections_by_month[prev2_m]
+    curr_b = billings_by_month[c_m]
+    curr_c = collections_by_month[c_m]
+    q_b = sum(billings_by_month[i] or 0 for i in range(0, 3))
+    q_c = sum(collections_by_month[i] or 0 for i in range(0, 3))
+
+    prev2_first = datetime(2026, 1, 1, 0, 0, 0, tzinfo=EST)
+    prev2_last = datetime(2026, 1, 31, 23, 59, 59, tzinfo=EST)
+    prev_first = datetime(2026, 2, 1, 0, 0, 0, tzinfo=EST)
+    prev_last = datetime(2026, 2, 28, 23, 59, 59, tzinfo=EST)
+    curr_first = datetime(2026, 3, 1, 0, 0, 0, tzinfo=EST)
+    curr_last = datetime(2026, 3, 31, 23, 59, 59, tzinfo=EST)
+    qtd_first_dt = datetime(2026, 1, 1, 0, 0, 0, tzinfo=EST)
+    qtd_end_dt = datetime(2026, 3, 31, 23, 59, 59, tzinfo=EST)
+    prev_start_ts = int(prev_first.timestamp())
+    prev_end_ts = int(prev_last.timestamp())
+    prev2_start_ts = int(prev2_first.timestamp())
+    prev2_end_ts = int(prev2_last.timestamp())
+    curr_start_ts = int(curr_first.timestamp())
+    curr_end_ts = int(curr_last.timestamp())
+    qtd_start_ts = int(qtd_first_dt.timestamp())
+    qtd_end_ts_int = int(qtd_end_dt.timestamp())
+
+    from connectors.chargebee import ChargebeeConnector
+    connector = ChargebeeConnector()
+    chargebee_message: Optional[str] = None
+    prev_billings_act: Optional[float] = None
+    prev_coll_act: Optional[float] = None
+    prev2_billings_act: Optional[float] = None
+    prev2_coll_act: Optional[float] = None
+    mtd_billings_act: Optional[float] = None
+    mtd_coll_act: Optional[float] = None
+    qtd_billings_act: Optional[float] = None
+    qtd_coll_act: Optional[float] = None
+    if connector.is_configured():
+        def _in_range(ts: Optional[int], start: int, end: int) -> bool:
+            if ts is None:
+                return False
+            return start <= ts <= end
+
+        invoices: list[Any] = []
+        payments: list[Any] = []
+        fetch_end = qtd_end_ts_int + 86400
+
+        # Do not use cash_invoices/cash_payments snapshots: sync uses _chargebee_cash_fetch_bounds
+        # (two months ago → now), so e.g. in April the cache starts in February and has no January
+        # rows. This view always needs full Jan–Mar; fetch that window from Chargebee directly.
+        try:
+            invoices = await asyncio.to_thread(
+                connector.fetch_invoices_in_date_range,
+                prev2_start_ts,
+                fetch_end,
+            )
+        except Exception as e:
+            chargebee_message = f"Chargebee: {str(e)[:80]}"
+        try:
+            payments = await asyncio.to_thread(
+                connector.fetch_payments_in_date_range,
+                prev2_start_ts,
+                fetch_end,
+            )
+        except Exception as e:
+            if not chargebee_message:
+                chargebee_message = f"Chargebee payments: {str(e)[:80]}"
+
+        for inv in invoices:
+            inv_date = inv.get("date")
+            try:
+                inv_ts = int(inv_date) if inv_date is not None else None
+            except (TypeError, ValueError):
+                inv_ts = None
+            total = inv.get("total")
+            try:
+                total_f = float(total) if total is not None else 0.0
+            except (TypeError, ValueError):
+                total_f = 0.0
+            total_f = total_f / 100.0
+            if inv_ts is not None:
+                if _in_range(inv_ts, prev2_start_ts, prev2_end_ts):
+                    prev2_billings_act = (prev2_billings_act or 0) + total_f
+                if _in_range(inv_ts, prev_start_ts, prev_end_ts):
+                    prev_billings_act = (prev_billings_act or 0) + total_f
+                if _in_range(inv_ts, curr_start_ts, curr_end_ts):
+                    mtd_billings_act = (mtd_billings_act or 0) + total_f
+                if inv_ts >= qtd_start_ts and inv_ts <= qtd_end_ts_int:
+                    qtd_billings_act = (qtd_billings_act or 0) + total_f
+
+        for txn in payments:
+            txn_date = txn.get("date")
+            try:
+                txn_ts = int(txn_date) if txn_date is not None else None
+            except (TypeError, ValueError):
+                txn_ts = None
+            amount = txn.get("amount")
+            try:
+                amount_f = float(amount) if amount is not None else 0.0
+            except (TypeError, ValueError):
+                amount_f = 0.0
+            amount_f = amount_f / 100.0
+            if txn_ts is not None and amount_f:
+                if _in_range(txn_ts, prev2_start_ts, prev2_end_ts):
+                    prev2_coll_act = (prev2_coll_act or 0) + amount_f
+                if _in_range(txn_ts, prev_start_ts, prev_end_ts):
+                    prev_coll_act = (prev_coll_act or 0) + amount_f
+                if _in_range(txn_ts, curr_start_ts, curr_end_ts):
+                    mtd_coll_act = (mtd_coll_act or 0) + amount_f
+                if txn_ts >= qtd_start_ts and txn_ts <= qtd_end_ts_int:
+                    qtd_coll_act = (qtd_coll_act or 0) + amount_f
+
+        if not chargebee_message and not invoices and not payments:
+            chargebee_message = "Chargebee: no invoices or payments in date range (check site/timezone)."
+    else:
+        chargebee_message = "Chargebee not configured (set CHARGEBEE_SITE and CHARGEBEE_API_KEY)."
+
+    def _cash_period(
+        label: str,
+        plan_b: Optional[float],
+        plan_c: Optional[float],
+        act_b: Optional[float],
+        act_c: Optional[float],
+    ) -> CashPeriod:
+        ach_b = (act_b / plan_b * 100) if plan_b and plan_b != 0 and act_b is not None else None
+        d_b = (act_b - plan_b) / 1000.0 if plan_b is not None and act_b is not None else None
+        ach_c = (act_c / plan_c * 100) if plan_c and plan_c != 0 and act_c is not None else None
+        d_c = (act_c - plan_c) / 1000.0 if plan_c is not None and act_c is not None else None
+        return CashPeriod(
+            period_label=label,
+            billings_plan=plan_b,
+            collections_plan=plan_c,
+            billings_actual=act_b,
+            collections_actual=act_c,
+            billings_achievement_pct=ach_b,
+            billings_delta_k=d_b,
+            collections_achievement_pct=ach_c,
+            collections_delta_k=d_c,
+        )
+
+    return CashMTDResponse(
+        two_months_ago=_cash_period(prev2_label, prev2_b, prev2_c, prev2_billings_act, prev2_coll_act),
+        previous_month=_cash_period(prev_label, prev_b, prev_c, prev_billings_act, prev_coll_act),
+        current_mtd=_cash_period(current_label, curr_b, curr_c, mtd_billings_act, mtd_coll_act),
+        qtd=_cash_period(qtd_label, q_b if q_b else None, q_c if q_c else None, qtd_billings_act, qtd_coll_act),
+        plan_source=plan_source,
+        plan_message=plan_message,
+        chargebee_message=chargebee_message,
+    )
+
+
+async def _cash_mtd_q2_2026(db: AsyncSession) -> CashMTDResponse:
+    """Fixed columns: Apr 26, May 26, Jun 26, Q2 26 — full months; Chargebee QTD through Jun 30."""
+    prev2_label = "Apr 26"
+    prev_label = "May 26"
+    current_label = "Jun 26"
+    qtd_label = "Q2 26"
+
+    sheet_range = "BS_2026P!A1:ZZ1000"
+    plan_source: Optional[str] = None
+    plan_message: Optional[str] = None
+    billings_by_month: list[Optional[float]] = [None] * 12
+    collections_by_month: list[Optional[float]] = [None] * 12
+
+    r_snap = await db.execute(
+        select(SheetSnapshot).where(SheetSnapshot.range_name == sheet_range).order_by(SheetSnapshot.as_of.desc()).limit(1)
+    )
+    snap = r_snap.scalar_one_or_none()
+    if snap and snap.data_json:
+        data = json.loads(snap.data_json)
+        try:
+            row_billings = data[BS_2026P_BILLINGS_ROW] if len(data) > BS_2026P_BILLINGS_ROW else []
+            for m in range(12):
+                col_idx = _a1_col_to_index(ARR_2026P_MONTH_COLUMNS[m])
+                v = row_billings[col_idx] if col_idx < len(row_billings) else None
+                billings_by_month[m] = _to_float_sheet(v)
+            for m in range(12):
+                col_idx = _a1_col_to_index(ARR_2026P_MONTH_COLUMNS[m])
+                coll = 0.0
+                for ri in BS_2026P_COLLECTIONS_ROWS:
+                    if len(data) > ri:
+                        row = data[ri]
+                        if col_idx < len(row):
+                            v = _to_float_sheet(row[col_idx])
+                            if v is not None:
+                                coll += v
+                collections_by_month[m] = coll if coll else None
+            plan_source = "BS_2026P"
+        except (TypeError, ValueError, IndexError):
+            plan_message = "Could not read Cash plan from sheet."
+    else:
+        plan_message = "No sheet snapshot. Sync BS_2026P first."
+
+    prev2_m = 3
+    prev_m = 4
+    c_m = 5
+    prev_b = billings_by_month[prev_m]
+    prev_c = collections_by_month[prev_m]
+    prev2_b = billings_by_month[prev2_m]
+    prev2_c = collections_by_month[prev2_m]
+    curr_b = billings_by_month[c_m]
+    curr_c = collections_by_month[c_m]
+    q_b = sum(billings_by_month[i] or 0 for i in range(3, 6))
+    q_c = sum(collections_by_month[i] or 0 for i in range(3, 6))
+
+    prev2_first = datetime(2026, 4, 1, 0, 0, 0, tzinfo=EST)
+    prev2_last = datetime(2026, 4, 30, 23, 59, 59, tzinfo=EST)
+    prev_first = datetime(2026, 5, 1, 0, 0, 0, tzinfo=EST)
+    prev_last = datetime(2026, 5, 31, 23, 59, 59, tzinfo=EST)
+    curr_first = datetime(2026, 6, 1, 0, 0, 0, tzinfo=EST)
+    curr_last = datetime(2026, 6, 30, 23, 59, 59, tzinfo=EST)
+    qtd_first_dt = datetime(2026, 4, 1, 0, 0, 0, tzinfo=EST)
+    qtd_end_dt = datetime(2026, 6, 30, 23, 59, 59, tzinfo=EST)
+    prev_start_ts = int(prev_first.timestamp())
+    prev_end_ts = int(prev_last.timestamp())
+    prev2_start_ts = int(prev2_first.timestamp())
+    prev2_end_ts = int(prev2_last.timestamp())
+    curr_start_ts = int(curr_first.timestamp())
+    curr_end_ts = int(curr_last.timestamp())
+    qtd_start_ts = int(qtd_first_dt.timestamp())
+    qtd_end_ts_int = int(qtd_end_dt.timestamp())
+
+    from connectors.chargebee import ChargebeeConnector
+    connector = ChargebeeConnector()
+    chargebee_message: Optional[str] = None
+    prev_billings_act: Optional[float] = None
+    prev_coll_act: Optional[float] = None
+    prev2_billings_act: Optional[float] = None
+    prev2_coll_act: Optional[float] = None
+    mtd_billings_act: Optional[float] = None
+    mtd_coll_act: Optional[float] = None
+    qtd_billings_act: Optional[float] = None
+    qtd_coll_act: Optional[float] = None
+    if connector.is_configured():
+        def _in_range(ts: Optional[int], start: int, end: int) -> bool:
+            if ts is None:
+                return False
+            return start <= ts <= end
+
+        invoices: list[Any] = []
+        payments: list[Any] = []
+        fetch_end = qtd_end_ts_int + 86400
+
+        try:
+            invoices = await asyncio.to_thread(
+                connector.fetch_invoices_in_date_range,
+                prev2_start_ts,
+                fetch_end,
+            )
+        except Exception as e:
+            chargebee_message = f"Chargebee: {str(e)[:80]}"
+        try:
+            payments = await asyncio.to_thread(
+                connector.fetch_payments_in_date_range,
+                prev2_start_ts,
+                fetch_end,
+            )
+        except Exception as e:
+            if not chargebee_message:
+                chargebee_message = f"Chargebee payments: {str(e)[:80]}"
+
+        for inv in invoices:
+            inv_date = inv.get("date")
+            try:
+                inv_ts = int(inv_date) if inv_date is not None else None
+            except (TypeError, ValueError):
+                inv_ts = None
+            total = inv.get("total")
+            try:
+                total_f = float(total) if total is not None else 0.0
+            except (TypeError, ValueError):
+                total_f = 0.0
+            total_f = total_f / 100.0
+            if inv_ts is not None:
+                if _in_range(inv_ts, prev2_start_ts, prev2_end_ts):
+                    prev2_billings_act = (prev2_billings_act or 0) + total_f
+                if _in_range(inv_ts, prev_start_ts, prev_end_ts):
+                    prev_billings_act = (prev_billings_act or 0) + total_f
+                if _in_range(inv_ts, curr_start_ts, curr_end_ts):
+                    mtd_billings_act = (mtd_billings_act or 0) + total_f
+                if inv_ts >= qtd_start_ts and inv_ts <= qtd_end_ts_int:
+                    qtd_billings_act = (qtd_billings_act or 0) + total_f
+
+        for txn in payments:
+            txn_date = txn.get("date")
+            try:
+                txn_ts = int(txn_date) if txn_date is not None else None
+            except (TypeError, ValueError):
+                txn_ts = None
+            amount = txn.get("amount")
+            try:
+                amount_f = float(amount) if amount is not None else 0.0
+            except (TypeError, ValueError):
+                amount_f = 0.0
+            amount_f = amount_f / 100.0
+            if txn_ts is not None and amount_f:
+                if _in_range(txn_ts, prev2_start_ts, prev2_end_ts):
+                    prev2_coll_act = (prev2_coll_act or 0) + amount_f
+                if _in_range(txn_ts, prev_start_ts, prev_end_ts):
+                    prev_coll_act = (prev_coll_act or 0) + amount_f
+                if _in_range(txn_ts, curr_start_ts, curr_end_ts):
+                    mtd_coll_act = (mtd_coll_act or 0) + amount_f
+                if txn_ts >= qtd_start_ts and txn_ts <= qtd_end_ts_int:
+                    qtd_coll_act = (qtd_coll_act or 0) + amount_f
+
+        if not chargebee_message and not invoices and not payments:
+            chargebee_message = "Chargebee: no invoices or payments in date range (check site/timezone)."
+    else:
+        chargebee_message = "Chargebee not configured (set CHARGEBEE_SITE and CHARGEBEE_API_KEY)."
+
+    def _cash_period(
+        label: str,
+        plan_b: Optional[float],
+        plan_c: Optional[float],
+        act_b: Optional[float],
+        act_c: Optional[float],
+    ) -> CashPeriod:
+        ach_b = (act_b / plan_b * 100) if plan_b and plan_b != 0 and act_b is not None else None
+        d_b = (act_b - plan_b) / 1000.0 if plan_b is not None and act_b is not None else None
+        ach_c = (act_c / plan_c * 100) if plan_c and plan_c != 0 and act_c is not None else None
+        d_c = (act_c - plan_c) / 1000.0 if plan_c is not None and act_c is not None else None
+        return CashPeriod(
+            period_label=label,
+            billings_plan=plan_b,
+            collections_plan=plan_c,
+            billings_actual=act_b,
+            collections_actual=act_c,
+            billings_achievement_pct=ach_b,
+            billings_delta_k=d_b,
+            collections_achievement_pct=ach_c,
+            collections_delta_k=d_c,
+        )
+
+    return CashMTDResponse(
+        two_months_ago=_cash_period(prev2_label, prev2_b, prev2_c, prev2_billings_act, prev2_coll_act),
+        previous_month=_cash_period(prev_label, prev_b, prev_c, prev_billings_act, prev_coll_act),
+        current_mtd=_cash_period(current_label, curr_b, curr_c, mtd_billings_act, mtd_coll_act),
+        qtd=_cash_period(qtd_label, q_b if q_b else None, q_c if q_c else None, qtd_billings_act, qtd_coll_act),
+        plan_source=plan_source,
+        plan_message=plan_message,
+        chargebee_message=chargebee_message,
+    )
+
+
+async def _get_dashboard_cash_mtd_impl(db: AsyncSession, *, fixed_periods: Optional[str] = None) -> CashMTDResponse:
+    if fixed_periods == "q1_2026":
+        return await _cash_mtd_q1_2026(db)
+    if fixed_periods == "q2_2026":
+        return await _cash_mtd_q2_2026(db)
     now_est = datetime.now(EST)
     year, month = now_est.year, now_est.month
     if month == 1:
@@ -4087,15 +6115,34 @@ async def _get_dashboard_cash_mtd_impl(db: AsyncSession) -> CashMTDResponse:
         invoices: list[Any] = []
         payments: list[Any] = []
 
-        # Billings: from invoices by invoice date (unchanged)
-        try:
-            invoices = await asyncio.to_thread(
-                connector.fetch_invoices_in_date_range,
-                prev2_start_ts,
-                curr_end_ts + 86400,
-            )
-        except Exception as e:
-            chargebee_message = f"Chargebee: {str(e)[:80]}"
+        cached = await _load_latest_chargebee_cash_from_cache(db)
+        if cached is not None:
+            invoices, payments, _cash_as_of = cached
+        else:
+            # Billings: from invoices by invoice date
+            try:
+                invoices = await asyncio.to_thread(
+                    connector.fetch_invoices_in_date_range,
+                    prev2_start_ts,
+                    curr_end_ts + 86400,
+                )
+            except Exception as e:
+                chargebee_message = f"Chargebee: {str(e)[:80]}"
+
+            # Collections: payment transactions by transaction date
+            try:
+                payments = await asyncio.to_thread(
+                    connector.fetch_payments_in_date_range,
+                    prev2_start_ts,
+                    curr_end_ts + 86400,
+                )
+            except Exception as e:
+                if not chargebee_message:
+                    chargebee_message = f"Chargebee payments: {str(e)[:80]}"
+            if not chargebee_message:
+                chargebee_message = (
+                    "Live Chargebee API (no cash cache). Run Dashboard → Refresh app data to cache billings/collections."
+                )
 
         for inv in invoices:
             inv_date = inv.get("date")
@@ -4120,16 +6167,6 @@ async def _get_dashboard_cash_mtd_impl(db: AsyncSession) -> CashMTDResponse:
                     qtd_billings_act = (qtd_billings_act or 0) + total_f
 
         # Collections: from payment transactions by transaction date (matches Chargebee Total Payments export)
-        try:
-            payments = await asyncio.to_thread(
-                connector.fetch_payments_in_date_range,
-                prev2_start_ts,
-                curr_end_ts + 86400,
-            )
-        except Exception as e:
-            if not chargebee_message:
-                chargebee_message = f"Chargebee payments: {str(e)[:80]}"
-
         for txn in payments:
             txn_date = txn.get("date")
             try:
@@ -4853,6 +6890,133 @@ async def export_copilot_arr_schedule_to_google_sheet(db: AsyncSession = Depends
     }
 
 
+NEW_SCHEDULE_EXPORT_SHEET = "ARR_Cockpit export"
+NEW_SCHEDULE_EXPORT_RANGE_ENV = "GOOGLE_SHEET_NEW_SCHEDULE_EXPORT_RANGE"
+
+
+@app.post("/api/export/new-schedule-to-google-sheet")
+async def export_new_schedule_to_google_sheet(db: AsyncSession = Depends(get_db)):
+    """
+    Export the NEW SCHEDULE table to the "ARR_Cockpit export" tab in the financial model
+    (GOOGLE_SHEET_ID). Columns: Account, 18 Digit SFDC Acct ID, Status, Type,
+    Subscription start, Subscription end, Live ARR, Contracted ARR, then one column per
+    month (Dec '25 … Dec '26). Header row, then Total row, then one row per account.
+    """
+    from connectors.google_sheets import GoogleSheetsConnector
+
+    # ---- data ----
+    result = await get_new_schedule_accounts(db)
+    out_rows = result.get("rows", []) if isinstance(result, dict) else []
+    month_keys = _new_schedule_month_keys()
+
+    static_headers = [
+        "Account",
+        "18 Digit SFDC Acct ID",
+        "Status",
+        "Type",
+        "Subscription start",
+        "Subscription end",
+        "Live ARR",
+        "Contracted ARR",
+    ]
+    header = static_headers + [_short_month_label(m) for m in month_keys]
+
+    grand_live_arr = sum(float(r.get("live_arr") or 0) for r in out_rows)
+    grand_contracted_arr = sum(float(r.get("contracted_arr") or 0) for r in out_rows)
+    totals_by_month: dict[str, float] = {m: 0.0 for m in month_keys}
+    for r in out_rows:
+        bm = r.get("arr_by_month") or {}
+        for m in month_keys:
+            totals_by_month[m] += float(bm.get(m) or 0)
+
+    total_row = (
+        ["Total", "", "", "", "", "",
+         _fmt_money_export(grand_live_arr),
+         _fmt_money_export(grand_contracted_arr)]
+        + [_fmt_money_export(totals_by_month.get(m, 0)) for m in month_keys]
+    )
+
+    values = [header, total_row]
+    for r in out_rows:
+        bm = r.get("arr_by_month") or {}
+        values.append(
+            [
+                r.get("account_name") or "",
+                r.get("account_id") or "",
+                (r.get("status") or "").strip(),
+                (r.get("type") or "").strip(),
+                r.get("subscription_start_date") or "",
+                r.get("subscription_end_date") or "",
+                _fmt_money_export(float(r.get("live_arr") or 0)),
+                _fmt_money_export(float(r.get("contracted_arr") or 0)),
+            ]
+            + [_fmt_money_export(float(bm.get(m) or 0)) for m in month_keys]
+        )
+
+    # ---- sheet write ----
+    sheet_id = os.getenv("GOOGLE_SHEET_ID")
+    if not sheet_id:
+        return {
+            "ok": False,
+            "error": "GOOGLE_SHEET_ID is not set. Set it in backend/.env to the financial model spreadsheet ID.",
+        }
+    backend_dir = Path(__file__).resolve().parent
+    cred_env = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+    cred_path = cred_env
+    if cred_path and not os.path.isabs(cred_path):
+        cred_path = str(backend_dir / cred_path)
+    connector = GoogleSheetsConnector(credentials_path=cred_path or cred_env)
+    connector.set_base_path(backend_dir)
+    if not connector.is_configured():
+        return {
+            "ok": False,
+            "error": "Google Sheets not configured. Set GOOGLE_APPLICATION_CREDENTIALS (or GOOGLE_SHEETS_CREDENTIALS_JSON) in .env.",
+        }
+    try:
+        await asyncio.to_thread(connector.ensure_sheet_exists, NEW_SCHEDULE_EXPORT_SHEET, spreadsheet_id=sheet_id)
+        exact_title = await asyncio.to_thread(connector.get_sheet_exact_title, NEW_SCHEDULE_EXPORT_SHEET, sheet_id)
+        if not exact_title:
+            return {"ok": False, "error": f'Tab "{NEW_SCHEDULE_EXPORT_SHEET}" not found after ensure. Check the spreadsheet.'}
+        sheet_ref = "'" + exact_title.replace("'", "''") + "'"
+        num_cols = len(header)
+        num_rows = len(values)
+        end_col = _index_to_a1_col(num_cols - 1)
+        range_a1 = os.getenv(NEW_SCHEDULE_EXPORT_RANGE_ENV) or f"{sheet_ref}!A1:{end_col}{num_rows}"
+        await asyncio.to_thread(connector.update_range, range_a1, values, spreadsheet_id=sheet_id)
+    except Exception as e:
+        err_msg = str(e)
+        if "403" in err_msg or "does not have permission" in err_msg.lower():
+            sa_email = connector.get_service_account_email()
+            err_msg = (
+                f"Permission denied. Share the Google Sheet with the service account as Editor: "
+                + (sa_email or "see client_email in your JSON key")
+                + ". "
+                + err_msg[:200]
+            )
+        elif "404" in err_msg or "Unable to parse range" in err_msg or "not found" in err_msg.lower():
+            err_msg = f'Sheet tab not found. Create a tab named "{NEW_SCHEDULE_EXPORT_SHEET}" in your financial model. ' + err_msg[:200]
+        return {"ok": False, "error": err_msg}
+
+    url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/edit"
+    sheet_gid = await asyncio.to_thread(connector.get_sheet_gid_by_title, NEW_SCHEDULE_EXPORT_SHEET, sheet_id)
+    if sheet_gid is not None:
+        url = f"{url}#gid={sheet_gid}"
+    account_count = len(out_rows)
+    return {
+        "ok": True,
+        "spreadsheet_url": url,
+        "spreadsheet_id": sheet_id,
+        "sheet_gid": sheet_gid,
+        "rows_written": len(values),
+        "account_count": account_count,
+        "range_used": range_a1,
+        "message": (
+            f'Exported {len(values)} rows (header, Total, {account_count} accounts) to "{NEW_SCHEDULE_EXPORT_SHEET}" tab.'
+            + (" No account data yet — sync from Salesforce first." if account_count == 0 else "")
+        ),
+    }
+
+
 @app.post("/api/export/test-write-to-sheet")
 async def test_write_to_sheet():
     """
@@ -4865,7 +7029,7 @@ async def test_write_to_sheet():
     if not sheet_id:
         return {"ok": False, "error": "GOOGLE_SHEET_ID is not set in backend/.env"}
     now_est = datetime.now(EST).strftime("%Y-%m-%d %H:%M:%S EST")
-    values = [["Test write from Dazos CFO Copilot", now_est]]
+    values = [["Test write from Dazos CFO Cockpit", now_est]]
     backend_dir = Path(__file__).resolve().parent
     cred_env = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
     cred_path = cred_env
@@ -5005,6 +7169,11 @@ ARR_2026P_MONTH_COLUMNS = [
     "BU", "BV", "BW", "BX", "BY", "BZ", "CA", "CB", "CC", "CD", "CE", "CF",
 ]  # Jan..Dec
 
+# Renewals plan: ARR_Calculations_2026P month columns BU..CF (Jan..Dec).
+# UFR plan: fixed row below; renewal rate / contraction use BU52/BU54; **cancelled plan $** = **−**row 35 (Jan = **−BU35**).
+ARR_2026P_RENEWALS_UFR_ROW = 32  # Excel row 33 — adjust if sheet layout differs
+RENEWALS_CANCELLED_PLAN_ROW = 35
+
 
 def _pipeline_from_snapshot_payload(
     payload: dict,
@@ -5102,8 +7271,9 @@ async def get_pipeline_overview(
     """
     Open opportunities (pipeline): not Closed Won / Closed Lost; record type = New Business or Expansion only.
     ARR = Opportunity.MRR (Finance Details) × 12 per opportunity.
-    Same data source as ARR: hourly Salesforce sync at :59 EST, daily EOD snapshot at 23:59 EST (use as_of for historical pipeline).
-    Optional filters: segment, stage, record_type. Optional as_of for pipeline from EOD snapshot.
+    Live data comes from SQLite after Dashboard → Refresh app data (or optional hourly background sync).
+    Optional as_of uses a stored EOD snapshot if one exists for that date (daily EOD at 23:59 EST snapshots DB state).
+    Optional filters: segment, stage, record_type.
     """
     if as_of is not None:
         r_snap = await db.execute(
@@ -5128,7 +7298,7 @@ async def get_pipeline_overview(
             "stages": [],
             "record_types": [],
             "snapshot_date": None,
-            "message": "No EOD snapshot for that date. Pipeline and ARR are snapshotted daily at 23:59 EST.",
+            "message": "No EOD snapshot for that date. Use live data without as_of, or ensure daily EOD has run after data was refreshed.",
         }
         base = os.getenv("SALESFORCE_BASE_URL", "").strip().rstrip("/")
         if base and ("salesforce.com" in base or "lightning.force.com" in base):
@@ -5237,8 +7407,8 @@ async def get_closed_overview(
 ):
     """
     Closed opportunities (Closed Won + Closed Lost). List includes New Business, Expansion, Renewal, and Amendment (for display).
-    Dashboard and bookings metrics still use New Business + Expansion only. Optional filters: segment, stage, record_type, months.
-    ARR = sum of product line item ARR per opportunity (excl. iVerify/Kipu), consistent with ARR overview.
+    Optional filters: segment, stage, record_type, months.
+    ARR = ``ARR__c`` (New Business) or ``Expansion_ARR__c`` (Expansion / Renewal / Amendment) on the Opportunity — no line-item rollup.
     """
     overrides = await _get_record_type_overrides(db)
 
@@ -5256,7 +7426,11 @@ async def get_closed_overview(
         Opportunity.close_date.isnot(None),
     ).order_by(Opportunity.close_date.desc())
     r = await db.execute(q_closed)
-    closed_opps_all = [o for o in r.scalars().all() if _in_bookings_list(o) and not _is_excluded_from_bookings(o)]
+    closed_opps_all = [
+        o
+        for o in r.scalars().all()
+        if _in_bookings_list(o) and not _is_excluded_from_bookings_nb_only(o, _effective_record_type(o))
+    ]
     account_ids_all = {o.account_id for o in closed_opps_all if o.account_id}
     account_segment: dict[str, str] = {}
     if account_ids_all:
@@ -5320,46 +7494,10 @@ async def get_closed_overview(
             closed_opps = [o for o in closed_opps_all if _keep(o)]
     else:
         closed_opps = [o for o in closed_opps_all if _keep(o)]
-    closed_sf_ids = {o.sf_id for o in closed_opps}
-    # ARR from product line items only (excl iVerify/Kipu), consistent with ARR overview
-    opp_to_arr_from_lines: dict[str, float] = {}
-    if closed_sf_ids:
-        q_lines = select(OpportunityLineItem).where(
-            OpportunityLineItem.opportunity_sf_id.in_(closed_sf_ids)
-        )
-        r_lines = await db.execute(q_lines)
-        for li in r_lines.scalars().all():
-            raw = _normalized_product_name(li.product_name)
-            if not _include_line_item_in_arr(raw, li.product_name):
-                continue
-            opp_sf_id = li.opportunity_sf_id
-            mrr = _line_item_effective_total(li)
-            opp_to_arr_from_lines[opp_sf_id] = opp_to_arr_from_lines.get(opp_sf_id, 0) + mrr * PIPELINE_ARR_MULTIPLIER
-        opp_to_arr_from_lines = {k: round(v, 2) for k, v in opp_to_arr_from_lines.items()}
     rows = []
     grand_total = 0.0
     for o in closed_opps:
-        arr_from_lines = opp_to_arr_from_lines.get(o.sf_id, 0)
-        # For renewals and amendments, booking ARR = delta (renewal change) as in renewals overview
-        if _is_renewal_record_type(_effective_record_type(o)) or _is_amendment_record_type(_effective_record_type(o)):
-            stage = (o.stage_name or "").strip()
-            if stage == "Closed Won":
-                # Simplified logic: use Opportunity.Expansion_ARR__c directly.
-                # Field is defined as MAX(ARR__c - Original_ARR__c, 0) in Salesforce.
-                exp_val = float(o.expansion_arr) if getattr(o, "expansion_arr", None) is not None else 0.0
-                arr = max(0.0, exp_val)
-            elif stage == "Closed Lost":
-                # Closed Lost bookings should never be counted as positive booking ARR.
-                arr = 0.0
-            else:
-                arr = arr_from_lines
-        else:
-            arr = arr_from_lines
-        # Closed Lost New Business: booking ARR = 0
-        if (o.stage_name or "").strip() == "Closed Lost" and (_effective_record_type(o) or "").strip().lower() == "new business":
-            arr = 0.0
-        # Booking ARR is only positive; set to 0 if not positive
-        arr = max(0.0, arr)
+        arr = _closed_overview_arr_from_opportunity(o, _effective_record_type(o))
         grand_total += arr
         seg = account_segment.get(o.account_id) if o.account_id else DEFAULT_SEGMENT
         rows.append({
@@ -5386,6 +7524,314 @@ async def get_closed_overview(
     if base and ("salesforce.com" in base or "lightning.force.com" in base):
         out["salesforce_base_url"] = base
     return out
+
+
+def _renewal_chart_month_keys() -> list[str]:
+    """Six renewal months (YYYY-MM), oldest first: 3 before current, current, 2 after (server local date)."""
+    today = date.today()
+    anchor = date(today.year, today.month, 1)
+    out: list[str] = []
+    for off in range(-3, 3):
+        d = _add_calendar_months(anchor, off)
+        out.append(f"{d.year}-{d.month:02d}")
+    return out
+
+
+def _build_renewals_chart_series(renewal_opps: list) -> list[RenewalsChartMonth]:
+    """
+    Stacked ARR chart (per month): excludes mid-term cancellation = Yes.
+    Months shown: three before the current calendar month, the current month, then two ahead (six bars, ``date.today()``).
+
+    - **Churned/contracted** = sum of ``delta`` over opps where ``delta < 0``; API exposes the
+      **positive** magnitude (``-`` that sum) for stacking and for Renewed math.
+    - **Open** = sum of up-for-renewal ARR (``original_acv``) for open (non-closed) opps.
+    - **Renewed** = total up-for-renewal ARR for the month minus churned/contracted minus open
+      (residual; floored at 0).
+    - **ARR renewal rate** = (UFR on **closed** opps + sum of ``delta`` where ``delta < 0``) / UFR on **closed**
+      opps — open pipeline UFR is excluded.
+    - **Mid-term cancellation** row (separate): sum of UFR and opp count for ``midterm_cancellation`` = Yes (excluded from the stack).
+    """
+    agg: dict[str, dict[str, float | int]] = {}
+    agg_mid: dict[str, dict[str, float | int]] = {}
+
+    def _month_key(o: Opportunity) -> Optional[str]:
+        rd = o.renewal_date if o.renewal_date is not None else o.close_date
+        if not rd:
+            return None
+        return f"{rd.year}-{rd.month:02d}"
+
+    for o in renewal_opps:
+        if getattr(o, "midterm_cancellation", 0) == 1:
+            continue
+        mk = _month_key(o)
+        if not mk:
+            continue
+        if mk not in agg:
+            agg[mk] = {
+                "ufr_open": 0.0,
+                "neg_delta_sum": 0.0,
+                "ufr_total": 0.0,
+                "ufr_closed": 0.0,
+                "count_open": 0,
+                "count_won": 0,
+                "count_lost": 0,
+                "opp_total": 0,
+            }
+        a = agg[mk]
+        st = (o.stage_name or "").strip()
+        up = float(o.original_acv) if o.original_acv is not None else None
+
+        renewed: Optional[float] = None
+        delta: Optional[float] = None
+        if _is_closed_lost_stage(st):
+            renewed = 0.0
+            if up is not None:
+                delta = round(renewed - float(up), 2)
+        elif _is_closed_won_stage(st):
+            if o.opportunity_arr is not None:
+                renewed = round(float(o.opportunity_arr), 2)
+            if up is not None and renewed is not None:
+                delta = round(float(renewed) - float(up), 2)
+
+        if up is not None:
+            a["ufr_total"] = float(a["ufr_total"]) + float(up)
+
+        a["opp_total"] = int(a["opp_total"]) + 1
+
+        if _is_closed_lost_stage(st):
+            a["count_lost"] = int(a["count_lost"]) + 1
+            if up is not None:
+                a["ufr_closed"] = float(a["ufr_closed"]) + float(up)
+        elif _is_closed_won_stage(st):
+            a["count_won"] = int(a["count_won"]) + 1
+            if up is not None:
+                a["ufr_closed"] = float(a["ufr_closed"]) + float(up)
+        else:
+            a["count_open"] = int(a["count_open"]) + 1
+            if up is not None:
+                a["ufr_open"] = float(a["ufr_open"]) + float(up)
+
+        if delta is not None and delta < 0:
+            a["neg_delta_sum"] = float(a["neg_delta_sum"]) + float(delta)
+
+    for o in renewal_opps:
+        if getattr(o, "midterm_cancellation", 0) != 1:
+            continue
+        mk = _month_key(o)
+        if not mk:
+            continue
+        if mk not in agg_mid:
+            agg_mid[mk] = {"ufr_sum": 0.0, "count": 0}
+        am = agg_mid[mk]
+        upm = float(o.original_acv) if o.original_acv is not None else None
+        if upm is not None:
+            am["ufr_sum"] = float(am["ufr_sum"]) + float(upm)
+        am["count"] = int(am["count"]) + 1
+
+    def _empty_month_agg() -> dict[str, float | int]:
+        return {
+            "ufr_open": 0.0,
+            "neg_delta_sum": 0.0,
+            "ufr_total": 0.0,
+            "ufr_closed": 0.0,
+            "count_open": 0,
+            "count_won": 0,
+            "count_lost": 0,
+            "opp_total": 0,
+        }
+
+    month_keys = _renewal_chart_month_keys()
+    out: list[RenewalsChartMonth] = []
+    for mk in month_keys:
+        if mk not in agg and mk not in agg_mid:
+            continue
+        raw = agg[mk] if mk in agg else _empty_month_agg()
+        mid_raw = agg_mid.get(mk, {"ufr_sum": 0.0, "count": 0})
+        ufr = float(raw["ufr_total"])
+        ufr_closed = float(raw["ufr_closed"])
+        neg_sum = float(raw["neg_delta_sum"])  # sum of delta where delta < 0 (≤ 0)
+        arr_churned = round(-neg_sum if neg_sum < 0 else 0.0, 2)
+        arr_open_v = round(float(raw["ufr_open"]), 2)
+        arr_renewed_v = round(max(0.0, ufr - arr_churned - arr_open_v), 2)
+        arr_rate: Optional[float] = None
+        if ufr_closed > 0:
+            arr_rate = round((ufr_closed + neg_sum) / ufr_closed, 4)
+        cw = int(raw["count_won"])
+        cl = int(raw["count_lost"])
+        opp_rate: Optional[float] = None
+        closed_denom = cw + cl
+        if closed_denom > 0:
+            opp_rate = round(cw / closed_denom, 4)
+        arr_midterm_v = round(float(mid_raw["ufr_sum"]), 2)
+        count_midterm = int(mid_raw["count"])
+        out.append(
+            RenewalsChartMonth(
+                month=mk,
+                arr_open=arr_open_v,
+                arr_renewed=arr_renewed_v,
+                arr_churned=arr_churned,
+                count_open=int(raw["count_open"]),
+                count_renewed=int(raw["count_won"]),
+                count_lost=cl,
+                arr_renewal_rate=arr_rate,
+                opp_renewal_rate=opp_rate,
+                arr_midterm_cancellation=arr_midterm_v,
+                count_midterm_cancellation=count_midterm,
+            )
+        )
+    return out
+
+
+@app.get("/api/renewals-overview", response_model=RenewalsOverviewResponse)
+async def get_renewals_overview(
+    db: AsyncSession = Depends(get_db),
+    stage: Optional[List[str]] = Query(None, description="Filter by stage"),
+    months: Optional[List[str]] = Query(None, description="Filter by renewal month (YYYY-MM); uses renewal date or close date"),
+    midterm: Optional[List[str]] = Query(
+        None,
+        description="Filter by mid-term cancellation: yes (Midterm_Cancellation__c true), no (false or unset)",
+    ),
+):
+    """
+    All **Renewal** opportunities from local DB (fast). Uses record-type overrides like closed-overview.
+
+    **Up for renewal ARR** = ``Original_ARR__c`` (``original_acv``). **Renewed ARR** = ``ARR__c`` (``opportunity_arr``)
+    when **Closed Won**, **0** when **Closed Lost**; open pipeline = null.
+
+    **Renewal date** column = dedicated ``renewal_date`` when set, else ``close_date``.
+    **Mid-term cancellation** = ``"Yes"`` when ``Midterm_Cancellation__c`` is true (synced as ``midterm_cancellation``); otherwise null.
+    Optional query ``midterm=yes`` / ``midterm=no`` filters rows (both = no filter).
+
+    **renewals_chart** (3 months before through 2 months after current month, excluding mid-term cancellation) powers the stacked charts: ARR stacks
+    (churn = positive magnitude of sum of negative deltas; Renewed = UFR total − churn − open; Open = UFR on open opps — open on top) and opportunity counts (Lost / Won / Open — open on top),     plus renewal rates
+    (ARR-style on closed UFR only; and won / (won + lost) among closed opps).
+    """
+    overrides = await _get_record_type_overrides(db)
+
+    def _effective_record_type(o: Opportunity) -> str:
+        key = (o.sf_id or "").strip()
+        override = overrides.get(key) or (overrides.get(key[:15]) if len(key) >= 15 else None)
+        return (override or o.record_type_name or "").strip() or "—"
+
+    def _renewal_month_key(o: Opportunity) -> Optional[str]:
+        rd = o.renewal_date if o.renewal_date is not None else o.close_date
+        if not rd:
+            return None
+        return f"{rd.year}-{rd.month:02d}"
+
+    q = select(Opportunity).where(Opportunity.stage_name.isnot(None))
+    r = await db.execute(q)
+    all_opps = [o for o in r.scalars().all() if not _is_excluded_from_bookings_nb_only(o, _effective_record_type(o))]
+    renewal_opps = [o for o in all_opps if _is_renewal_record_type(_effective_record_type(o))]
+
+    stages_set: set[str] = set()
+    available_months_set: set[str] = set()
+    for o in renewal_opps:
+        stages_set.add((o.stage_name or "—").strip() or "—")
+        mk = _renewal_month_key(o)
+        if mk:
+            available_months_set.add(mk)
+
+    filter_stages = {(s or "").strip().lower() for s in (stage or [])}
+    filter_months = set(months) if months else None
+    filter_midterm: Optional[set[str]] = None
+    if midterm:
+        fm = {(m or "").strip().lower() for m in midterm if (m or "").strip()}
+        if fm:
+            filter_midterm = fm
+
+    def _keep_stage(o: Opportunity) -> bool:
+        if not filter_stages:
+            return True
+        return ((o.stage_name or "").strip().lower() or "—") in filter_stages
+
+    def _keep_month(o: Opportunity) -> bool:
+        if not filter_months:
+            return True
+        mk = _renewal_month_key(o)
+        return mk is not None and mk in filter_months
+
+    def _keep_midterm(o: Opportunity) -> bool:
+        if not filter_midterm:
+            return True
+        if filter_midterm >= {"yes", "no"}:
+            return True
+        is_yes = getattr(o, "midterm_cancellation", 0) == 1
+        if "yes" in filter_midterm and is_yes:
+            return True
+        if "no" in filter_midterm and not is_yes:
+            return True
+        return False
+
+    rows_out: list[RenewalsOverviewRow] = []
+    for o in renewal_opps:
+        if not _keep_stage(o) or not _keep_month(o) or not _keep_midterm(o):
+            continue
+        st = (o.stage_name or "").strip()
+        renewal_dt = o.renewal_date if o.renewal_date is not None else o.close_date
+        renewal_iso = renewal_dt.isoformat() if renewal_dt else None
+
+        if o.original_acv is not None:
+            up = round(float(o.original_acv), 2)
+        else:
+            up = None
+
+        renewed: Optional[float] = None
+        delta: Optional[float] = None
+        if _is_closed_lost_stage(st):
+            renewed = 0.0
+            if up is not None:
+                delta = round(renewed - up, 2)
+        elif _is_closed_won_stage(st):
+            if o.opportunity_arr is not None:
+                renewed = round(float(o.opportunity_arr), 2)
+            if up is not None and renewed is not None:
+                delta = round(renewed - up, 2)
+
+        midterm_after = "Yes" if getattr(o, "midterm_cancellation", 0) == 1 else None
+
+        rows_out.append(
+            RenewalsOverviewRow(
+                account_id=o.account_id,
+                account_name=o.account_name or "—",
+                opportunity_sf_id=o.sf_id,
+                opportunity_name=o.name or "—",
+                stage_name=st or "—",
+                renewal_date=renewal_iso,
+                midterm_cancellation_after_stage=midterm_after,
+                up_for_renewal_arr=up,
+                renewed_arr=renewed,
+                delta=delta,
+            )
+        )
+
+    def _sort_key(rw: RenewalsOverviewRow):
+        d = date.fromisoformat(rw.renewal_date) if rw.renewal_date else date.min
+        return (-d.toordinal(), rw.account_name or "", rw.opportunity_name or "")
+
+    rows_out.sort(key=_sort_key)
+
+    grand_up = round(sum(float(r.up_for_renewal_arr) for r in rows_out if r.up_for_renewal_arr is not None), 2)
+    grand_renewed = round(sum(float(r.renewed_arr) for r in rows_out if r.renewed_arr is not None), 2)
+    grand_delta = round(sum(float(r.delta) for r in rows_out if r.delta is not None), 2)
+
+    base = os.getenv("SALESFORCE_BASE_URL", "").strip().rstrip("/")
+    sf_url: Optional[str] = None
+    if base and ("salesforce.com" in base or "lightning.force.com" in base):
+        sf_url = base
+
+    renewals_chart = _build_renewals_chart_series(renewal_opps)
+
+    return RenewalsOverviewResponse(
+        rows=rows_out,
+        grand_up_for_renewal_arr=grand_up,
+        grand_renewed_arr=grand_renewed,
+        grand_delta=grand_delta,
+        stages=sorted(stages_set),
+        available_months=sorted(available_months_set, reverse=True),
+        renewals_chart=renewals_chart,
+        salesforce_base_url=sf_url,
+    )
 
 
 @app.get("/api/manual-overwrites")
@@ -5537,12 +7983,25 @@ async def delete_active_arr_override(
     return {"ok": True, "account_name": account_name}
 
 
+def _collect_route_paths(routes) -> list[str]:
+    """Flatten Starlette/FastAPI route trees so nested routers (e.g. Mount) appear in debug output."""
+    out: list[str] = []
+    for r in routes:
+        p = getattr(r, "path", None)
+        if p:
+            out.append(p)
+        sub = getattr(r, "routes", None)
+        if sub:
+            out.extend(_collect_route_paths(sub))
+    return out
+
+
 @app.get("/api/debug/routes")
 async def debug_routes():
     """Return list of registered route paths (for debugging 404s) and whether app password is required."""
-    paths = [getattr(r, "path", None) for r in app.routes if hasattr(r, "path") and getattr(r, "path", None)]
+    paths = _collect_route_paths(app.routes)
     return {
-        "paths": sorted(p for p in paths if p),
+        "paths": sorted(set(p for p in paths if p)),
         "dashboard_routes": [p for p in paths if p and "dashboard" in p],
         "app_password_required": bool(APP_PASSWORD),
         "source": "backend/.env or APP_PASSWORD env var; if both unset, no password required",
@@ -6207,25 +8666,18 @@ async def get_quickbooks_report(
 
 # ----- Chargebee sync (billing reconciliation) -----
 
-CHARGEBEE_REPORT_TYPES = ["subscriptions", "invoices"]
+CHARGEBEE_REPORT_TYPES = ["subscriptions", "invoices", "cash_invoices", "cash_payments"]
 
 
-@app.post("/api/sync/chargebee")
-async def sync_chargebee(db: AsyncSession = Depends(get_db)):
-    """
-    Sync subscriptions and invoices from Chargebee into the app.
-    Requires CHARGEBEE_SITE and CHARGEBEE_API_KEY in .env.
-    """
+async def _sync_chargebee_snapshots(db: AsyncSession) -> dict:
+    """Store list API pages + full cash-window invoices/payments for dashboard (SQLite reads)."""
     from connectors.chargebee import ChargebeeConnector
 
     connector = ChargebeeConnector()
     if not connector.is_configured():
-        return {
-            "ok": False,
-            "error": "Chargebee not configured. Set CHARGEBEE_SITE and CHARGEBEE_API_KEY in backend/.env.",
-        }
-    synced = {}
-    for report_type in CHARGEBEE_REPORT_TYPES:
+        return {"ok": False, "error": "Chargebee not configured."}
+    synced: dict[str, Any] = {}
+    for report_type in ("subscriptions", "invoices"):
         try:
             if report_type == "subscriptions":
                 data = await asyncio.to_thread(connector.list_subscriptions, limit=100)
@@ -6235,13 +8687,73 @@ async def sync_chargebee(db: AsyncSession = Depends(get_db)):
             return {"ok": False, "error": f"Chargebee {report_type} failed: {e}"}
         snapshot = ChargebeeSnapshot(report_type=report_type, data_json=json.dumps(data))
         db.add(snapshot)
-        count = len(data.get("list") or [])
-        synced[report_type] = count
+        synced[report_type] = len(data.get("list") or [])
+
+    now_est = datetime.now(EST)
+    start_ts, end_ts = _chargebee_cash_fetch_bounds(now_est)
+    try:
+        cash_invoices = await asyncio.to_thread(
+            connector.fetch_invoices_in_date_range,
+            start_ts,
+            end_ts + 86400,
+        )
+    except Exception as e:
+        return {"ok": False, "error": f"Chargebee cash_invoices failed: {e}"}
+    db.add(
+        ChargebeeSnapshot(
+            report_type="cash_invoices",
+            data_json=json.dumps(
+                {
+                    "invoices": cash_invoices,
+                    "window_start_ts": start_ts,
+                    "window_end_ts": end_ts,
+                }
+            ),
+        )
+    )
+    synced["cash_invoices"] = len(cash_invoices)
+
+    try:
+        cash_payments = await asyncio.to_thread(
+            connector.fetch_payments_in_date_range,
+            start_ts,
+            end_ts + 86400,
+        )
+    except Exception as e:
+        return {"ok": False, "error": f"Chargebee cash_payments failed: {e}"}
+    db.add(
+        ChargebeeSnapshot(
+            report_type="cash_payments",
+            data_json=json.dumps(
+                {
+                    "payments": cash_payments,
+                    "window_start_ts": start_ts,
+                    "window_end_ts": end_ts,
+                }
+            ),
+        )
+    )
+    synced["cash_payments"] = len(cash_payments)
     await db.commit()
+    return {"ok": True, "synced": synced}
+
+
+@app.post("/api/sync/chargebee")
+async def sync_chargebee(db: AsyncSession = Depends(get_db)):
+    """
+    Sync subscriptions, invoices (first page each), and full cash-window billings/collections into SQLite.
+    Requires CHARGEBEE_SITE and CHARGEBEE_API_KEY in .env.
+    """
+    res = await _sync_chargebee_snapshots(db)
+    if not res.get("ok"):
+        return {
+            "ok": False,
+            "error": res.get("error", "Chargebee sync failed."),
+        }
     return {
         "ok": True,
-        "synced": synced,
-        "message": "Chargebee subscriptions and invoices synced (first page each).",
+        "synced": res.get("synced"),
+        "message": "Chargebee synced (list pages + cash billings/collections for dashboard cash KPIs).",
     }
 
 
@@ -6250,7 +8762,7 @@ async def get_chargebee_snapshot(
     report_type: str,
     db: AsyncSession = Depends(get_db),
 ):
-    """Return the latest Chargebee snapshot. report_type: subscriptions or invoices."""
+    """Return the latest Chargebee snapshot. report_type: subscriptions, invoices, cash_invoices, cash_payments."""
     if report_type not in CHARGEBEE_REPORT_TYPES:
         return {"error": f"report_type must be one of: {', '.join(CHARGEBEE_REPORT_TYPES)}"}
     r = await db.execute(
@@ -6269,3 +8781,224 @@ async def get_chargebee_snapshot(
         }
     data = json.loads(row.data_json) if row.data_json else None
     return {"report_type": report_type, "as_of": row.as_of.isoformat() if row.as_of else None, "data": data}
+
+
+# ----- Unified app dataset refresh (Option B: SQLite tables; single UI entry point on Dashboard) -----
+
+
+def _dataset_sheet_range_list() -> list[str]:
+    """Google Sheet A1 ranges pulled during POST /api/dataset/refresh. Override with env DATASET_SHEET_RANGES=comma-separated."""
+    raw = (os.getenv("DATASET_SHEET_RANGES") or "").strip()
+    if raw:
+        return [x.strip() for x in raw.split(",") if x.strip()]
+    return [
+        "ARR_Calculations_2026P!A1:ZZ1000",
+        "BS_2026P!A1:ZZ1000",
+    ]
+
+
+async def _sync_google_sheet_range_session(db: AsyncSession, range_name: str, connector) -> dict:
+    """Persist one sheet range; caller supplies a configured GoogleSheetsConnector."""
+    try:
+        data = await asyncio.to_thread(connector.read_range, range_name)
+        data = await asyncio.to_thread(_merge_arr_2026p_bu35_from_direct_cell, connector, range_name, data)
+    except Exception as e:
+        err_msg = str(e)
+        if "403" in err_msg or "does not have permission" in err_msg.lower():
+            sa_email = connector.get_service_account_email()
+            err_msg = (
+                "Google Sheets: permission denied. Share your financial model sheet with the service account as **Editor**: "
+                + (sa_email or "see client_email in your JSON key")
+                + "."
+            )
+        elif "404" in err_msg or "Unable to parse range" in err_msg or "not found" in err_msg.lower():
+            err_msg = (
+                "Google Sheets: could not read range "
+                f"\"{range_name}\". Check tab name and GOOGLE_SHEET_ID. Raw: " + err_msg[:200]
+            )
+        return {"ok": False, "error": err_msg}
+    snapshot = SheetSnapshot(source="google_sheets", range_name=range_name, data_json=json.dumps(data))
+    db.add(snapshot)
+    await db.commit()
+    return {"ok": True, "range_name": range_name, "rows": len(data)}
+
+
+async def _sync_chargebee_session(db: AsyncSession) -> dict:
+    """Same Chargebee payload as POST /api/sync/chargebee (used by Refresh app data)."""
+    return await _sync_chargebee_snapshots(db)
+
+
+async def _sync_quickbooks_session(db: AsyncSession) -> dict:
+    from connectors.quickbooks import QuickBooksConnector
+
+    connector = QuickBooksConnector()
+    if not connector.is_configured():
+        return {"ok": False, "error": "QuickBooks not configured."}
+    synced = {}
+    for report_type in QB_REPORT_TYPES:
+        api_name = QB_REPORT_API_NAMES[report_type]
+        try:
+            data = await asyncio.to_thread(connector.get_report, api_name)
+        except Exception as e:
+            return {"ok": False, "error": f"QuickBooks {api_name} failed: {e}"}
+        snapshot = QuickBooksReportSnapshot(report_type=report_type, data_json=json.dumps(data))
+        db.add(snapshot)
+        synced[report_type] = True
+    await db.commit()
+    return {"ok": True, "synced": list(synced.keys())}
+
+
+async def _persist_app_dataset_state(ok: bool, steps: list, err: Optional[str]) -> None:
+    async with AsyncSessionLocal() as db:
+        row = await db.get(AppDatasetState, 1)
+        if not row:
+            row = AppDatasetState(id=1)
+            db.add(row)
+        row.updated_at = datetime.now(timezone.utc)
+        row.last_refresh_ok = 1 if ok else 0
+        row.last_error = err
+        row.steps_json = json.dumps(steps)
+        await db.commit()
+
+
+async def _refresh_app_dataset() -> dict:
+    """
+    One pipeline: Salesforce → Google Sheet ranges → Chargebee.
+    QuickBooks is not part of this flow; use POST /api/sync/quickbooks when configured.
+    Skips optional sources when not configured. Stops on first failure.
+    """
+    steps: list = []
+    async with _dataset_refresh_lock:
+        async with AsyncSessionLocal() as db:
+            try:
+                result = await _run_salesforce_sync(db)
+                if not result.get("ok"):
+                    await db.rollback()
+                    steps.append({"step": "salesforce", "ok": False, "detail": result.get("error")})
+                    await _persist_app_dataset_state(False, steps, str(result.get("error")))
+                    return {"ok": False, "error": result.get("error"), "steps": steps}
+                await db.commit()
+                steps.append({
+                    "step": "salesforce",
+                    "ok": True,
+                    "detail": {
+                        "synced_accounts": result.get("synced_accounts"),
+                        "synced_opportunities": result.get("synced_opportunities"),
+                        "synced_line_items": result.get("synced_line_items"),
+                    },
+                })
+            except Exception as e:
+                await db.rollback()
+                steps.append({"step": "salesforce", "ok": False, "detail": str(e)})
+                await _persist_app_dataset_state(False, steps, str(e))
+                return {"ok": False, "error": str(e), "steps": steps}
+
+        from connectors.google_sheets import GoogleSheetsConnector
+
+        gs = GoogleSheetsConnector()
+        ranges = _dataset_sheet_range_list()
+        if not gs.is_configured():
+            steps.append({"step": "google_sheet", "ok": True, "detail": "skipped (not configured)"})
+        elif not ranges:
+            steps.append({"step": "google_sheet", "ok": True, "detail": "skipped (no ranges)"})
+        else:
+            for range_name in ranges:
+                async with AsyncSessionLocal() as db:
+                    res = await _sync_google_sheet_range_session(db, range_name, gs)
+                    entry = {"step": f"google_sheet:{range_name}", "ok": res.get("ok"), "detail": {k: v for k, v in res.items() if k != "ok"}}
+                    steps.append(entry)
+                    if not res.get("ok"):
+                        await _persist_app_dataset_state(False, steps, res.get("error"))
+                        return {"ok": False, "error": res.get("error"), "steps": steps}
+
+        from connectors.chargebee import ChargebeeConnector
+
+        cb = ChargebeeConnector()
+        if not cb.is_configured():
+            steps.append({"step": "chargebee", "ok": True, "detail": "skipped (not configured)"})
+        else:
+            async with AsyncSessionLocal() as db:
+                res = await _sync_chargebee_session(db)
+                steps.append({"step": "chargebee", "ok": res.get("ok"), "detail": res})
+                if not res.get("ok"):
+                    await _persist_app_dataset_state(False, steps, res.get("error"))
+                    return {"ok": False, "error": res.get("error"), "steps": steps}
+
+    await _persist_app_dataset_state(True, steps, None)
+    return {"ok": True, "steps": steps, "message": "Dataset refresh complete."}
+
+
+@app.get("/api/dataset/status")
+async def get_dataset_status(db: AsyncSession = Depends(get_db)):
+    """Last unified refresh time and outcome (Dashboard → Refresh app data)."""
+    row = await db.get(AppDatasetState, 1)
+    if not row:
+        return {
+            "updated_at": None,
+            "updated_at_utc": None,
+            "last_refresh_ok": None,
+            "last_error": None,
+            "steps": [],
+            "message": "No refresh yet. Use Refresh app data on the Dashboard.",
+        }
+    try:
+        await _scrub_legacy_quickbooks_from_dataset_state(db, row)
+    except Exception:
+        logging.getLogger(__name__).exception("dataset status: primary QuickBooks scrub failed")
+    row = await db.get(AppDatasetState, 1)
+    if not row:
+        return {
+            "updated_at": None,
+            "updated_at_utc": None,
+            "last_refresh_ok": None,
+            "last_error": None,
+            "steps": [],
+            "message": "No refresh yet. Use Refresh app data on the Dashboard.",
+        }
+    try:
+        await _force_clear_quickbooks_dataset_error(db, row)
+    except Exception:
+        logging.getLogger(__name__).exception("dataset status: force QuickBooks error clear failed")
+    row = await db.get(AppDatasetState, 1)
+    if not row:
+        return {
+            "updated_at": None,
+            "updated_at_utc": None,
+            "last_refresh_ok": None,
+            "last_error": None,
+            "steps": [],
+            "message": "No refresh yet. Use Refresh app data on the Dashboard.",
+        }
+    st: list = []
+    if row.steps_json:
+        try:
+            st = json.loads(row.steps_json)
+        except json.JSONDecodeError:
+            st = []
+    updated_at_iso: Optional[str] = None
+    updated_at_utc: Optional[str] = None
+    if row.updated_at:
+        u_utc = _app_dataset_updated_at_as_utc(row.updated_at)
+        updated_at_iso = u_utc.isoformat().replace("+00:00", "Z")
+        updated_at_utc = _format_updated_at_utc_display(row.updated_at)
+
+    return {
+        "updated_at": updated_at_iso,
+        "updated_at_utc": updated_at_utc,
+        "last_refresh_ok": bool(row.last_refresh_ok),
+        "last_error": row.last_error,
+        "steps": st,
+    }
+
+
+@app.post("/api/dataset/refresh")
+async def post_dataset_refresh():
+    """
+    Refresh app data into SQLite: Salesforce, Google Sheets (DATASET_SHEET_RANGES), Chargebee (each if configured).
+    QuickBooks is synced separately via POST /api/sync/quickbooks when ready.
+    """
+    try:
+        return await _refresh_app_dataset()
+    except Exception as e:
+        await _persist_app_dataset_state(False, [{"step": "fatal", "ok": False, "detail": str(e)}], str(e))
+        return JSONResponse(status_code=200, content={"ok": False, "error": str(e), "steps": []})

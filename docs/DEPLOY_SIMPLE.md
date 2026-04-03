@@ -1,4 +1,4 @@
-# Deploy Dazos CFO Copilot (simplest path)
+# Deploy Dazos CFO Cockpit (simplest path)
 
 This guide gets the app running 24/7 on the internet so you can use it from any device and the **hourly Salesforce sync** and **daily EOD snapshot** keep running when your computer is off.
 

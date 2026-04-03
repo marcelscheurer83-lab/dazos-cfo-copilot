@@ -4,7 +4,7 @@ import { checkAppPassword, checkBackendHealthDetailed } from './api'
 type Props = { onSuccess: () => void }
 
 const SERVER_UNREACHABLE_INTRO =
-  'Backend not reachable. Open this app from http://localhost:5173 (same URL as the dev server). Ensure exactly one backend is running on port 8000.'
+  'Backend not reachable. Open this app from http://localhost:5173 (same URL as the dev server). Ensure exactly one backend is running on port 8008 (see backend/start-backend.ps1).'
 
 export default function Login({ onSuccess }: Props) {
   const [password, setPassword] = useState('')
@@ -58,7 +58,7 @@ export default function Login({ onSuccess }: Props) {
       >
         <div style={{ marginBottom: '1.5rem' }}>
           <div style={{ fontSize: '1.25rem', fontWeight: 700 }}>Dazos</div>
-          <div style={{ fontSize: '0.875rem', color: 'var(--text-muted)' }}>CFO Copilot</div>
+          <div style={{ fontSize: '0.875rem', color: 'var(--text-muted)' }}>CFO Cockpit</div>
         </div>
         <form onSubmit={handleSubmit}>
           <label style={{ display: 'block', marginBottom: '0.5rem', fontSize: '0.875rem', color: 'var(--text-muted)' }}>

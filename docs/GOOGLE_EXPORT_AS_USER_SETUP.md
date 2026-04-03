@@ -12,7 +12,7 @@ Send the following to your Google Workspace admin (e.g. IT or whoever manages ad
 
 ---
 
-**Subject:** One-time API delegation for Dazos CFO Copilot (Google Sheets export)
+**Subject:** One-time API delegation for Dazos CFO Cockpit (Google Sheets export)
 
 We need domain-wide delegation set up once so our internal app can create new Google Sheets in a user’s Drive (marcel@dazos.com) when they click “Export to Google Sheet.” The app uses a service account; this allows it to act as that user only for creating/writing the sheet.
 

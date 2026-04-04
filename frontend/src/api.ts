@@ -1134,6 +1134,34 @@ export async function getArrHistory(): Promise<ArrHistoryResponse> {
   return r.json()
 }
 
+// ── ARR Cohort Churn ─────────────────────────────────────────────────────────
+export type CohortMonth = {
+  offset: number
+  arr: number
+  pct: number | null   // % of Month-0 ARR; null if starting_arr = 0
+  calendar_month: string
+}
+
+export type CohortRow = {
+  cohort_month: string        // YYYY-MM
+  starting_arr: number
+  account_count: number
+  months: CohortMonth[]
+}
+
+export type ArrCohortChurnResponse = {
+  cohorts: CohortRow[]
+  max_offset: number
+  sheet_snapshot_as_of: string | null
+  message: string | null
+}
+
+export async function getArrCohortChurn(): Promise<ArrCohortChurnResponse> {
+  const r = await apiFetch('/arr-cohort-churn')
+  if (!r.ok) throw new Error(`ARR Cohort Churn fetch failed: HTTP ${r.status}`)
+  return r.json()
+}
+
 export async function askCopilot(question: string): Promise<CopilotResponse> {
   const r = await apiFetch('/copilot', {
     method: 'POST',

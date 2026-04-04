@@ -2967,21 +2967,15 @@ async def get_new_schedule_accounts(db: AsyncSession = Depends(get_db)):
     return {"rows": rows, "month_columns": month_keys, "salesforce_base_url": sf_url}
 
 
-@app.get("/api/arr-history")
-async def get_arr_history(db: AsyncSession = Depends(get_db)):
+async def _build_arr_history_data(db: AsyncSession) -> dict:
     """
-    Historical end-of-month live ARR per account, covering Jan 2022 through the current calendar month.
+    Core data-builder shared by /api/arr-history and /api/arr-cohort-churn.
 
-    - **Jan 2022 – Nov 2025**: sourced from the ``ARR_Schedule`` Google Sheet snapshot.
-      Account names are in column B (index 1), starting at row 185 (index 184).
-      Months run from column AQ (index 42, Jan 2022) through column CK (index 88, Nov 2025).
-    - **Dec 2025 – current month**: computed from Salesforce opportunity data using the same
-      live-ARR rules as the Schedule view (contract window containment + midterm-cancellation zero-out).
-
-    Accounts that only appear in the sheet (churned before Salesforce era) are included.
-    Accounts that only exist in Salesforce are also included.
-    Where an account appears in both, sheet data is used for the pre-Dec-25 months and
-    Salesforce for Dec-25 onwards.
+    Returns dict with keys:
+      - ``month_columns``: list[str] of YYYY-MM from Jan 2022 → current month
+      - ``rows``: list[{account_name, arr_by_month}]
+      - ``sheet_snapshot_as_of``: ISO string or None
+      - ``message``: warning string or None
     """
     # ── constants ────────────────────────────────────────────────────────────────
     HIST_RANGE = "ARR_Schedule!A1:ZZ2000"
@@ -3136,23 +3130,115 @@ async def get_arr_history(db: AsyncSession = Depends(get_db)):
         _arr.update(sf_by_name.get(_name, {}))
         rows.append({"account_name": _name, "arr_by_month": _arr})
 
-    # ── 5. Column totals ──────────────────────────────────────────────────────────
-    all_months = historical_months + sf_months
-    totals_by_month: dict[str, float] = {
-        _mk: round(sum(_r["arr_by_month"].get(_mk, 0.0) for _r in rows), 2)
-        for _mk in all_months
-    }
-
     return {
-        "month_columns": all_months,
+        "month_columns": historical_months + sf_months,
         "rows": rows,
-        "totals_by_month": totals_by_month,
         "sheet_snapshot_as_of": sheet_as_of,
         "message": (
             None
             if snap
             else "ARR_Schedule sheet snapshot not found. Run 'Refresh app data' to sync it."
         ),
+    }
+
+
+@app.get("/api/arr-history")
+async def get_arr_history(db: AsyncSession = Depends(get_db)):
+    """
+    Historical end-of-month live ARR per account, covering Jan 2022 through the current calendar month.
+    Sheet source (Jan 2022 – Nov 2025) + Salesforce source (Dec 2025 onwards).
+    """
+    data = await _build_arr_history_data(db)
+    rows = data["rows"]
+    all_months: list[str] = data["month_columns"]
+    totals_by_month: dict[str, float] = {
+        _mk: round(sum(_r["arr_by_month"].get(_mk, 0.0) for _r in rows), 2)
+        for _mk in all_months
+    }
+    return {
+        "month_columns": all_months,
+        "rows": rows,
+        "totals_by_month": totals_by_month,
+        "sheet_snapshot_as_of": data["sheet_snapshot_as_of"],
+        "message": data["message"],
+    }
+
+
+@app.get("/api/arr-cohort-churn")
+async def get_arr_cohort_churn(db: AsyncSession = Depends(get_db)):
+    """
+    Monthly cohort ARR retention analysis.
+
+    Each cohort = all accounts whose **first month with ARR > 0** (in the combined sheet+Salesforce
+    history) falls in that calendar month.
+
+    For each cohort, tracks total ARR at **Month 0** (the cohort month), **Month 1**, **Month 2**, …
+    and expresses each period as a % of Month 0 ARR (NRR-style — can exceed 100% if the cohort expands).
+
+    Useful for reading churn patterns, expansion trends, and cohort quality over time.
+    """
+    data = await _build_arr_history_data(db)
+    rows = data["rows"]
+    all_months: list[str] = data["month_columns"]
+    month_to_idx: dict[str, int] = {mk: i for i, mk in enumerate(all_months)}
+
+    # ── 1. Assign each account to its cohort (first month with ARR > 0) ──────────
+    cohort_accounts: dict[str, list[str]] = {}   # cohort_month -> [account_names]
+    arr_lookup: dict[str, dict[str, float]] = {r["account_name"]: r["arr_by_month"] for r in rows}
+
+    for row in rows:
+        name = row["account_name"]
+        abm = row["arr_by_month"]
+        cohort_month: Optional[str] = None
+        for mk in all_months:
+            if abm.get(mk, 0.0) > 0:
+                cohort_month = mk
+                break
+        if cohort_month is None:
+            continue
+        cohort_accounts.setdefault(cohort_month, []).append(name)
+
+    # ── 2. Build retention matrix per cohort ─────────────────────────────────────
+    result_cohorts: list[dict] = []
+    max_offset = 0
+
+    for cohort_month in sorted(cohort_accounts.keys()):
+        names = cohort_accounts[cohort_month]
+        cohort_idx = month_to_idx[cohort_month]
+        num_periods = len(all_months) - cohort_idx
+
+        # Sum ARR for all cohort members at each subsequent month
+        monthly_arr: list[float] = []
+        for offset in range(num_periods):
+            target_mk = all_months[cohort_idx + offset]
+            total = round(sum(arr_lookup[n].get(target_mk, 0.0) for n in names), 2)
+            monthly_arr.append(total)
+
+        starting_arr = monthly_arr[0] if monthly_arr else 0.0
+        max_offset = max(max_offset, num_periods - 1)
+
+        months_list = []
+        for offset, arr in enumerate(monthly_arr):
+            pct = round(arr / starting_arr * 100, 1) if starting_arr > 0 else None
+            months_list.append({
+                "offset": offset,
+                "arr": arr,
+                "pct": pct,
+                "calendar_month": all_months[cohort_idx + offset],
+            })
+
+        result_cohorts.append({
+            "cohort_month": cohort_month,
+            "starting_arr": round(starting_arr, 2),
+            "account_count": len(names),
+            "months": months_list,
+        })
+
+    return {
+        "cohorts": result_cohorts,
+        "max_offset": max_offset,
+        "sheet_snapshot_as_of": data["sheet_snapshot_as_of"],
+        "message": data["message"],
     }
 
 

@@ -38,17 +38,12 @@ function fmtArr(n: number): string {
   return `$${Math.round(n)}`
 }
 
-// ── column visibility ─────────────────────────────────────────────────────────
-
-const SHOW_EVERY_N = [0, 1, 2, 3, 5, 8, 11, 14, 17, 20, 23, 26, 29, 32, 35, 38, 41, 44, 47]
-
 // ── component ─────────────────────────────────────────────────────────────────
 
 export default function ARRCohortChurn() {
   const [data, setData] = useState<ArrCohortChurnResponse | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
-  const [showAll, setShowAll] = useState(false)
 
   useEffect(() => {
     setLoading(true)
@@ -59,12 +54,8 @@ export default function ARRCohortChurn() {
 
   const visibleOffsets = useMemo(() => {
     if (!data) return []
-    const max = data.max_offset
-    if (showAll || max <= 24) {
-      return Array.from({ length: max + 1 }, (_, i) => i)
-    }
-    return SHOW_EVERY_N.filter((n) => n <= max)
-  }, [data, showAll])
+    return Array.from({ length: data.max_offset + 1 }, (_, i) => i)
+  }, [data])
 
   if (loading) return <div style={{ padding: '2rem', color: 'var(--text-muted)' }}>Loading cohort data…</div>
   if (error)   return <div style={{ padding: '2rem', color: 'var(--negative)' }}>Error: {error}</div>
@@ -94,25 +85,6 @@ export default function ARRCohortChurn() {
         Each row = accounts whose first ARR month is the cohort month. Values show % of Month 0 ARR still active
         (NRR — can exceed 100% with expansions). Jan 2022 – Nov 2025 from Google Sheet; Dec 2025+ from Salesforce.
       </p>
-
-      {/* toggle */}
-      {data.max_offset > 24 && (
-        <button
-          onClick={() => setShowAll((v) => !v)}
-          style={{
-            marginBottom: '1rem',
-            padding: '0.3rem 0.75rem',
-            fontSize: '0.8rem',
-            background: 'var(--surface-2, #2a2a3a)',
-            border: '1px solid var(--border)',
-            borderRadius: 4,
-            color: 'var(--text)',
-            cursor: 'pointer',
-          }}
-        >
-          {showAll ? 'Show fewer columns' : `Show all ${data.max_offset + 1} months`}
-        </button>
-      )}
 
       {/* legend */}
       <div style={{ display: 'flex', gap: '0.75rem', flexWrap: 'wrap', marginBottom: '1rem', fontSize: '0.75rem' }}>

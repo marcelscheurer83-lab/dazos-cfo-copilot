@@ -3025,7 +3025,11 @@ async def get_arr_history(db: AsyncSession = Depends(get_db)):
                     if _v is not None and _v != 0.0:
                         _monthly[_mk] = _v
             if _monthly:
-                sheet_by_name[_name] = _monthly
+                # Merge (sum) into existing entry — handles duplicate rows for the same account name
+                existing = sheet_by_name.get(_name, {})
+                for _mk, _v in _monthly.items():
+                    existing[_mk] = round(existing.get(_mk, 0.0) + _v, 2)
+                sheet_by_name[_name] = existing
 
     # ── 3. Salesforce months Dec '25 – current month ─────────────────────────────
     today_est = datetime.now(EST).date()

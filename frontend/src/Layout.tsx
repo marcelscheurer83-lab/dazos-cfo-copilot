@@ -30,7 +30,7 @@ const nav: NavItem[] = [
     label: 'ARR',
     children: [
       { to: '/arr-schedule/new-schedule', label: 'Schedule' },
-      { to: '/arr-schedule/cohort-churn', label: 'Cohort Churn' },
+      { to: '/arr-schedule/cohort-churn', label: 'Cohort Retention' },
     ],
   },
   {

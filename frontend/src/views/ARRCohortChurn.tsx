@@ -104,8 +104,7 @@ export default function ARRCohortChurn() {
       </div>
 
       {/* table */}
-      <div style={{ overflowX: 'auto', borderRadius: 8, border: '1px solid var(--border)' }}>
-        <table style={{ borderCollapse: 'collapse', fontSize: '0.78rem', minWidth: '100%', tableLayout: 'fixed' }}>
+      <table style={{ borderCollapse: 'collapse', fontSize: '0.78rem', width: '100%', tableLayout: 'fixed' }}>
           <colgroup>
             <col style={{ width: 90 }} />
             <col style={{ width: 56 }} />
@@ -173,7 +172,6 @@ export default function ARRCohortChurn() {
             })}
           </tbody>
         </table>
-      </div>
 
       <p style={{ marginTop: '0.75rem', fontSize: '0.75rem', color: 'var(--text-muted)' }}>
         {cohorts.length} cohorts · {data.max_offset + 1} months of history ·{' '}

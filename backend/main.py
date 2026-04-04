@@ -2843,8 +2843,9 @@ async def get_new_schedule_accounts(db: AsyncSession = Depends(get_db)):
 
     def _cw_future_contract_start_arr_sum(opps: list[Opportunity], today: date) -> float:
         """
-        Sum of ``ARR__c`` (``opportunity_arr``) for Closed Won opportunities whose ``contract_start_date`` is
-        strictly after ``today``. All record types; does **not** apply bookings owner exclusion.
+        Sum of ``Expansion_ARR__c`` (``expansion_arr``) for Closed Won opportunities whose
+        ``contract_start_date`` is strictly after ``today``. All record types; does **not** apply
+        bookings owner exclusion.
         """
         total = 0.0
         for o in opps:
@@ -2853,8 +2854,9 @@ async def get_new_schedule_accounts(db: AsyncSession = Depends(get_db)):
             cs = o.contract_start_date
             if cs is None or cs <= today:
                 continue
-            if o.opportunity_arr is not None:
-                total += float(o.opportunity_arr)
+            val = getattr(o, "expansion_arr", None)
+            if val is not None:
+                total += float(val)
         return round(total, 2)
 
     q_cw = select(Opportunity).where(
@@ -3643,6 +3645,32 @@ async def auth_check():
     Use this for login verification instead of a data endpoint so 500s from DB/Salesforce don't show as "Invalid password."
     """
     return {"ok": True}
+
+
+@app.get("/api/dashboard/overview-targets")
+async def get_dashboard_overview_targets(db: AsyncSession = Depends(get_db)):
+    """
+    Read annual targets from OVERVIEW_2026P sheet snapshot.
+    net_new_carr_ytd_target: H15 (row 15, col H = index 7) — full-year Net New Contracted ARR target.
+    Returns null for any value not found / not yet synced.
+    """
+    RANGE = "OVERVIEW_2026P!A1:ZZ1000"
+    r_snap = await db.execute(
+        select(SheetSnapshot)
+        .where(SheetSnapshot.range_name == RANGE)
+        .order_by(SheetSnapshot.as_of.desc())
+        .limit(1)
+    )
+    snap = r_snap.scalar_one_or_none()
+    if not snap or not snap.data_json:
+        return {"net_new_carr_ytd_target": None, "message": "No OVERVIEW_2026P snapshot. Run Refresh app data first."}
+    try:
+        data = json.loads(snap.data_json)
+        row = data[14] if len(data) > 14 else []  # row 15 = index 14
+        val = _to_float_sheet(row[7]) if len(row) > 7 else None  # col H = index 7
+        return {"net_new_carr_ytd_target": val, "message": None}
+    except Exception as e:
+        return {"net_new_carr_ytd_target": None, "message": f"Could not read target: {str(e)[:80]}"}
 
 
 @app.get("/api/dashboard-kpi", response_model=DashboardKPI)

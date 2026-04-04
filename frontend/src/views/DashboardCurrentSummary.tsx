@@ -5,6 +5,7 @@ import {
   getDashboardRenewalsMTD,
   getDashboardCashMTD,
   getNewScheduleAccounts,
+  getOverviewTargets,
   getDatasetStatus,
   refreshAppDataset,
   type DashboardKPI,
@@ -17,6 +18,7 @@ import {
   type CashMTDResponse,
   type DatasetStatus,
   type DashboardFixedPeriods,
+  type OverviewTargets,
 } from '../api'
 
 const DATASET_REFRESH_TIMEOUT_MS = 15 * 60 * 1000
@@ -116,9 +118,9 @@ const blockStyle: React.CSSProperties = {
   padding: '1rem 1.25rem',
 }
 
-/** Current Overview: Bookings / Renewals / Cash — half page width, left-aligned with Live ARR row. */
+/** Current Overview: Bookings / Renewals / Cash — slightly wider than half page, left-aligned with Live ARR row. */
 const overviewMtdBlockLayout: React.CSSProperties = {
-  maxWidth: '50%',
+  maxWidth: '55%',
   width: '100%',
   justifySelf: 'start',
   boxSizing: 'border-box',
@@ -169,6 +171,8 @@ export default function DashboardCurrentSummary({ title = 'Current Overview' }: 
   const [refreshMessage, setRefreshMessage] = useState<string | null>(null)
   const [liveArrTotal, setLiveArrTotal] = useState<number | null>(null)
   const [liveCarrTotal, setLiveCarrTotal] = useState<number | null>(null)
+  const [netNewCarrYtd, setNetNewCarrYtd] = useState<number | null>(null)
+  const [overviewTargets, setOverviewTargets] = useState<OverviewTargets | null>(null)
   const [arrErr, setArrErr] = useState<string | null>(null)
 
   const loadAllDashboardData = useCallback(() => {
@@ -195,11 +199,18 @@ export default function DashboardCurrentSummary({ title = 'Current Overview' }: 
       getNewScheduleAccounts()
         .then((res) => {
           const rows = res.rows ?? []
-          setLiveArrTotal(rows.reduce((s, r) => s + (r.live_arr ?? 0), 0))
-          setLiveCarrTotal(rows.reduce((s, r) => s + (r.contracted_arr ?? 0), 0))
+          const liveArr = rows.reduce((s, r) => s + (r.live_arr ?? 0), 0)
+          const carr = rows.reduce((s, r) => s + (r.contracted_arr ?? 0), 0)
+          const dec25Arr = rows.reduce((s, r) => s + ((r.arr_by_month?.['2025-12']) ?? 0), 0)
+          setLiveArrTotal(liveArr)
+          setLiveCarrTotal(carr)
+          setNetNewCarrYtd(carr - dec25Arr)
           setArrErr(null)
         })
         .catch((e: unknown) => setArrErr(normalizeFetchError(e instanceof Error ? e.message : String(e), 'ARR')))
+      getOverviewTargets()
+        .then(setOverviewTargets)
+        .catch(() => setOverviewTargets(null))
     }
 
     getDatasetStatus()
@@ -327,9 +338,10 @@ export default function DashboardCurrentSummary({ title = 'Current Overview' }: 
               gap: '1.25rem',
               alignItems: 'stretch',
               gridColumn: '1 / -1',
+              ...(overviewOnly ? { maxWidth: '55%', width: '100%', boxSizing: 'border-box' } : {}),
             }}
           >
-            <div style={dashboardArrStatCardStyle}>
+            <div style={{ ...dashboardArrStatCardStyle, ...(overviewOnly ? { flex: '1 1 0', minWidth: 0 } : {}) }}>
               <div style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '0.35rem', textAlign: 'center' }}>
                 Live ARR
               </div>
@@ -346,7 +358,7 @@ export default function DashboardCurrentSummary({ title = 'Current Overview' }: 
               )}
             </div>
 
-            <div style={dashboardArrStatCardStyle}>
+            <div style={{ ...dashboardArrStatCardStyle, ...(overviewOnly ? { flex: '1 1 0', minWidth: 0 } : {}) }}>
               <div
                 style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '0.35rem', textAlign: 'center', lineHeight: 1.3, maxWidth: 220 }}
                 title="Live ARR plus Closed Won opportunities with a contract start after today."
@@ -362,6 +374,33 @@ export default function DashboardCurrentSummary({ title = 'Current Overview' }: 
                 </div>
               )}
               {!arrErr && liveCarrTotal == null && (
+                <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)', textAlign: 'center', margin: 0 }}>Loading…</p>
+              )}
+            </div>
+
+            <div style={{ ...dashboardArrStatCardStyle, ...(overviewOnly ? { flex: '1 1 0', minWidth: 0 } : {}) }}>
+              <div
+                style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '0.35rem', textAlign: 'center', lineHeight: 1.3, maxWidth: 220 }}
+                title="Contracted ARR today minus ARR active at end of Dec '25 — net new ARR added year-to-date."
+              >
+                Net New Contracted ARR YTD
+              </div>
+              {arrErr && (
+                <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)', textAlign: 'center', margin: 0 }}>{arrErr}</p>
+              )}
+              {!arrErr && netNewCarrYtd != null && (
+                <>
+                  <div style={{ fontSize: '1.75rem', fontWeight: 700, color: 'var(--text)', textAlign: 'center' }}>
+                    {new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 }).format(netNewCarrYtd)}
+                  </div>
+                  {overviewTargets?.net_new_carr_ytd_target != null && overviewTargets.net_new_carr_ytd_target !== 0 && (
+                    <div style={{ fontSize: '0.85rem', color: 'var(--text-muted)', textAlign: 'center', marginTop: '0.2rem' }}>
+                      {`(${Math.round(netNewCarrYtd / overviewTargets.net_new_carr_ytd_target * 100)}% of plan)`}
+                    </div>
+                  )}
+                </>
+              )}
+              {!arrErr && netNewCarrYtd == null && (
                 <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)', textAlign: 'center', margin: 0 }}>Loading…</p>
               )}
             </div>
@@ -384,7 +423,7 @@ export default function DashboardCurrentSummary({ title = 'Current Overview' }: 
             <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>{normalizeFetchError(bookingsErr, 'Bookings')}</p>
           )}
           {!bookingsErr && bookingsMTD && (
-            <BookingsMTDBlock data={bookingsMTD} overviewOnly={overviewOnly} />
+            <BookingsMTDBlock data={bookingsMTD} overviewOnly={overviewOnly} hidePipeCov={isFixedQuarterDashboard(title)} />
           )}
           {!bookingsErr && !bookingsMTD && (
             <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>Loading…</p>
@@ -589,7 +628,7 @@ function RenewalsMetricRow({ label, row }: { label: string; row: RenewalsMTDRow 
   )
 }
 
-function BookingsMTDBlock({ data, overviewOnly }: { data: BookingsMTDResponse; overviewOnly?: boolean }) {
+function BookingsMTDBlock({ data, overviewOnly, hidePipeCov }: { data: BookingsMTDResponse; overviewOnly?: boolean; hidePipeCov?: boolean }) {
   const { two_months_ago, previous_month, current_mtd, qtd, plan_message } = data
   const periods: BookingsPeriod[] = (
     overviewOnly
@@ -612,7 +651,7 @@ function BookingsMTDBlock({ data, overviewOnly }: { data: BookingsMTDResponse; o
       <div style={mtPeriodGridStyle(periods.length)}>
         {periods.map((period) => {
           // Pipe coverage applies to MTD/QTD only (open pipeline vs plan shortfall). Past calendar months omit the column.
-          const showPipeCov = period !== two_months_ago && period !== previous_month
+          const showPipeCov = !hidePipeCov && period !== two_months_ago && period !== previous_month
           return (
           <div key={period.period_label}>
             <div style={{ fontSize: '1.05em', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '0.5rem' }}>

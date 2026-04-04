@@ -885,6 +885,17 @@ export async function getDatasetStatus(): Promise<DatasetStatus> {
   return r.json()
 }
 
+export type OverviewTargets = {
+  net_new_carr_ytd_target: number | null
+  message: string | null
+}
+
+export async function getOverviewTargets(): Promise<OverviewTargets> {
+  const r = await apiFetch('/dashboard/overview-targets')
+  if (!r.ok) throw new Error('Failed to fetch overview targets')
+  return r.json()
+}
+
 /** Unified refresh: Salesforce, Google Sheets (DATASET_SHEET_RANGES), Chargebee when configured. QuickBooks is separate (POST /api/sync/quickbooks). Can take many minutes. */
 export async function refreshAppDataset(signal?: AbortSignal): Promise<{
   ok: boolean

@@ -1114,6 +1114,26 @@ export async function getAccounts(limit = 5000): Promise<AccountRow[]> {
   return r.json()
 }
 
+// ── ARR History ──────────────────────────────────────────────────────────────
+export type ArrHistoryRow = {
+  account_name: string
+  arr_by_month: Record<string, number>
+}
+
+export type ArrHistoryResponse = {
+  month_columns: string[]
+  rows: ArrHistoryRow[]
+  totals_by_month: Record<string, number>
+  sheet_snapshot_as_of: string | null
+  message: string | null
+}
+
+export async function getArrHistory(): Promise<ArrHistoryResponse> {
+  const r = await apiFetch('/arr-history')
+  if (!r.ok) throw new Error(`ARR History fetch failed: HTTP ${r.status}`)
+  return r.json()
+}
+
 export async function askCopilot(question: string): Promise<CopilotResponse> {
   const r = await apiFetch('/copilot', {
     method: 'POST',

@@ -2967,6 +2967,191 @@ async def get_new_schedule_accounts(db: AsyncSession = Depends(get_db)):
     return {"rows": rows, "month_columns": month_keys, "salesforce_base_url": sf_url}
 
 
+@app.get("/api/arr-history")
+async def get_arr_history(db: AsyncSession = Depends(get_db)):
+    """
+    Historical end-of-month live ARR per account, covering Jan 2022 through the current calendar month.
+
+    - **Jan 2022 – Nov 2025**: sourced from the ``ARR_Schedule`` Google Sheet snapshot.
+      Account names are in column B (index 1), starting at row 185 (index 184).
+      Months run from column AQ (index 42, Jan 2022) through column CK (index 88, Nov 2025).
+    - **Dec 2025 – current month**: computed from Salesforce opportunity data using the same
+      live-ARR rules as the Schedule view (contract window containment + midterm-cancellation zero-out).
+
+    Accounts that only appear in the sheet (churned before Salesforce era) are included.
+    Accounts that only exist in Salesforce are also included.
+    Where an account appears in both, sheet data is used for the pre-Dec-25 months and
+    Salesforce for Dec-25 onwards.
+    """
+    # ── constants ────────────────────────────────────────────────────────────────
+    HIST_RANGE = "ARR_Schedule!A1:ZZ2000"
+    HIST_ROW_START = 184   # row 185, 0-indexed
+    COL_NAME = 1           # col B = account name
+    COL_AQ = 42            # col AQ = Jan 2022 (0-indexed; A=1…AQ=43 → index 42)
+    # col CK = Nov 2025 (0-indexed; CK=89 → index 88). Verified: CK-AQ+1=47 months = Jan22..Nov25 ✓
+
+    # ── 1. Historical months Jan '22 – Nov '25 ───────────────────────────────────
+    historical_months: list[str] = []
+    _m = date(2022, 1, 1)
+    _end_hist = date(2025, 11, 1)
+    while _m <= _end_hist:
+        historical_months.append(_m.strftime("%Y-%m"))
+        _m = date(_m.year + 1, 1, 1) if _m.month == 12 else date(_m.year, _m.month + 1, 1)
+
+    # ── 2. Load sheet snapshot ────────────────────────────────────────────────────
+    r_snap = await db.execute(
+        select(SheetSnapshot)
+        .where(SheetSnapshot.range_name == HIST_RANGE)
+        .order_by(SheetSnapshot.as_of.desc())
+        .limit(1)
+    )
+    snap = r_snap.scalar_one_or_none()
+    sheet_as_of: Optional[str] = snap.as_of.isoformat() if snap else None
+
+    sheet_by_name: dict[str, dict[str, float]] = {}
+    if snap and snap.data_json:
+        _data = json.loads(snap.data_json)
+        for _row in _data[HIST_ROW_START:]:
+            if not _row or len(_row) <= COL_NAME:
+                continue
+            _name = str(_row[COL_NAME]).strip() if len(_row) > COL_NAME else ""
+            if not _name:
+                continue
+            _monthly: dict[str, float] = {}
+            for _i, _mk in enumerate(historical_months):
+                _ci = COL_AQ + _i
+                if _ci < len(_row):
+                    _v = _to_float_sheet(_row[_ci])
+                    if _v is not None and _v != 0.0:
+                        _monthly[_mk] = _v
+            if _monthly:
+                sheet_by_name[_name] = _monthly
+
+    # ── 3. Salesforce months Dec '25 – current month ─────────────────────────────
+    today_est = datetime.now(EST).date()
+    sf_months: list[str] = []
+    _m = date(2025, 12, 1)
+    _ceil = date(today_est.year, today_est.month, 1)
+    while _m <= _ceil:
+        sf_months.append(_m.strftime("%Y-%m"))
+        _m = date(_m.year + 1, 1, 1) if _m.month == 12 else date(_m.year, _m.month + 1, 1)
+
+    month_end_dates: dict[str, date] = {}
+    for _mk in sf_months:
+        _y, _mo = int(_mk[:4]), int(_mk[5:])
+        month_end_dates[_mk] = date(_y, _mo, calendar.monthrange(_y, _mo)[1])
+
+    # record-type overrides
+    overrides = await _get_record_type_overrides(db)
+
+    def _eff_rt(o: Opportunity) -> str:
+        _key = (o.sf_id or "").strip()
+        _ov = overrides.get(_key) or (overrides.get(_key[:15]) if len(_key) >= 15 else None)
+        return (_ov or o.record_type_name or "").strip()
+
+    # fetch all closed opps (CW + CL needed for midterm-cancellation zero-out)
+    _q = select(Opportunity).where(
+        or_(
+            Opportunity.stage_name.in_(CLOSED_STAGES),
+            func.lower(func.trim(Opportunity.stage_name)) == "closed won",
+        )
+    )
+    _r = await db.execute(_q)
+    _all_closed = list(_r.scalars().all())
+
+    # group by account_id
+    _sf_accounts: dict[str, str] = {}   # account_id -> account_name
+    _opps_by_aid: dict[str, list[Opportunity]] = {}
+    for _o in _all_closed:
+        _aid = (_o.account_id or "").strip()
+        if not _aid:
+            continue
+        if _aid not in _sf_accounts:
+            _sf_accounts[_aid] = (_o.account_name or "").strip() or "—"
+        _opps_by_aid.setdefault(_aid, []).append(_o)
+
+    def _live_arr_as_of(opps: list[Opportunity], as_of: date) -> float:
+        _total = 0.0
+        for _o in opps:
+            if not _is_closed_won_stage(_o.stage_name):
+                continue
+            _rt = _eff_rt(_o)
+            if not (
+                _is_new_business_record_type(_rt)
+                or _is_renewal_record_type(_rt)
+                or _is_expansion_record_type(_rt)
+            ):
+                continue
+            _cs, _ce = _o.contract_start_date, _o.contract_end_date
+            if _cs is None or _ce is None:
+                continue
+            if not (_cs <= as_of <= _ce):
+                continue
+            if _o.opportunity_arr is not None:
+                _total += float(_o.opportunity_arr)
+        return round(_total, 2)
+
+    def _zero_after_midterm(opps: list[Opportunity], as_of: date) -> bool:
+        for _o in opps:
+            if not _is_closed_lost_stage(_o.stage_name):
+                continue
+            if getattr(_o, "midterm_cancellation", 0) != 1:
+                continue
+            if not _is_renewal_record_type(_eff_rt(_o)):
+                continue
+            _ce = _o.contract_end_date
+            if _ce is not None and as_of > _ce:
+                return True
+        return False
+
+    # compute per account, per SF month
+    sf_by_name: dict[str, dict[str, float]] = {}
+    for _aid, _name in _sf_accounts.items():
+        _acct_opps = _opps_by_aid.get(_aid, [])
+        _monthly: dict[str, float] = {}
+        for _mk in sf_months:
+            _eom = month_end_dates[_mk]
+            _v = _live_arr_as_of(_acct_opps, _eom)
+            if _zero_after_midterm(_acct_opps, _eom):
+                _v = 0.0
+            if _v != 0.0:
+                _monthly[_mk] = _v
+        if _monthly:
+            # If multiple account_ids share the same name, merge values
+            existing = sf_by_name.get(_name, {})
+            for _mk, _v in _monthly.items():
+                existing[_mk] = round(existing.get(_mk, 0.0) + _v, 2)
+            sf_by_name[_name] = existing
+
+    # ── 4. Merge sheet + Salesforce rows ─────────────────────────────────────────
+    all_names: set[str] = set(sheet_by_name.keys()) | set(sf_by_name.keys())
+    rows: list[dict] = []
+    for _name in sorted(all_names, key=lambda x: x.lower()):
+        _arr: dict[str, float] = {}
+        _arr.update(sheet_by_name.get(_name, {}))
+        _arr.update(sf_by_name.get(_name, {}))
+        rows.append({"account_name": _name, "arr_by_month": _arr})
+
+    # ── 5. Column totals ──────────────────────────────────────────────────────────
+    all_months = historical_months + sf_months
+    totals_by_month: dict[str, float] = {
+        _mk: round(sum(_r["arr_by_month"].get(_mk, 0.0) for _r in rows), 2)
+        for _mk in all_months
+    }
+
+    return {
+        "month_columns": all_months,
+        "rows": rows,
+        "totals_by_month": totals_by_month,
+        "sheet_snapshot_as_of": sheet_as_of,
+        "message": (
+            None
+            if snap
+            else "ARR_Schedule sheet snapshot not found. Run 'Refresh app data' to sync it."
+        ),
+    }
+
+
 @app.get("/api/analytics/active-arr-by-product")
 async def get_active_arr_by_product(
     as_of: Optional[date] = Query(
@@ -8823,6 +9008,7 @@ def _dataset_sheet_range_list() -> list[str]:
         "ARR_Calculations_2026P!A1:ZZ1000",
         "BS_2026P!A1:ZZ1000",
         "OVERVIEW_2026P!A1:ZZ1000",
+        "ARR_Schedule!A1:ZZ2000",
     ]
 
 

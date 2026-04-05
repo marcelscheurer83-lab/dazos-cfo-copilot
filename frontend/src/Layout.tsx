@@ -29,8 +29,9 @@ const nav: NavItem[] = [
   {
     label: 'ARR',
     children: [
-      { to: '/arr-schedule/new-schedule', label: 'Schedule' },
+      { to: '/arr-schedule/bridge', label: 'Bridge' },
       { to: '/arr-schedule/cohort-churn', label: 'Cohort Retention' },
+      { to: '/arr-schedule/new-schedule', label: 'Schedule' },
     ],
   },
   {
@@ -71,7 +72,7 @@ const subLinkStyle = (isActive: boolean) => ({
 })
 
 const GTM_PATHS = ['/bookings', '/renewals', '/pipeline-overview']
-const ARR_SCHEDULE_PATHS = ['/arr-schedule/new-schedule', '/arr-schedule/cohort-churn']
+const ARR_SCHEDULE_PATHS = ['/arr-schedule/new-schedule', '/arr-schedule/cohort-churn', '/arr-schedule/bridge']
 const EXPORTS_PATHS = ['/products-purchased', '/customer-overview']
 const ANALYTICS_PATHS = ['/analytics', '/analytics/crm-seats']
 

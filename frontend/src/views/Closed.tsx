@@ -371,7 +371,7 @@ export default function Closed() {
 
   return (
     <>
-      <h1 style={{ margin: '0 0 1.5rem', fontSize: '1.5rem', fontWeight: 600, color: 'var(--text)' }}>New and Expansion Bookings Overview</h1>
+      <h1 style={{ margin: '0 0 1.5rem', fontSize: '1.5rem', fontWeight: 600, color: 'var(--text)' }}>New and Expansion Bookings</h1>
 
       {chartDataByRecordType.months.length > 0 && (
           <div style={{ marginBottom: '1.5rem', maxWidth: '100%', display: 'flex', gap: '2rem', flexWrap: 'wrap' }}>

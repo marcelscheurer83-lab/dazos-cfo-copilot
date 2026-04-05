@@ -212,6 +212,24 @@ class ARRSchedulePeriod(Base):
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
 
 
+class MonthlyArrSnapshot(Base):
+    """
+    Materialized end-of-month live ARR per account, covering Jan 2022 → current month.
+    Only non-zero rows are stored (missing = $0 ARR for that account-month).
+    Fully replaced on every dataset refresh via _refresh_monthly_arr_snapshot().
+    Source: ARR_Schedule Google Sheet (Jan 2022 – Nov 2025) + Salesforce opps (Dec 2025+).
+    """
+    __tablename__ = "monthly_arr_snapshots"
+    id = Column(Integer, primary_key=True)
+    account_name = Column(String(256), nullable=False, index=True)
+    month_key = Column(String(7), nullable=False, index=True)   # YYYY-MM
+    arr = Column(Float, nullable=False)
+    refreshed_at = Column(DateTime, server_default=func.now())
+    __table_args__ = (
+        UniqueConstraint("account_name", "month_key", name="uq_monthly_arr_account_month"),
+    )
+
+
 class OpportunityLineItem(Base):
     """Synced from Salesforce — product lines on opportunities. total_price = MRR (monthly); ARR = total_price * 12.
     When same product has multiple segments (different term/price), ARR = (sum(term_months_i * price_i) / sum(term_months_i)) * 12."""

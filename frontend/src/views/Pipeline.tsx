@@ -454,7 +454,7 @@ export default function Pipeline() {
 
   return (
     <>
-      <h1 style={{ margin: '0 0 1.5rem', fontSize: '1.5rem', fontWeight: 600, color: 'var(--text)' }}>Pipeline overview</h1>
+      <h1 style={{ margin: '0 0 1.5rem', fontSize: '1.5rem', fontWeight: 600, color: 'var(--text)' }}>Pipeline</h1>
       {chartDataByStage.months.length > 0 && (
         <div style={{ marginBottom: '1.5rem', maxWidth: '100%', display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '2rem', alignItems: 'stretch' }}>
               <div style={{ minWidth: 0, display: 'flex', flexDirection: 'column' }}>

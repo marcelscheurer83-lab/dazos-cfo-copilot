@@ -8,6 +8,7 @@ import {
   getOverviewTargets,
   getDatasetStatus,
   refreshAppDataset,
+  getArrBridge,
   type DashboardKPI,
   type BookingsMTDResponse,
   type BookingsMTDRow,
@@ -138,6 +139,87 @@ const dashboardArrStatCardStyle: React.CSSProperties = {
   boxSizing: 'border-box',
 }
 
+// ── ARR Bridge Summary (overview sidebar) ────────────────────────────────────
+
+function fmtBridgeAmt(n: number): string {
+  return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 }).format(n)
+}
+
+function getQtrMonthKeys(bridge: import('../api').ArrBridgeMonth[]): string[] {
+  if (!bridge.length) return []
+  const latest = bridge[bridge.length - 1].month // YYYY-MM
+  const [y, m] = latest.split('-').map(Number)
+  const qStart = Math.floor((m - 1) / 3) * 3 + 1
+  return [qStart, qStart + 1, qStart + 2]
+    .filter((mo) => mo <= m)
+    .map((mo) => `${y}-${String(mo).padStart(2, '0')}`)
+}
+
+function ArrBridgeSummaryBlock({ bridgeMonths }: { bridgeMonths: import('../api').ArrBridgeMonth[] }) {
+  const latest = bridgeMonths[bridgeMonths.length - 1]
+  const qKeys = getQtrMonthKeys(bridgeMonths)
+  const qMonths = bridgeMonths.filter((b) => qKeys.includes(b.month))
+  const qLabel = latest ? (() => {
+    const [y, m] = latest.month.split('-').map(Number)
+    const q = Math.ceil(m / 3)
+    return `Q${q} '${String(y).slice(2)} QTD`
+  })() : 'QTD'
+  const mLabel = latest ? (() => {
+    const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
+    const [y, m] = latest.month.split('-').map(Number)
+    return `${months[m - 1]} '${String(y).slice(2)}`
+  })() : '—'
+
+  const sum = (key: keyof import('../api').ArrBridgeMonth) =>
+    qMonths.reduce((s, b) => s + (b[key] as number), 0)
+
+  const qBeginning = qMonths.length ? qMonths[0].beginning_arr : 0
+  const qEnding    = qMonths.length ? qMonths[qMonths.length - 1].ending_arr : 0
+
+  const rows: { label: string; mVal: number; qVal: number; color?: string; bold?: boolean; sep?: boolean }[] = latest ? [
+    { label: 'Beginning ARR',  mVal: latest.beginning_arr, qVal: qBeginning,        color: 'var(--text-muted)' },
+    { label: '+ New Business', mVal: latest.new_business,  qVal: sum('new_business'), color: '#3b82f6' },
+    { label: '+ Expansion',    mVal: latest.expansion,     qVal: sum('expansion'),    color: '#22c55e' },
+    { label: '− Contraction',  mVal: latest.contraction,   qVal: sum('contraction'),  color: '#f97316' },
+    { label: '− Churn',        mVal: latest.churn,         qVal: sum('churn'),        color: '#ef4444' },
+    { label: 'Ending ARR',     mVal: latest.ending_arr,    qVal: qEnding,             bold: true, sep: true },
+  ] : []
+
+  return (
+    <div style={{ ...blockStyle, flex: 1, minWidth: 0, boxSizing: 'border-box' }}>
+      <div style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text)', marginBottom: '0.5rem' }}>
+        ARR Bridge
+      </div>
+      {!latest ? (
+        <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)', margin: 0 }}>Loading…</p>
+      ) : (
+        <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.8rem' }}>
+          <thead>
+            <tr style={{ borderBottom: '2px solid var(--border)' }}>
+              <th style={{ textAlign: 'left', padding: '0.3rem 0.5rem', color: 'var(--text-muted)', fontWeight: 600 }}></th>
+              <th style={{ textAlign: 'right', padding: '0.3rem 0.5rem', color: 'var(--text-muted)', fontWeight: 600 }}>{mLabel} MTD</th>
+              <th style={{ textAlign: 'right', padding: '0.3rem 0.5rem', color: 'var(--text-muted)', fontWeight: 600 }}>{qLabel}</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map(({ label, mVal, qVal, color, bold, sep }) => (
+              <tr key={label} style={{ borderBottom: sep ? '2px solid var(--border)' : '1px solid var(--border)' }}>
+                <td style={{ padding: '0.3rem 0.5rem', color: color ?? 'var(--text)', fontWeight: bold ? 700 : 400, whiteSpace: 'nowrap' }}>{label}</td>
+                <td style={{ padding: '0.3rem 0.5rem', textAlign: 'right', fontVariantNumeric: 'tabular-nums', color: color ?? 'var(--text)', fontWeight: bold ? 700 : 400 }}>
+                  {mVal === 0 ? '—' : fmtBridgeAmt(mVal)}
+                </td>
+                <td style={{ padding: '0.3rem 0.5rem', textAlign: 'right', fontVariantNumeric: 'tabular-nums', color: color ?? 'var(--text)', fontWeight: bold ? 700 : 400 }}>
+                  {qVal === 0 ? '—' : fmtBridgeAmt(qVal)}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+    </div>
+  )
+}
+
 /** MTD tables: avoid fixed layout + zoom collapsing row heights; keep rows readable. */
 const mtTableStyle: React.CSSProperties = {
   width: '100%',
@@ -174,6 +256,10 @@ export default function DashboardCurrentSummary({ title = 'Current Overview' }: 
   const [netNewCarrYtd, setNetNewCarrYtd] = useState<number | null>(null)
   const [overviewTargets, setOverviewTargets] = useState<OverviewTargets | null>(null)
   const [arrErr, setArrErr] = useState<string | null>(null)
+  const [yoyGrowth, setYoyGrowth] = useState<number | null>(null)
+  const [nrr12m, setNrr12m] = useState<number | null>(null)
+  const [grr12m, setGrr12m] = useState<number | null>(null)
+  const [bridgeMonths, setBridgeMonths] = useState<import('../api').ArrBridgeMonth[]>([])
 
   const loadAllDashboardData = useCallback(() => {
     const fixed = dashboardFixedPeriodsForTitle(title)
@@ -211,6 +297,17 @@ export default function DashboardCurrentSummary({ title = 'Current Overview' }: 
       getOverviewTargets()
         .then(setOverviewTargets)
         .catch(() => setOverviewTargets(null))
+      getArrBridge()
+        .then((res) => {
+          const latestRet = res.retention[res.retention.length - 1]
+          const latestBridge = res.bridge[res.bridge.length - 1]
+          const latestYoy = latestBridge ? res.yoy.find((y) => y.month === latestBridge.month) : undefined
+          setNrr12m(latestRet?.nrr_trailing_12m ?? null)
+          setGrr12m(latestRet?.grr_trailing_12m ?? null)
+          setYoyGrowth(latestYoy?.yoy_pct ?? null)
+          setBridgeMonths(res.bridge)
+        })
+        .catch(() => { /* non-critical — silently skip */ })
     }
 
     getDatasetStatus()
@@ -338,7 +435,7 @@ export default function DashboardCurrentSummary({ title = 'Current Overview' }: 
               gap: '1.25rem',
               alignItems: 'stretch',
               gridColumn: '1 / -1',
-              ...(overviewOnly ? { maxWidth: '55%', width: '100%', boxSizing: 'border-box' } : {}),
+              ...(overviewOnly ? { width: '100%', boxSizing: 'border-box' } : {}),
             }}
           >
             <div style={{ ...dashboardArrStatCardStyle, ...(overviewOnly ? { flex: '1 1 0', minWidth: 0 } : {}) }}>
@@ -404,30 +501,77 @@ export default function DashboardCurrentSummary({ title = 'Current Overview' }: 
                 <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)', textAlign: 'center', margin: 0 }}>Loading…</p>
               )}
             </div>
+
+            {/* ── ARR Growth YoY ── */}
+            <div style={{ ...dashboardArrStatCardStyle, ...(overviewOnly ? { flex: '1 1 0', minWidth: 0 } : {}) }}>
+              <div style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '0.35rem', textAlign: 'center' }}>
+                ARR Growth YoY
+              </div>
+              {yoyGrowth != null ? (
+                <div style={{ fontSize: '1.75rem', fontWeight: 700, textAlign: 'center', color: yoyGrowth >= 20 ? 'var(--positive, #22c55e)' : yoyGrowth >= 0 ? '#f59e0b' : 'var(--negative, #ef4444)' }}>
+                  {yoyGrowth}%
+                </div>
+              ) : (
+                <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)', textAlign: 'center', margin: 0 }}>Loading…</p>
+              )}
+            </div>
+
+            {/* ── T12M NRR ── */}
+            <div style={{ ...dashboardArrStatCardStyle, ...(overviewOnly ? { flex: '1 1 0', minWidth: 0 } : {}) }}>
+              <div style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '0.35rem', textAlign: 'center' }}>
+                Net Revenue Retention
+              </div>
+              {nrr12m != null ? (
+                <>
+                  <div style={{ fontSize: '1.75rem', fontWeight: 700, textAlign: 'center', color: nrr12m >= 100 ? 'var(--positive, #22c55e)' : nrr12m >= 85 ? '#f59e0b' : 'var(--negative, #ef4444)' }}>
+                    {nrr12m}%
+                  </div>
+                  <div style={{ fontSize: '0.85rem', color: 'var(--text-muted)', textAlign: 'center', marginTop: '0.2rem' }}>Trailing 12M</div>
+                </>
+              ) : (
+                <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)', textAlign: 'center', margin: 0 }}>Loading…</p>
+              )}
+            </div>
+
+            {/* ── T12M GRR ── */}
+            <div style={{ ...dashboardArrStatCardStyle, ...(overviewOnly ? { flex: '1 1 0', minWidth: 0 } : {}) }}>
+              <div style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '0.35rem', textAlign: 'center' }}>
+                Gross Revenue Retention
+              </div>
+              {grr12m != null ? (
+                <>
+                  <div style={{ fontSize: '1.75rem', fontWeight: 700, textAlign: 'center', color: grr12m >= 90 ? 'var(--positive, #22c55e)' : grr12m >= 75 ? '#f59e0b' : 'var(--negative, #ef4444)' }}>
+                    {grr12m}%
+                  </div>
+                  <div style={{ fontSize: '0.85rem', color: 'var(--text-muted)', textAlign: 'center', marginTop: '0.2rem' }}>Trailing 12M</div>
+                </>
+              ) : (
+                <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)', textAlign: 'center', margin: 0 }}>Loading…</p>
+              )}
+            </div>
+
           </div>
         )}
 
-        {/* Block 1: Bookings */}
-        <div
-          style={{
-            ...blockStyle,
-            gridColumn: '1 / -1',
-            minWidth: 0,
-            ...(overviewOnly ? overviewMtdBlockLayout : {}),
-          }}
-        >
-          <div style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text)', marginBottom: '0.5rem' }}>
-            Bookings (ARR)
+        {/* Block 1: Bookings (+ ARR Bridge table in overview mode) */}
+        <div style={{ gridColumn: '1 / -1', display: 'flex', gap: '1.25rem', alignItems: 'flex-start', minWidth: 0, ...(overviewOnly ? { width: '100%' } : {}) }}>
+          <div style={{ ...blockStyle, minWidth: 0, ...(overviewOnly ? { flex: '0 0 55%', boxSizing: 'border-box' } : { flex: '1 1 auto' }) }}>
+            <div style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text)', marginBottom: '0.5rem' }}>
+              Bookings (ARR)
+            </div>
+            {bookingsErr && (
+              <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>{normalizeFetchError(bookingsErr, 'Bookings')}</p>
+            )}
+            {!bookingsErr && bookingsMTD && (
+              <BookingsMTDBlock data={bookingsMTD} overviewOnly={overviewOnly} hidePipeCov={isFixedQuarterDashboard(title)} />
+            )}
+            {!bookingsErr && !bookingsMTD && (
+              <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>Loading…</p>
+            )}
           </div>
-          {bookingsErr && (
-            <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>{normalizeFetchError(bookingsErr, 'Bookings')}</p>
-          )}
-          {!bookingsErr && bookingsMTD && (
-            <BookingsMTDBlock data={bookingsMTD} overviewOnly={overviewOnly} hidePipeCov={isFixedQuarterDashboard(title)} />
-          )}
-          {!bookingsErr && !bookingsMTD && (
-            <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>Loading…</p>
-          )}
+
+          {/* ARR Bridge summary — overview only */}
+          {overviewOnly && <ArrBridgeSummaryBlock bridgeMonths={bridgeMonths} />}
         </div>
 
         {/* Renewals (same periods as Bookings / Cash) */}

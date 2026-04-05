@@ -478,7 +478,7 @@ export default function ARRNewSchedule() {
     <>
       <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '1rem', marginBottom: '1.25rem' }}>
         <h1 style={{ margin: 0, fontSize: '1.5rem', fontWeight: 600, color: 'var(--text)' }}>
-          Schedule
+          ARR Schedule
         </h1>
         <button
           type="button"

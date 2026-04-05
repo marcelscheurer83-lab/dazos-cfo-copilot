@@ -50,6 +50,7 @@ from models import (
     SalesforceEODSnapshot,
     ARRScheduleDaily,
     ARRSchedulePeriod,
+    MonthlyArrSnapshot,
 )
 from schemas import (
     KPISummary,
@@ -2981,6 +2982,7 @@ async def _build_arr_history_data(db: AsyncSession) -> dict:
     HIST_RANGE = "ARR_Schedule!A1:ZZ2000"
     HIST_ROW_START = 184   # row 185, 0-indexed
     COL_NAME = 1           # col B = account name
+    COL_SF_ID = 2          # col C = 18-digit Salesforce account ID
     COL_AQ = 42            # col AQ = Jan 2022 (0-indexed; A=1…AQ=43 → index 42)
     # col CK = Nov 2025 (0-indexed; CK=89 → index 88). Verified: CK-AQ+1=47 months = Jan22..Nov25 ✓
 
@@ -3002,7 +3004,11 @@ async def _build_arr_history_data(db: AsyncSession) -> dict:
     snap = r_snap.scalar_one_or_none()
     sheet_as_of: Optional[str] = snap.as_of.isoformat() if snap else None
 
-    sheet_by_name: dict[str, dict[str, float]] = {}
+    # Keyed by 18-digit SF account ID where available; fall back to name for rows without an ID.
+    sheet_by_sf_id: dict[str, dict[str, float]] = {}   # sf_id  → monthly arr
+    sheet_id_to_name: dict[str, str] = {}              # sf_id  → sheet display name
+    sheet_by_name_no_id: dict[str, dict[str, float]] = {}  # name → monthly arr (no ID rows)
+
     if snap and snap.data_json:
         _data = json.loads(snap.data_json)
         for _row in _data[HIST_ROW_START:]:
@@ -3011,6 +3017,10 @@ async def _build_arr_history_data(db: AsyncSession) -> dict:
             _name = str(_row[COL_NAME]).strip() if len(_row) > COL_NAME else ""
             if not _name:
                 continue
+            _sf_id_raw = str(_row[COL_SF_ID]).strip() if len(_row) > COL_SF_ID else ""
+            # Accept 15- or 18-char alphanumeric SF IDs starting with "001"
+            _has_id = len(_sf_id_raw) in (15, 18) and _sf_id_raw.startswith("001")
+
             _monthly: dict[str, float] = {}
             for _i, _mk in enumerate(historical_months):
                 _ci = COL_AQ + _i
@@ -3018,12 +3028,22 @@ async def _build_arr_history_data(db: AsyncSession) -> dict:
                     _v = _to_float_sheet(_row[_ci])
                     if _v is not None and _v != 0.0:
                         _monthly[_mk] = _v
-            if _monthly:
-                # Merge (sum) into existing entry — handles duplicate rows for the same account name
-                existing = sheet_by_name.get(_name, {})
+
+            if not _monthly:
+                continue
+
+            if _has_id:
+                sheet_id_to_name[_sf_id_raw] = _name
+                existing = sheet_by_sf_id.get(_sf_id_raw, {})
                 for _mk, _v in _monthly.items():
                     existing[_mk] = round(existing.get(_mk, 0.0) + _v, 2)
-                sheet_by_name[_name] = existing
+                sheet_by_sf_id[_sf_id_raw] = existing
+            else:
+                # No valid SF ID — fall back to name keying (handles legacy/unnamed rows)
+                existing = sheet_by_name_no_id.get(_name, {})
+                for _mk, _v in _monthly.items():
+                    existing[_mk] = round(existing.get(_mk, 0.0) + _v, 2)
+                sheet_by_name_no_id[_name] = existing
 
     # ── 3. Salesforce months Dec '25 – current month ─────────────────────────────
     today_est = datetime.now(EST).date()
@@ -3102,8 +3122,8 @@ async def _build_arr_history_data(db: AsyncSession) -> dict:
                 return True
         return False
 
-    # compute per account, per SF month
-    sf_by_name: dict[str, dict[str, float]] = {}
+    # compute per account, per SF month — keyed by account_id
+    sf_by_id: dict[str, dict[str, float]] = {}   # account_id → monthly arr
     for _aid, _name in _sf_accounts.items():
         _acct_opps = _opps_by_aid.get(_aid, [])
         _monthly: dict[str, float] = {}
@@ -3115,20 +3135,40 @@ async def _build_arr_history_data(db: AsyncSession) -> dict:
             if _v != 0.0:
                 _monthly[_mk] = _v
         if _monthly:
-            # If multiple account_ids share the same name, merge values
-            existing = sf_by_name.get(_name, {})
+            existing = sf_by_id.get(_aid, {})
             for _mk, _v in _monthly.items():
                 existing[_mk] = round(existing.get(_mk, 0.0) + _v, 2)
-            sf_by_name[_name] = existing
+            sf_by_id[_aid] = existing
 
-    # ── 4. Merge sheet + Salesforce rows ─────────────────────────────────────────
-    all_names: set[str] = set(sheet_by_name.keys()) | set(sf_by_name.keys())
+    # ── 4. Merge sheet + Salesforce rows by account ID ───────────────────────────
+    # Primary key = SF account ID.  SF account name is the canonical display name.
+    # Sheet-only rows (churned before Dec '25 with no SF match) use the sheet name.
     rows: list[dict] = []
-    for _name in sorted(all_names, key=lambda x: x.lower()):
+
+    # All account IDs that appear in either source
+    all_ids: set[str] = set(sheet_by_sf_id.keys()) | set(sf_by_id.keys())
+    used_names: set[str] = set()
+
+    for _aid in all_ids:
+        _sf_name = _sf_accounts.get(_aid, "")
+        _sheet_name = sheet_id_to_name.get(_aid, "")
+        # Canonical name: prefer SF name (system of record), fall back to sheet name
+        _canon = _sf_name or _sheet_name
+        if not _canon:
+            continue
         _arr: dict[str, float] = {}
-        _arr.update(sheet_by_name.get(_name, {}))
-        _arr.update(sf_by_name.get(_name, {}))
-        rows.append({"account_name": _name, "arr_by_month": _arr})
+        _arr.update(sheet_by_sf_id.get(_aid, {}))   # historical (Jan 22 – Nov 25)
+        _arr.update(sf_by_id.get(_aid, {}))           # Dec 25 onwards
+        if _arr:
+            rows.append({"account_name": _canon, "arr_by_month": _arr})
+            used_names.add(_canon)
+
+    # Sheet rows that had no SF ID — include as-is (legacy / churned accounts)
+    for _name, _monthly in sheet_by_name_no_id.items():
+        if _name not in used_names:
+            rows.append({"account_name": _name, "arr_by_month": _monthly})
+
+    rows.sort(key=lambda r: r["account_name"].lower())
 
     return {
         "month_columns": historical_months + sf_months,
@@ -3239,6 +3279,259 @@ async def get_arr_cohort_churn(db: AsyncSession = Depends(get_db)):
         "max_offset": max_offset,
         "sheet_snapshot_as_of": data["sheet_snapshot_as_of"],
         "message": data["message"],
+    }
+
+
+async def _refresh_monthly_arr_snapshot(db: AsyncSession) -> dict:
+    """
+    Full-replace of ``monthly_arr_snapshots``.
+    Called at the end of every dataset refresh so the table stays current.
+    """
+    from sqlalchemy import delete as _sa_delete
+    try:
+        data = await _build_arr_history_data(db)
+        rows = data["rows"]
+        await db.execute(_sa_delete(MonthlyArrSnapshot))
+        new_rows = [
+            MonthlyArrSnapshot(account_name=row["account_name"], month_key=mk, arr=arr)
+            for row in rows
+            for mk, arr in row["arr_by_month"].items()
+            if arr and arr != 0.0
+        ]
+        db.add_all(new_rows)
+        await db.commit()
+        return {"ok": True, "rows_written": len(new_rows)}
+    except Exception as e:
+        await db.rollback()
+        return {"ok": False, "error": str(e)[:200]}
+
+
+def _mk_offset(mk: str, months: int) -> str:
+    """Return the YYYY-MM key that is ``months`` calendar months before (negative) or after (positive) ``mk``."""
+    y, mo = int(mk[:4]), int(mk[5:])
+    total = y * 12 + (mo - 1) + months
+    return f"{total // 12}-{(total % 12) + 1:02d}"
+
+
+@app.post("/api/arr-snapshot/refresh")
+async def post_arr_snapshot_refresh(db: AsyncSession = Depends(get_db)):
+    """Rebuild MonthlyArrSnapshot from current ARR history data (lightweight, no external API calls)."""
+    result = await _refresh_monthly_arr_snapshot(db)
+    return result
+
+
+@app.get("/api/arr-bridge/accounts")
+async def get_arr_bridge_accounts(
+    month: str = Query(..., description="YYYY-MM"),
+    component: str = Query(..., description="new_business | expansion | contraction | churn"),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Returns the individual accounts that make up a bridge component for a given month.
+    Used for drill-down from the Monthly ARR Movement chart.
+    """
+    prior_mk = _mk_offset(month, -1)
+
+    snap_r = await db.execute(
+        select(MonthlyArrSnapshot).where(
+            MonthlyArrSnapshot.month_key.in_([month, prior_mk])
+        )
+    )
+    snaps = snap_r.scalars().all()
+
+    curr:  dict[str, float] = {s.account_name: s.arr for s in snaps if s.month_key == month}
+    prior: dict[str, float] = {s.account_name: s.arr for s in snaps if s.month_key == prior_mk}
+    all_names = set(curr.keys()) | set(prior.keys())
+
+    accounts: list[dict] = []
+    for name in all_names:
+        a_curr  = curr.get(name, 0.0)
+        a_prior = prior.get(name, 0.0)
+        if component == "new_business" and a_prior == 0.0 and a_curr > 0.0:
+            accounts.append({"account_name": name, "arr": a_curr, "arr_change": round(a_curr, 2)})
+        elif component == "expansion" and a_prior > 0.0 and a_curr > a_prior:
+            accounts.append({"account_name": name, "arr": a_curr, "arr_change": round(a_curr - a_prior, 2)})
+        elif component == "contraction" and a_prior > 0.0 and 0.0 < a_curr < a_prior:
+            accounts.append({"account_name": name, "arr": a_curr, "arr_change": round(a_curr - a_prior, 2)})
+        elif component == "churn" and a_prior > 0.0 and a_curr == 0.0:
+            accounts.append({"account_name": name, "arr": 0.0, "arr_change": round(-a_prior, 2)})
+
+    # Look up SF account IDs from the opportunities table
+    if accounts:
+        names = [a["account_name"] for a in accounts]
+        id_r = await db.execute(
+            select(Opportunity.account_id, Opportunity.account_name)
+            .where(Opportunity.account_name.in_(names))
+            .distinct()
+        )
+        id_map: dict[str, str] = {}
+        for row in id_r:
+            if row.account_name not in id_map and row.account_id:
+                id_map[row.account_name] = row.account_id
+        for a in accounts:
+            a["sf_account_id"] = id_map.get(a["account_name"])
+
+    accounts.sort(key=lambda x: abs(x["arr_change"]), reverse=True)
+
+    base = os.getenv("SALESFORCE_BASE_URL", "").strip().rstrip("/")
+    return {
+        "accounts": accounts,
+        "month": month,
+        "component": component,
+        "salesforce_base_url": base or None,
+    }
+
+
+@app.get("/api/arr-bridge")
+async def get_arr_bridge(db: AsyncSession = Depends(get_db)):
+    """
+    ARR bridge (waterfall) and trailing-12M GRR / NRR for the last 13 calendar months.
+
+    Bridge components (each month M vs prior month M-1):
+    - **New Business**: accounts with $0 ARR in M-1 and >$0 in M
+    - **Expansion**: increase in ARR for accounts active in both months (arr_M > arr_M1 > 0)
+    - **Contraction**: decrease in ARR for accounts active in both months (0 < arr_M < arr_M1)
+    - **Churn**: ARR of accounts that had >$0 in M-1 and $0 in M
+
+    Trailing-12M NRR / GRR (as of month M):
+    - Cohort = all accounts with ARR > 0 in M-12
+    - Denominator = sum of their ARR in M-12
+    - NRR = sum of their current ARR in M (0 if churned) / denominator
+    - GRR = sum of min(arr_M, arr_M-12) per account / denominator  (capped, no expansion credit)
+    """
+    today_est = datetime.now(EST).date()
+    current_mk = today_est.strftime("%Y-%m")
+
+    # 13 displayed months (oldest first)
+    display_months: list[str] = []
+    _m = date(today_est.year, today_est.month, 1)
+    for _ in range(13):
+        display_months.insert(0, _m.strftime("%Y-%m"))
+        _m = date(_m.year - 1 if _m.month == 1 else _m.year, 12 if _m.month == 1 else _m.month - 1, 1)
+
+    # Fetch range: need M-12 of earliest shown month for NRR/GRR, plus M-1 for beginning ARR
+    fetch_from = _mk_offset(display_months[0], -13)   # 13 months before earliest shown
+    fetch_to = current_mk
+
+    # Check snapshot is populated
+    count_r = await db.execute(
+        select(func.count(MonthlyArrSnapshot.id)).where(MonthlyArrSnapshot.month_key <= fetch_to)
+    )
+    row_count = count_r.scalar_one()
+    if row_count == 0:
+        return {
+            "bridge": [], "retention": [], "display_months": display_months,
+            "message": "Monthly ARR snapshot not yet built. Run 'Refresh app data' to populate it.",
+        }
+
+    # Load all relevant rows
+    snap_r = await db.execute(
+        select(MonthlyArrSnapshot)
+        .where(MonthlyArrSnapshot.month_key >= fetch_from)
+        .where(MonthlyArrSnapshot.month_key <= fetch_to)
+    )
+    snap_rows = snap_r.scalars().all()
+
+    # arr_map[account_name][month_key] = arr
+    arr_map: dict[str, dict[str, float]] = {}
+    for s in snap_rows:
+        arr_map.setdefault(s.account_name, {})[s.month_key] = s.arr
+
+    all_accounts = list(arr_map.keys())
+
+    def get_arr(account: str, mk: str) -> float:
+        return arr_map.get(account, {}).get(mk, 0.0)
+
+    def total_arr(mk: str) -> float:
+        return round(sum(arr_map.get(a, {}).get(mk, 0.0) for a in all_accounts), 2)
+
+    bridge: list[dict] = []
+    retention: list[dict] = []
+
+    for mk in display_months:
+        prior_mk = _mk_offset(mk, -1)
+
+        beg = total_arr(prior_mk)
+        new_biz = exp = ctr = churn = 0.0
+
+        for acc in all_accounts:
+            a_prior = get_arr(acc, prior_mk)
+            a_curr  = get_arr(acc, mk)
+            if a_prior == 0.0 and a_curr > 0.0:
+                new_biz += a_curr
+            elif a_prior > 0.0 and a_curr > a_prior:
+                exp += a_curr - a_prior
+            elif a_prior > 0.0 and 0.0 < a_curr < a_prior:
+                ctr += a_prior - a_curr
+            elif a_prior > 0.0 and a_curr == 0.0:
+                churn += a_prior
+
+        end = total_arr(mk)
+        bridge.append({
+            "month": mk,
+            "beginning_arr": round(beg, 2),
+            "new_business": round(new_biz, 2),
+            "expansion": round(exp, 2),
+            "contraction": round(ctr, 2),
+            "churn": round(churn, 2),
+            "net_change": round(new_biz + exp - ctr - churn, 2),
+            "ending_arr": round(end, 2),
+        })
+
+        # Trailing 12M retention
+        m12 = _mk_offset(mk, -12)
+        cohort = [a for a in all_accounts if get_arr(a, m12) > 0.0]
+        if cohort:
+            denom = round(sum(get_arr(a, m12) for a in cohort), 2)
+            nrr_num = round(sum(get_arr(a, mk) for a in cohort), 2)
+            grr_num = round(sum(min(get_arr(a, mk), get_arr(a, m12)) for a in cohort), 2)
+            retention.append({
+                "month": mk,
+                "nrr_trailing_12m": round(nrr_num / denom * 100, 1) if denom > 0 else None,
+                "grr_trailing_12m": round(grr_num / denom * 100, 1) if denom > 0 else None,
+                "cohort_arr": denom,
+                "cohort_size": len(cohort),
+            })
+        else:
+            retention.append({
+                "month": mk,
+                "nrr_trailing_12m": None,
+                "grr_trailing_12m": None,
+                "cohort_arr": None,
+                "cohort_size": 0,
+            })
+
+    # ── YoY ARR growth — all available months ───────────────────────────────────
+    month_totals_r = await db.execute(
+        select(MonthlyArrSnapshot.month_key, func.sum(MonthlyArrSnapshot.arr).label("total"))
+        .group_by(MonthlyArrSnapshot.month_key)
+        .order_by(MonthlyArrSnapshot.month_key)
+    )
+    month_totals: dict[str, float] = {
+        row.month_key: round(row.total, 2) for row in month_totals_r
+    }
+    yoy: list[dict] = []
+    sorted_months = sorted(month_totals.keys())
+    for mk in sorted_months:
+        m12 = _mk_offset(mk, -12)
+        m1 = _mk_offset(mk, -1)
+        if m12 in month_totals:
+            prior = month_totals[m12]
+            pct = round((month_totals[mk] - prior) / prior * 100, 1) if prior > 0 else None
+            net_new = round(month_totals[mk] - month_totals.get(m1, 0.0), 2)
+            yoy.append({
+                "month": mk,
+                "ending_arr": month_totals[mk],
+                "net_new_arr": net_new,
+                "yoy_pct": pct,
+            })
+
+    return {
+        "bridge": bridge,
+        "retention": retention,
+        "yoy": yoy,
+        "display_months": display_months,
+        "message": None,
     }
 
 
@@ -9228,6 +9521,14 @@ async def _refresh_app_dataset() -> dict:
                 if not res.get("ok"):
                     await _persist_app_dataset_state(False, steps, res.get("error"))
                     return {"ok": False, "error": res.get("error"), "steps": steps}
+
+        # Materialize monthly ARR snapshot (used by /api/arr-bridge)
+        async with AsyncSessionLocal() as db:
+            arr_res = await _refresh_monthly_arr_snapshot(db)
+            steps.append({"step": "monthly_arr_snapshot", "ok": arr_res.get("ok"), "detail": arr_res})
+            if not arr_res.get("ok"):
+                await _persist_app_dataset_state(False, steps, arr_res.get("error"))
+                return {"ok": False, "error": arr_res.get("error"), "steps": steps}
 
     await _persist_app_dataset_state(True, steps, None)
     return {"ok": True, "steps": steps, "message": "Dataset refresh complete."}

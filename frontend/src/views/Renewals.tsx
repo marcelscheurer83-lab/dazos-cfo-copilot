@@ -731,7 +731,7 @@ export default function Renewals() {
 
   return (
     <>
-      <h1 style={{ margin: '0 0 1.5rem', fontSize: '1.5rem', fontWeight: 600, color: 'var(--text)' }}>Renewals (ARR)</h1>
+      <h1 style={{ margin: '0 0 1.5rem', fontSize: '1.5rem', fontWeight: 600, color: 'var(--text)' }}>Renewals</h1>
 
       {(filterStage.length > 0 || filterRenewalMonth.length > 0 || filterMidterm.length > 0 || chartSliceFilter != null) && (
         <p style={{ marginBottom: '1rem', display: 'flex', alignItems: 'center', gap: '0.75rem', flexWrap: 'wrap' }}>

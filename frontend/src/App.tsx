@@ -8,6 +8,7 @@ import ARR from './views/ARR'
 import ARRScheduleActiveArr from './views/ARRScheduleActiveArr'
 import ARRNewSchedule from './views/ARRNewSchedule'
 import ARRCohortChurn from './views/ARRCohortChurn'
+import ARRBridge from './views/ARRBridge'
 import Analytics from './views/Analytics'
 import AnalyticsCRMSeats from './views/AnalyticsCRMSeats'
 import Pipeline from './views/Pipeline'
@@ -79,6 +80,7 @@ export default function App() {
         <Route path="arr-schedule/active-arr" element={<ARRScheduleActiveArr />} />
         <Route path="arr-schedule/new-schedule" element={<ARRNewSchedule />} />
         <Route path="arr-schedule/cohort-churn" element={<ARRCohortChurn />} />
+        <Route path="arr-schedule/bridge" element={<ARRBridge />} />
         <Route path="analytics" element={<Analytics />} />
         <Route path="analytics/crm-seats" element={<AnalyticsCRMSeats />} />
         <Route path="arr" element={<Navigate to="/products-purchased" replace />} />

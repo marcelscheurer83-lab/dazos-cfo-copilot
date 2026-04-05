@@ -1134,6 +1134,67 @@ export async function getArrHistory(): Promise<ArrHistoryResponse> {
   return r.json()
 }
 
+// ── ARR Bridge ───────────────────────────────────────────────────────────────
+export type ArrBridgeMonth = {
+  month: string              // YYYY-MM
+  beginning_arr: number
+  new_business: number
+  expansion: number
+  contraction: number
+  churn: number
+  net_change: number
+  ending_arr: number
+}
+
+export type ArrRetentionMonth = {
+  month: string
+  nrr_trailing_12m: number | null
+  grr_trailing_12m: number | null
+  cohort_arr: number | null
+  cohort_size: number
+}
+
+export type ArrYoyMonth = {
+  month: string        // YYYY-MM
+  ending_arr: number
+  net_new_arr: number
+  yoy_pct: number | null
+}
+
+export type ArrBridgeResponse = {
+  bridge: ArrBridgeMonth[]
+  retention: ArrRetentionMonth[]
+  yoy: ArrYoyMonth[]
+  display_months: string[]
+  message: string | null
+}
+
+export async function getArrBridge(): Promise<ArrBridgeResponse> {
+  const r = await apiFetch('/arr-bridge')
+  if (!r.ok) throw new Error(`ARR Bridge fetch failed: HTTP ${r.status}`)
+  return r.json()
+}
+
+export type BridgeAccountRow = {
+  account_name: string
+  arr: number
+  arr_change: number
+  sf_account_id: string | null
+}
+
+export type BridgeAccountsResponse = {
+  accounts: BridgeAccountRow[]
+  month: string
+  component: string
+  salesforce_base_url: string | null
+}
+
+export async function getBridgeAccounts(month: string, component: string): Promise<BridgeAccountsResponse> {
+  const r = await apiFetch(`/arr-bridge/accounts?month=${encodeURIComponent(month)}&component=${encodeURIComponent(component)}`)
+  if (!r.ok) throw new Error(`Bridge accounts fetch failed: HTTP ${r.status}`)
+  return r.json()
+}
+
 // ── ARR Cohort Churn ─────────────────────────────────────────────────────────
 export type CohortMonth = {
   offset: number

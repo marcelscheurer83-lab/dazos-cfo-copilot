@@ -385,7 +385,7 @@ export default function ARRBridge() {
               />
               <Tooltip
                 contentStyle={{ background: '#1e1e2e', border: '1px solid var(--border)', fontSize: 12 }}
-                formatter={(v: any, name: string) =>
+                formatter={(v: any, name: any) =>
                   name === 'YoY Growth (%, right)' ? `${(+v).toFixed(1)}%` : fmtFull(v)
                 }
               />

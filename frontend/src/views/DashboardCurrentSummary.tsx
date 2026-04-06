@@ -119,13 +119,6 @@ const blockStyle: React.CSSProperties = {
   padding: '1rem 1.25rem',
 }
 
-/** Current Overview: Bookings / Renewals / Cash — slightly wider than half page, left-aligned with Live ARR row. */
-const overviewMtdBlockLayout: React.CSSProperties = {
-  maxWidth: '55%',
-  width: '100%',
-  justifySelf: 'start',
-  boxSizing: 'border-box',
-}
 
 /** Top-row ARR / CRM stat cards share one fixed width (matches Live ARR). */
 const dashboardArrStatCardStyle: React.CSSProperties = {
@@ -139,86 +132,6 @@ const dashboardArrStatCardStyle: React.CSSProperties = {
   boxSizing: 'border-box',
 }
 
-// ── ARR Bridge Summary (overview sidebar) ────────────────────────────────────
-
-function fmtBridgeAmt(n: number): string {
-  return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 }).format(n)
-}
-
-function getQtrMonthKeys(bridge: import('../api').ArrBridgeMonth[]): string[] {
-  if (!bridge.length) return []
-  const latest = bridge[bridge.length - 1].month // YYYY-MM
-  const [y, m] = latest.split('-').map(Number)
-  const qStart = Math.floor((m - 1) / 3) * 3 + 1
-  return [qStart, qStart + 1, qStart + 2]
-    .filter((mo) => mo <= m)
-    .map((mo) => `${y}-${String(mo).padStart(2, '0')}`)
-}
-
-function ArrBridgeSummaryBlock({ bridgeMonths }: { bridgeMonths: import('../api').ArrBridgeMonth[] }) {
-  const latest = bridgeMonths[bridgeMonths.length - 1]
-  const qKeys = getQtrMonthKeys(bridgeMonths)
-  const qMonths = bridgeMonths.filter((b) => qKeys.includes(b.month))
-  const qLabel = latest ? (() => {
-    const [y, m] = latest.month.split('-').map(Number)
-    const q = Math.ceil(m / 3)
-    return `Q${q} '${String(y).slice(2)} QTD`
-  })() : 'QTD'
-  const mLabel = latest ? (() => {
-    const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
-    const [y, m] = latest.month.split('-').map(Number)
-    return `${months[m - 1]} '${String(y).slice(2)}`
-  })() : '—'
-
-  const sum = (key: keyof import('../api').ArrBridgeMonth) =>
-    qMonths.reduce((s, b) => s + (b[key] as number), 0)
-
-  const qBeginning = qMonths.length ? qMonths[0].beginning_arr : 0
-  const qEnding    = qMonths.length ? qMonths[qMonths.length - 1].ending_arr : 0
-
-  const rows: { label: string; mVal: number; qVal: number; color?: string; bold?: boolean; sep?: boolean }[] = latest ? [
-    { label: 'Beginning ARR',  mVal: latest.beginning_arr, qVal: qBeginning,        color: 'var(--text-muted)' },
-    { label: '+ New Business', mVal: latest.new_business,  qVal: sum('new_business'), color: '#3b82f6' },
-    { label: '+ Expansion',    mVal: latest.expansion,     qVal: sum('expansion'),    color: '#22c55e' },
-    { label: '− Contraction',  mVal: latest.contraction,   qVal: sum('contraction'),  color: '#f97316' },
-    { label: '− Churn',        mVal: latest.churn,         qVal: sum('churn'),        color: '#ef4444' },
-    { label: 'Ending ARR',     mVal: latest.ending_arr,    qVal: qEnding,             bold: true, sep: true },
-  ] : []
-
-  return (
-    <div style={{ ...blockStyle, flex: 1, minWidth: 0, boxSizing: 'border-box' }}>
-      <div style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text)', marginBottom: '0.5rem' }}>
-        ARR Bridge
-      </div>
-      {!latest ? (
-        <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)', margin: 0 }}>Loading…</p>
-      ) : (
-        <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.8rem' }}>
-          <thead>
-            <tr style={{ borderBottom: '2px solid var(--border)' }}>
-              <th style={{ textAlign: 'left', padding: '0.3rem 0.5rem', color: 'var(--text-muted)', fontWeight: 600 }}></th>
-              <th style={{ textAlign: 'right', padding: '0.3rem 0.5rem', color: 'var(--text-muted)', fontWeight: 600 }}>{mLabel} MTD</th>
-              <th style={{ textAlign: 'right', padding: '0.3rem 0.5rem', color: 'var(--text-muted)', fontWeight: 600 }}>{qLabel}</th>
-            </tr>
-          </thead>
-          <tbody>
-            {rows.map(({ label, mVal, qVal, color, bold, sep }) => (
-              <tr key={label} style={{ borderBottom: sep ? '2px solid var(--border)' : '1px solid var(--border)' }}>
-                <td style={{ padding: '0.3rem 0.5rem', color: color ?? 'var(--text)', fontWeight: bold ? 700 : 400, whiteSpace: 'nowrap' }}>{label}</td>
-                <td style={{ padding: '0.3rem 0.5rem', textAlign: 'right', fontVariantNumeric: 'tabular-nums', color: color ?? 'var(--text)', fontWeight: bold ? 700 : 400 }}>
-                  {mVal === 0 ? '—' : fmtBridgeAmt(mVal)}
-                </td>
-                <td style={{ padding: '0.3rem 0.5rem', textAlign: 'right', fontVariantNumeric: 'tabular-nums', color: color ?? 'var(--text)', fontWeight: bold ? 700 : 400 }}>
-                  {qVal === 0 ? '—' : fmtBridgeAmt(qVal)}
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      )}
-    </div>
-  )
-}
 
 /** MTD tables: avoid fixed layout + zoom collapsing row heights; keep rows readable. */
 const mtTableStyle: React.CSSProperties = {
@@ -259,7 +172,6 @@ export default function DashboardCurrentSummary({ title = 'Current Performance' 
   const [yoyGrowth, setYoyGrowth] = useState<number | null>(null)
   const [nrr12m, setNrr12m] = useState<number | null>(null)
   const [grr12m, setGrr12m] = useState<number | null>(null)
-  const [bridgeMonths, setBridgeMonths] = useState<import('../api').ArrBridgeMonth[]>([])
 
   const loadAllDashboardData = useCallback(() => {
     const fixed = dashboardFixedPeriodsForTitle(title)
@@ -305,7 +217,7 @@ export default function DashboardCurrentSummary({ title = 'Current Performance' 
           setNrr12m(latestRet?.nrr_trailing_12m ?? null)
           setGrr12m(latestRet?.grr_trailing_12m ?? null)
           setYoyGrowth(latestYoy?.yoy_pct ?? null)
-          setBridgeMonths(res.bridge)
+
         })
         .catch(() => { /* non-critical — silently skip */ })
     }

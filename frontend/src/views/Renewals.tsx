@@ -158,7 +158,7 @@ function RenewalStackedBarSegments({
   return <>{parts}</>
 }
 
-type FilterColumn = 'stage' | 'midterm' | 'renewal_month'
+type FilterColumn = 'stage' | 'midterm' | 'renewal_month' | 'forecast_category'
 type SortKey =
   | 'account_name'
   | 'opportunity_name'
@@ -181,6 +181,7 @@ export default function Renewals() {
   const [filterStage, setFilterStage] = useState<string[]>(() => rv.stage)
   const [filterRenewalMonth, setFilterRenewalMonth] = useState<string[]>(() => rv.months)
   const [filterMidterm, setFilterMidterm] = useState<string[]>(() => rv.midterm)
+  const [filterForecast, setFilterForecast] = useState<string[]>([])
   const [chartSliceFilter, setChartSliceFilter] = useState<RenewalChartSliceFilter | null>(null)
   const [openFilter, setOpenFilter] = useState<FilterColumn | null>(null)
   const stageThRef = useRef<HTMLTableHeaderCellElement>(null)
@@ -189,6 +190,8 @@ export default function Renewals() {
   const midtermPopoverRef = useRef<HTMLDivElement>(null)
   const renewalDateThRef = useRef<HTMLTableHeaderCellElement>(null)
   const renewalDatePopoverRef = useRef<HTMLDivElement>(null)
+  const forecastThRef = useRef<HTMLTableHeaderCellElement>(null)
+  const forecastPopoverRef = useRef<HTMLDivElement>(null)
 
   const loadData = useCallback(() => {
     getRenewalsOverview({
@@ -219,13 +222,17 @@ export default function Renewals() {
         ? stageThRef
         : openFilter === 'midterm'
           ? midtermThRef
-          : renewalDateThRef
+          : openFilter === 'renewal_month'
+            ? renewalDateThRef
+            : forecastThRef
     const popRef =
       openFilter === 'stage'
         ? stagePopoverRef
         : openFilter === 'midterm'
           ? midtermPopoverRef
-          : renewalDatePopoverRef
+          : openFilter === 'renewal_month'
+            ? renewalDatePopoverRef
+            : forecastPopoverRef
     const handleClick = (e: MouseEvent) => {
       const t = e.target as Node
       if (thRef.current?.contains(t) || popRef.current?.contains(t)) return
@@ -296,10 +303,21 @@ export default function Renewals() {
     })
   }, [rows, sortKey, sortDir])
 
+  const forecastOptions = useMemo(() => {
+    const vals = [...new Set(rows.map((r) => r.forecast_category ?? '—'))].sort()
+    return vals
+  }, [rows])
+
   const displayRows = useMemo(() => {
-    if (chartSliceFilter == null) return sortedRows
-    return sortedRows.filter((r) => rowMatchesRenewalChartSlice(r, chartSliceFilter))
-  }, [sortedRows, chartSliceFilter])
+    let out = sortedRows
+    if (filterForecast.length > 0) {
+      out = out.filter((r) => filterForecast.includes(r.forecast_category ?? '—'))
+    }
+    if (chartSliceFilter != null) {
+      out = out.filter((r) => rowMatchesRenewalChartSlice(r, chartSliceFilter))
+    }
+    return out
+  }, [sortedRows, filterForecast, chartSliceFilter])
 
   const footerUp = useMemo(() => {
     if (chartSliceFilter == null) return data?.grand_up_for_renewal_arr ?? 0
@@ -711,6 +729,92 @@ export default function Renewals() {
     )
   }
 
+  const thFilterForecast = () => {
+    const col: FilterColumn = 'forecast_category'
+    const options = forecastOptions
+    const selected = filterForecast
+    const isOpen = openFilter === col
+    const hasActiveFilter = selected.length > 0
+    return (
+      <th
+        ref={forecastThRef}
+        style={{
+          textAlign: 'left',
+          padding: '0.5rem 0.75rem',
+          color: 'var(--text-muted)',
+          fontWeight: 500,
+          whiteSpace: 'nowrap',
+          position: 'relative',
+          verticalAlign: 'bottom',
+        }}
+      >
+        <span style={{ userSelect: 'none' }}>Forecast</span>
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation()
+            setOpenFilter((f) => (f === col ? null : col))
+          }}
+          title="Filter"
+          style={{
+            marginLeft: 4,
+            padding: 2,
+            background: hasActiveFilter ? 'var(--accent)' : 'transparent',
+            color: hasActiveFilter ? '#fff' : 'var(--text-muted)',
+            border: '1px solid var(--border)',
+            borderRadius: 4,
+            cursor: 'pointer',
+            lineHeight: 1,
+          }}
+        >
+          ⋮
+        </button>
+        {isOpen && (
+          <div ref={forecastPopoverRef} style={popoverStyle} onClick={(e) => e.stopPropagation()}>
+            <select
+              multiple
+              size={Math.min(8, Math.max(2, options.length))}
+              value={selected}
+              onChange={(e) => setFilterForecast(Array.from(e.target.selectedOptions, (o) => o.value))}
+              style={{
+                padding: '0.35rem 0.5rem',
+                fontSize: '0.9rem',
+                width: '100%',
+                border: '1px solid var(--border)',
+                borderRadius: 4,
+                background: 'var(--bg)',
+                color: 'var(--text)',
+              }}
+            >
+              {options.map((opt) => (
+                <option key={opt} value={opt}>{opt}</option>
+              ))}
+            </select>
+            <p style={{ fontSize: '0.75rem', color: 'var(--text-muted)', margin: '0.35rem 0 0' }}>Ctrl+click to select multiple</p>
+            {selected.length > 0 && (
+              <button
+                type="button"
+                onClick={() => setFilterForecast([])}
+                style={{
+                  marginTop: '0.35rem',
+                  padding: '0.25rem 0.5rem',
+                  fontSize: '0.8rem',
+                  cursor: 'pointer',
+                  background: 'var(--bg)',
+                  color: 'var(--text-muted)',
+                  border: '1px solid var(--border)',
+                  borderRadius: 4,
+                }}
+              >
+                Clear
+              </button>
+            )}
+          </div>
+        )}
+      </th>
+    )
+  }
+
   const linkStyle = { color: 'var(--accent)', textDecoration: 'none' }
 
   if (err) return <p style={{ color: 'var(--negative)' }}>{err}</p>
@@ -732,37 +836,6 @@ export default function Renewals() {
   return (
     <>
       <h1 style={{ margin: '0 0 1.5rem', fontSize: '1.5rem', fontWeight: 600, color: 'var(--text)' }}>Renewals</h1>
-
-      {(filterStage.length > 0 || filterRenewalMonth.length > 0 || filterMidterm.length > 0 || chartSliceFilter != null) && (
-        <p style={{ marginBottom: '1rem', display: 'flex', alignItems: 'center', gap: '0.75rem', flexWrap: 'wrap' }}>
-          <button
-            type="button"
-            onClick={() => {
-              setFilterStage([])
-              setFilterRenewalMonth([])
-              setFilterMidterm([])
-              setChartSliceFilter(null)
-              setOpenFilter(null)
-            }}
-            style={{
-              padding: '0.5rem 1rem',
-              fontSize: '0.9rem',
-              cursor: 'pointer',
-              background: 'var(--bg)',
-              color: 'var(--text-muted)',
-              border: '1px solid var(--border)',
-              borderRadius: 6,
-            }}
-          >
-            Reset filters
-          </button>
-          {chartSliceFilter != null && (
-            <span style={{ fontSize: '0.85rem', color: 'var(--text)' }}>
-              Table: <strong>{renewalChartSliceSummary(chartSliceFilter)}</strong>
-            </span>
-          )}
-        </p>
-      )}
 
       {chartRows.length > 0 && (
         <div style={{ marginBottom: '1.5rem', maxWidth: '100%', display: 'flex', gap: '2rem', flexWrap: 'wrap' }}>
@@ -1184,6 +1257,41 @@ export default function Renewals() {
         </div>
       )}
 
+      {(chartSliceFilter != null ||
+        filterStage.length > 0 ||
+        filterRenewalMonth.length > 0 ||
+        filterMidterm.length > 0 ||
+        filterForecast.length > 0) && (
+        <p style={{ marginBottom: '1rem', display: 'flex', alignItems: 'center', gap: '0.75rem', flexWrap: 'wrap' }}>
+          {chartSliceFilter != null && (
+            <span style={{ fontSize: '0.85rem', color: 'var(--text)' }}>
+              Table: <strong>{renewalChartSliceSummary(chartSliceFilter)}</strong>
+            </span>
+          )}
+          <button
+            type="button"
+            onClick={() => {
+              setFilterStage([])
+              setFilterRenewalMonth([])
+              setFilterMidterm([])
+              setFilterForecast([])
+              setChartSliceFilter(null)
+              setOpenFilter(null)
+            }}
+            style={{
+              padding: '0.5rem 1rem',
+              fontSize: '0.9rem',
+              cursor: 'pointer',
+              background: 'var(--bg)',
+              color: 'var(--text-muted)',
+              border: '1px solid var(--border)',
+              borderRadius: 6,
+            }}
+          >
+            Clear all filters
+          </button>
+        </p>
+      )}
       <div style={{ overflowX: 'auto' }}>
         <table style={{ width: '100%', minWidth: 720, borderCollapse: 'collapse', fontSize: '0.9rem', color: 'var(--text)' }}>
           <thead>
@@ -1191,6 +1299,7 @@ export default function Renewals() {
               {th('account_name', 'Account', 'left')}
               {th('opportunity_name', 'Opportunity', 'left')}
               {thFilterStage()}
+              {thFilterForecast()}
               {thFilterMidterm()}
               {thFilterRenewalDate()}
               {th('up_for_renewal_arr', 'Up for renewal ARR', 'right')}
@@ -1201,7 +1310,7 @@ export default function Renewals() {
           <tbody>
             <tr style={{ borderBottom: '1px solid var(--border)', fontWeight: 600, background: 'var(--surface)' }}>
               <td style={{ padding: '0.5rem 0.75rem', color: 'var(--text-muted)' }}>Total</td>
-              <td style={{ padding: '0.5rem 0.75rem' }} colSpan={4} />
+              <td style={{ padding: '0.5rem 0.75rem' }} colSpan={5} />
               <td style={{ textAlign: 'right', padding: '0.5rem 0.75rem', color: 'var(--text)' }}>{fmtMoney(footerUp)}</td>
               <td style={{ textAlign: 'right', padding: '0.5rem 0.75rem', color: 'var(--text)' }}>{fmtMoney(footerRen)}</td>
               <td
@@ -1255,6 +1364,7 @@ export default function Renewals() {
                   )}
                 </td>
                 <td style={{ padding: '0.5rem 0.75rem', whiteSpace: 'nowrap' }}>{row.stage_name}</td>
+                <td style={{ padding: '0.5rem 0.75rem', whiteSpace: 'nowrap' }}>{row.forecast_category ?? '—'}</td>
                 <td
                   style={{
                     padding: '0.5rem 0.75rem',
@@ -1284,7 +1394,7 @@ export default function Renewals() {
           <tfoot>
             <tr style={{ borderTop: '2px solid var(--border)', fontWeight: 600 }}>
               <td style={{ padding: '0.5rem 0.75rem', color: 'var(--text)' }}>Total</td>
-              <td style={{ padding: '0.5rem 0.75rem' }} colSpan={4} />
+              <td style={{ padding: '0.5rem 0.75rem' }} colSpan={5} />
               <td style={{ textAlign: 'right', padding: '0.5rem 0.75rem', color: 'var(--text)' }}>{fmtMoney(footerUp)}</td>
               <td style={{ textAlign: 'right', padding: '0.5rem 0.75rem', color: 'var(--text)' }}>{fmtMoney(footerRen)}</td>
               <td
@@ -1307,7 +1417,7 @@ export default function Renewals() {
       )}
       {rows.length > 0 && displayRows.length === 0 && (
         <p style={{ fontSize: '0.9rem', color: 'var(--text-muted)', marginTop: '0.5rem' }}>
-          No rows match the chart selection. Click the same segment again or use Reset filters.
+          No rows match the chart selection. Click the same segment again or use Clear all filters.
         </p>
       )}
     </>

@@ -164,6 +164,7 @@ class RenewalsOverviewRow(BaseModel):
     opportunity_sf_id: str
     opportunity_name: str
     stage_name: str
+    forecast_category: Optional[str] = None
     renewal_date: Optional[str] = None  # ISO date; dedicated Renewal Date when set, else Close Date
     midterm_cancellation_after_stage: Optional[str] = None  # "Yes" when Midterm_Cancellation__c is true; null when false
     up_for_renewal_arr: Optional[float] = None  # Original_ARR__c (stored as original_acv)

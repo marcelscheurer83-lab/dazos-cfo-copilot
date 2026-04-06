@@ -763,6 +763,7 @@ def _opp_soql_extra_fields() -> str:
         parts.append(_SALESFORCE_MIDTERM_CANCELLATION_FIELD)
     # Include ARR__c when present in org so we can fall back to it for opps without products
     parts.append("ARR__c")
+    parts.append("Forecast__c")
     return ", " + ", ".join(parts) if parts else ""
 
 
@@ -784,6 +785,7 @@ def _opp_soql_extra_fields_no_renewal_date() -> str:
         parts.append(_SALESFORCE_MIDTERM_CANCELLATION_FIELD)
     # Include ARR__c when present in org so we can fall back to it for opps without products
     parts.append("ARR__c")
+    parts.append("Forecast__c")
     return ", " + ", ".join(parts) if parts else ""
 DEFAULT_OPPORTUNITY_SOQL = (
     "SELECT Id, Name, Amount, CloseDate, StageName, Type, RecordType.Name, "
@@ -1550,6 +1552,7 @@ async def _run_salesforce_sync(db: AsyncSession) -> dict:
         contract_end_dt = _parse_date(rec.get(_SALESFORCE_CONTRACT_END_DATE_FIELD)) if _SALESFORCE_CONTRACT_END_DATE_FIELD else None
         midterm_val = rec.get(_SALESFORCE_MIDTERM_CANCELLATION_FIELD) if _SALESFORCE_MIDTERM_CANCELLATION_FIELD else None
         midterm_cancellation = 1 if midterm_val in (True, "true", "1", 1) or (isinstance(midterm_val, str) and midterm_val.strip().lower() == "true") else 0
+        forecast_cat = (rec.get("Forecast__c") or "").strip() or None
         opp = Opportunity(
             sf_id=sf_id,
             name=rec.get("Name"),
@@ -1569,6 +1572,7 @@ async def _run_salesforce_sync(db: AsyncSession) -> dict:
             contract_start_date=contract_start_dt,
             contract_end_date=contract_end_dt,
             midterm_cancellation=midterm_cancellation,
+            forecast_category=forecast_cat,
             created_date=_parse_datetime(rec.get("CreatedDate")),
         )
         db.add(opp)
@@ -3313,6 +3317,277 @@ def _mk_offset(mk: str, months: int) -> str:
     return f"{total // 12}-{(total % 12) + 1:02d}"
 
 
+# ── Forecast weights ─────────────────────────────────────────────────────────
+_FC_NB_EXP_WEIGHTS: dict[str, float] = {
+    "Commit":     0.90,
+    "Best Case":  0.60,
+    "Upside":     0.25,
+}
+_FC_RENEWAL_WEIGHTS: dict[str, float] = {
+    "Commit":           0.90,
+    "Best Case":        0.70,
+    "Positive Outlook": 0.90,
+    "Neutral":          0.70,
+    "At Risk":          0.10,
+    "Intent to Churn":  0.00,
+}
+
+# Sheet target config: Jan 2026 = column index 72 (BU)
+_FORECAST_SHEET_RANGE  = "ARR_Calculations_2026P!A1:ZZ1000"
+_FORECAST_COL_JAN2026  = 72   # BU = 0-indexed (column BU = Jan 2026)
+_FORECAST_ROW_NB         = 10  # row 11 (1-indexed) = New Business ARR target
+_FORECAST_ROW_EXP        = 11  # row 12 (1-indexed) = Expansion ARR target
+_FORECAST_ROW_RENEW_RATE = 51  # row 52 (1-indexed) = ARR renewal rate target
+
+
+@app.get("/api/forecast/current-quarter")
+async def get_forecast_current_quarter(db: AsyncSession = Depends(get_db)):
+    """
+    Quarter forecast for Bookings (NB + Expansion) and Renewals.
+    Actuals = Closed Won opps.  Pipeline = open opps weighted by Forecast__c.
+    Targets from ARR_Calculations_2026P sheet.
+    """
+    today_est = datetime.now(EST).date()
+    q_start_mo = ((today_est.month - 1) // 3) * 3 + 1
+    q_year = today_est.year
+    months: list[str] = [
+        f"{q_year}-{(q_start_mo + i):02d}" for i in range(3)
+    ]
+    q_label = f"Q{(q_start_mo - 1) // 3 + 1} '{str(q_year)[2:]}"
+
+    def _mk_to_date_range(mk: str) -> tuple[date, date]:
+        y, m = int(mk[:4]), int(mk[5:])
+        return date(y, m, 1), date(y, m, calendar.monthrange(y, m)[1])
+
+    # ── fetch all opps ──────────────────────────────────────────────────────
+    _q = select(Opportunity)
+    _r = await db.execute(_q)
+    all_opps: list[Opportunity] = list(_r.scalars().all())
+
+    overrides = await _get_record_type_overrides(db)
+
+    def _eff_rt(o: Opportunity) -> str:
+        _key = (o.sf_id or "").strip()
+        _ov = overrides.get(_key) or (overrides.get(_key[:15]) if len(_key) >= 15 else None)
+        return (_ov or o.record_type_name or "").strip()
+
+    def _booking_arr(o: Opportunity) -> float:
+        """Booking ARR for closed won opps — matches _closed_overview_arr_from_opportunity."""
+        rt = _eff_rt(o)
+        if _is_renewal_record_type(rt) or _is_amendment_record_type(rt) or _is_expansion_record_type(rt):
+            return _booking_arr_expansion_or_arr_c(o)
+        if _is_new_business_record_type(rt):
+            return max(0.0, float(o.opportunity_arr or 0))
+        return 0.0
+
+    # Build line-item ARR map for all open opps (same logic as pipeline overview)
+    open_sf_ids = {
+        o.sf_id for o in all_opps
+        if not _is_closed_won_stage(o.stage_name)
+        and not _is_closed_lost_stage(o.stage_name)
+        and o.sf_id
+    }
+    opp_to_line_arr = await _line_item_arr_for_opportunities(db, open_sf_ids)
+
+    def _pipeline_arr(o: Opportunity) -> float:
+        """Pipeline ARR — MRR×multiplier when set, else line-item ARR. Matches pipeline-overview."""
+        if o.mrr is not None and o.mrr != 0:
+            return round(float(o.mrr) * PIPELINE_ARR_MULTIPLIER, 2)
+        return opp_to_line_arr.get(o.sf_id, 0.0)
+
+    def _weighted(o: Opportunity, weights: dict[str, float]) -> float:
+        fc = (o.forecast_category or "").strip()
+        w = weights.get(fc, 0.0)
+        return _pipeline_arr(o) * w
+
+    # ── sheet targets ────────────────────────────────────────────────────────
+    snap_r = await db.execute(
+        select(SheetSnapshot)
+        .where(SheetSnapshot.range_name == _FORECAST_SHEET_RANGE)
+        .order_by(SheetSnapshot.as_of.desc())
+        .limit(1)
+    )
+    snap = snap_r.scalar_one_or_none()
+    sheet_data = json.loads(snap.data_json) if snap and snap.data_json else []
+
+    def _sheet_target(row_idx: int, mk: str) -> Optional[float]:
+        if not sheet_data:
+            return None
+        y, m = int(mk[:4]), int(mk[5:])
+        # Months since Jan 2026
+        col = _FORECAST_COL_JAN2026 + (y - 2026) * 12 + (m - 1)
+        row = sheet_data[row_idx] if row_idx < len(sheet_data) else []
+        v = row[col] if col < len(row) else None
+        return _to_float_sheet(v)
+
+    # ── build per-month data ─────────────────────────────────────────────────
+    nb_months, exp_months, renewal_months = [], [], []
+
+    for mk in months:
+        d_start, d_end = _mk_to_date_range(mk)
+        is_current = mk == today_est.strftime("%Y-%m")
+        # For current month, actuals run up to today; for past months use full month
+        actuals_end = today_est if is_current else d_end
+
+        # ── New Business ──────────────────────────────────────────────────
+        # Use same logic as _closed_won_arr_in_range for consistency with bookings view
+        _nb_total, nb_actual, _nb_exp = await _closed_won_arr_in_range(db, d_start, actuals_end)
+
+        nb_open = [
+            o for o in all_opps
+            if not _is_closed_won_stage(o.stage_name)
+            and not _is_closed_lost_stage(o.stage_name)
+            and _is_new_business_record_type(_eff_rt(o))
+            and not _is_excluded_from_bookings_nb_only(o, _eff_rt(o))
+            and o.close_date and d_start <= o.close_date <= d_end
+        ]
+        nb_pipe_weighted = sum(_weighted(o, _FC_NB_EXP_WEIGHTS) for o in nb_open)
+        nb_pipe_raw      = sum(_pipeline_arr(o) for o in nb_open)
+
+        nb_months.append({
+            "month": mk,
+            "actuals": round(nb_actual, 2),
+            "pipeline_weighted": round(nb_pipe_weighted, 2),
+            "pipeline_raw": round(nb_pipe_raw, 2),
+            "forecast": round(nb_actual + nb_pipe_weighted, 2),
+            "target": _sheet_target(_FORECAST_ROW_NB, mk),
+        })
+
+        # ── Expansion ─────────────────────────────────────────────────────
+        # _closed_won_arr_in_range returns (total, nb, expansion_mid_term)
+        # Expansion "upon renewal" is separate; match bookings view by adding both
+        _exp_total, _exp_nb, exp_mid = await _closed_won_arr_in_range(db, d_start, actuals_end)
+        exp_upon_renewal = await _closed_won_renewal_expansion_arr_in_range(db, d_start, actuals_end)
+        exp_actual = round(exp_mid + exp_upon_renewal, 2)
+
+        exp_open = [
+            o for o in all_opps
+            if not _is_closed_won_stage(o.stage_name)
+            and not _is_closed_lost_stage(o.stage_name)
+            and _is_expansion_record_type(_eff_rt(o))
+            and o.close_date and d_start <= o.close_date <= d_end
+        ]
+        exp_pipe_weighted = sum(_weighted(o, _FC_NB_EXP_WEIGHTS) for o in exp_open)
+        exp_pipe_raw      = sum(_pipeline_arr(o) for o in exp_open)
+
+        exp_months.append({
+            "month": mk,
+            "actuals": round(exp_actual, 2),
+            "pipeline_weighted": round(exp_pipe_weighted, 2),
+            "pipeline_raw": round(exp_pipe_raw, 2),
+            "forecast": round(exp_actual + exp_pipe_weighted, 2),
+            "target": _sheet_target(_FORECAST_ROW_EXP, mk),
+        })
+
+        # ── Renewals ──────────────────────────────────────────────────────
+        # Use _aggregate_renewals_actuals for actuals (matches dashboard exactly).
+        # Pipeline weights original_acv (same unit as UFR).
+
+        # All renewal opps for record-type override + exclusion already applied via _eff_rt
+        renewal_opps_all = [
+            o for o in all_opps
+            if _is_renewal_record_type(_eff_rt(o))
+        ]
+
+        # Full month UFR — all renewal opps whose renewal_date falls this month
+        ufr_full, _, _, _, _, _, _ = _aggregate_renewals_actuals(
+            renewal_opps_all,
+            lambda rd: d_start <= rd <= d_end,
+        )
+        due_arr = ufr_full
+
+        # Actuals: CW/CL renewal opps bucketed to this month by renewal_date,
+        # but use close_date <= actuals_end so already-closed deals count even if
+        # their renewal_date is later in the month (e.g. renewal_date=Apr 15, close_date=Mar 27).
+        actuals_opps = [
+            o for o in renewal_opps_all
+            if _is_renewal_effective_date_in_range(o, d_start, d_end)
+            and getattr(o, "midterm_cancellation", 0) != 1
+            and (_is_closed_won_stage(o.stage_name) or _is_closed_lost_stage(o.stage_name))
+            and (o.close_date is None or o.close_date <= actuals_end)
+        ]
+        ufr_closed = sum(float(o.original_acv or 0) for o in actuals_opps)
+        churn_a_val = sum(float(o.original_acv or 0) for o in actuals_opps if _is_closed_lost_stage(o.stage_name))
+        contr_a_val = sum(
+            max(0.0, float(o.original_acv or 0) - float(o.opportunity_arr or 0))
+            for o in actuals_opps
+            if _is_closed_won_stage(o.stage_name)
+            and float(o.opportunity_arr or 0) < float(o.original_acv or 0)
+        )
+        won_arr = round(max(0.0, ufr_closed - churn_a_val - contr_a_val), 2)
+        # Use full-month UFR as denominator so partial-month rates aren't inflated
+        # (e.g. 1 closed deal that renewed = 100% is misleading; use total due instead)
+        rate_a = round(won_arr / due_arr, 6) if due_arr > 0 else None
+
+        # Open pipeline for this month, weighted by Forecast__c using original_acv
+        renew_open = [
+            o for o in renewal_opps_all
+            if not _is_closed_won_stage(o.stage_name)
+            and not _is_closed_lost_stage(o.stage_name)
+            and getattr(o, "midterm_cancellation", 0) != 1
+            and _is_renewal_effective_date_in_range(o, d_start, d_end)
+        ]
+        def _renew_weighted(o: Opportunity) -> float:
+            fc = (o.forecast_category or "").strip()
+            w = _FC_RENEWAL_WEIGHTS.get(fc, 0.0)
+            return float(o.original_acv or 0) * w
+
+        renew_pipe_weighted = sum(_renew_weighted(o) for o in renew_open)
+        renew_pipe_raw      = sum(float(o.original_acv or 0) for o in renew_open)
+        forecast_arr = round(won_arr + renew_pipe_weighted, 2)
+        # rate_actual: use _aggregate result (denominator = closed UFR only, matching dashboard)
+        rate_actual   = round(rate_a * 100, 1) if rate_a is not None else None
+        # rate_forecast: (won + weighted pipeline) / full month UFR
+        rate_forecast = round(forecast_arr / due_arr * 100, 1) if due_arr > 0 else None
+        rate_target_raw = _sheet_target(_FORECAST_ROW_RENEW_RATE, mk)
+        rate_target   = round(rate_target_raw * 100, 1) if rate_target_raw is not None else None
+        renewal_months.append({
+            "month": mk,
+            "due_arr": round(due_arr, 2),
+            "won_arr": round(won_arr, 2),
+            "pipeline_weighted": round(renew_pipe_weighted, 2),
+            "pipeline_raw": round(renew_pipe_raw, 2),
+            "forecast_arr": forecast_arr,
+            "rate_actual": rate_actual,
+            "rate_forecast": rate_forecast,
+            "rate_target": rate_target,
+        })
+
+    # ── quarter totals ───────────────────────────────────────────────────────
+    def _sum(arr: list[dict], key: str) -> float:
+        return round(sum(m[key] for m in arr if m[key] is not None), 2)
+
+    def _avg(arr: list[dict], key: str) -> Optional[float]:
+        vals = [m[key] for m in arr if m[key] is not None]
+        return round(sum(vals) / len(vals), 1) if vals else None
+
+    base = os.getenv("SALESFORCE_BASE_URL", "").strip().rstrip("/")
+    return {
+        "quarter": q_label,
+        "months": months,
+        "new_business": nb_months,
+        "expansion": exp_months,
+        "renewals": renewal_months,
+        "quarter_totals": {
+            "nb_actuals":       _sum(nb_months,  "actuals"),
+            "nb_forecast":      _sum(nb_months,  "forecast"),
+            "nb_target":        _sum(nb_months,  "target") if all(m["target"] for m in nb_months) else None,
+            "exp_actuals":      _sum(exp_months, "actuals"),
+            "exp_forecast":     _sum(exp_months, "forecast"),
+            "exp_target":       _sum(exp_months, "target") if all(m["target"] for m in exp_months) else None,
+            "total_actuals":    round(_sum(nb_months, "actuals") + _sum(exp_months, "actuals"), 2),
+            "total_forecast":   round(_sum(nb_months, "forecast") + _sum(exp_months, "forecast"), 2),
+            "renewal_due":      _sum(renewal_months, "due_arr"),
+            "renewal_won":      _sum(renewal_months, "won_arr"),
+            "renewal_forecast": _sum(renewal_months, "forecast_arr"),
+            "rate_actual":      _avg(renewal_months, "rate_actual"),
+            "rate_forecast":    _avg(renewal_months, "rate_forecast"),
+            "rate_target":      _avg(renewal_months, "rate_target"),
+        },
+        "salesforce_base_url": base or None,
+    }
+
+
 @app.post("/api/arr-snapshot/refresh")
 async def post_arr_snapshot_refresh(db: AsyncSession = Depends(get_db)):
     """Rebuild MonthlyArrSnapshot from current ARR history data (lightweight, no external API calls)."""
@@ -4377,6 +4652,11 @@ def _bu54_percent_to_fraction(x: Optional[float]) -> Optional[float]:
 
 def _renewal_effective_date(o: Opportunity) -> Optional[date]:
     return o.renewal_date if o.renewal_date is not None else o.close_date
+
+
+def _is_renewal_effective_date_in_range(o: Opportunity, d_start: date, d_end: date) -> bool:
+    rd = _renewal_effective_date(o)
+    return rd is not None and d_start <= rd <= d_end
 
 
 def _renewal_delta_for_opp(o: Opportunity) -> tuple[Optional[float], Optional[float]]:
@@ -7975,6 +8255,7 @@ async def get_pipeline_overview(
             "opportunity_sf_id": o.sf_id,
             "opportunity_name": o.name or "—",
             "stage_name": _canonical_stage_name(o.stage_name),
+            "forecast_category": (o.forecast_category or "").strip() or None,
             "record_type_name": o.record_type_name or "—",
             "close_date": o.close_date.isoformat() if o.close_date else None,
             "arr": arr,
@@ -8106,6 +8387,7 @@ async def get_closed_overview(
             "record_type_name": _effective_record_type(o),
             "close_date": o.close_date.isoformat() if o.close_date else None,
             "arr": arr,
+            "forecast_category": (o.forecast_category or "").strip() or None,
         })
     rows.sort(key=lambda x: (-(date.fromisoformat(x["close_date"]) if x["close_date"] else date.min).toordinal(), -x["arr"]))
     out = {
@@ -8393,6 +8675,7 @@ async def get_renewals_overview(
                 opportunity_sf_id=o.sf_id,
                 opportunity_name=o.name or "—",
                 stage_name=st or "—",
+                forecast_category=(o.forecast_category or "").strip() or None,
                 renewal_date=renewal_iso,
                 midterm_cancellation_after_stage=midterm_after,
                 up_for_renewal_arr=up,

@@ -140,6 +140,7 @@ class Opportunity(Base):
     contract_end_date = Column(Date, nullable=True)  # Optional; from SF e.g. Contract_End_Date__c (New Business)
     owner_name = Column(String(255), nullable=True)  # Opportunity Owner (User) name from Salesforce
     midterm_cancellation = Column(Integer, default=0)  # 1 = Midterm Cancellation true on renewal (subscription ended at this opp's contract_end_date)
+    forecast_category = Column(String(64), nullable=True)  # SF Forecast__c picklist: Commit, Best Case, Upside, Positive Outlook, Neutral, At Risk, Intent to Churn
     created_date = Column(DateTime, nullable=True)
     synced_at = Column(DateTime, server_default=func.now())
 

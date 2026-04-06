@@ -746,6 +746,7 @@ export type PipelineOverviewRow = {
   opportunity_sf_id: string
   opportunity_name: string
   stage_name: string
+  forecast_category: string | null
   record_type_name: string
   close_date: string | null
   arr: number
@@ -815,6 +816,7 @@ export type RenewalsOverviewRow = {
   opportunity_sf_id: string
   opportunity_name: string
   stage_name: string
+  forecast_category: string | null
   renewal_date: string | null
   /** "Yes" when Midterm_Cancellation__c is true; null when false. */
   midterm_cancellation_after_stage: string | null
@@ -1220,6 +1222,70 @@ export type ArrCohortChurnResponse = {
 export async function getArrCohortChurn(): Promise<ArrCohortChurnResponse> {
   const r = await apiFetch('/arr-cohort-churn')
   if (!r.ok) throw new Error(`ARR Cohort Churn fetch failed: HTTP ${r.status}`)
+  return r.json()
+}
+
+// ── Forecast ──────────────────────────────────────────────────────────────────
+export type ForecastMonthNB = {
+  month: string
+  actuals: number
+  pipeline_weighted: number
+  pipeline_raw: number
+  forecast: number
+  target: number | null
+}
+
+export type ForecastMonthExp = {
+  month: string
+  actuals: number
+  pipeline_weighted: number
+  pipeline_raw: number
+  forecast: number
+  target: number | null
+}
+
+export type ForecastMonthRenewal = {
+  month: string
+  due_arr: number
+  won_arr: number
+  pipeline_weighted: number
+  pipeline_raw: number
+  forecast_arr: number
+  rate_actual: number | null
+  rate_forecast: number | null
+  rate_target: number | null
+}
+
+export type ForecastQuarterTotals = {
+  nb_actuals: number
+  nb_forecast: number
+  nb_target: number | null
+  exp_actuals: number
+  exp_forecast: number
+  exp_target: number | null
+  total_actuals: number
+  total_forecast: number
+  renewal_due: number
+  renewal_won: number
+  renewal_forecast: number
+  rate_actual: number | null
+  rate_forecast: number | null
+  rate_target: number | null
+}
+
+export type ForecastResponse = {
+  quarter: string
+  months: string[]
+  new_business: ForecastMonthNB[]
+  expansion: ForecastMonthExp[]
+  renewals: ForecastMonthRenewal[]
+  quarter_totals: ForecastQuarterTotals
+  salesforce_base_url: string | null
+}
+
+export async function getForecastCurrentQuarter(): Promise<ForecastResponse> {
+  const r = await apiFetch('/forecast/current-quarter')
+  if (!r.ok) throw new Error(`Forecast fetch failed: HTTP ${r.status}`)
   return r.json()
 }
 

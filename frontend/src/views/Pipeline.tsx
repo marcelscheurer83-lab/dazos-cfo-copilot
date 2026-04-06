@@ -2,13 +2,13 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { getPipelineOverview, type PipelineOverviewResponse } from '../api'
 import { loadPipelineFilters, savePipelineFilters } from '../tableFilterStorage'
 
-type FilterColumn = 'stage' | 'record_type' | 'close_date'
+type FilterColumn = 'stage' | 'record_type' | 'close_date' | 'forecast_category'
 
 function fmtMoney(n: number) {
   return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 }).format(n)
 }
 
-type SortKey = 'account_name' | 'opportunity_name' | 'stage_name' | 'record_type_name' | 'close_date' | 'arr'
+type SortKey = 'account_name' | 'opportunity_name' | 'stage_name' | 'record_type_name' | 'close_date' | 'arr' | 'forecast_category'
 type SortDir = 'asc' | 'desc'
 
 /** Same stage bucket as stacked charts (must match chartDataByStage). */
@@ -72,6 +72,7 @@ export default function Pipeline() {
   const [filterStage, setFilterStage] = useState<string[]>(() => pv.stage)
   const [filterRecordType, setFilterRecordType] = useState<string[]>(() => pv.recordType)
   const [filterCloseDate, setFilterCloseDate] = useState<string[]>(() => pv.closeDate)
+  const [filterForecast, setFilterForecast] = useState<string[]>([])
   /** Chart stack selection: close month + stage bucket (month null = all months). */
   const [chartSliceFilter, setChartSliceFilter] = useState<{ month: string | null; stage: string } | null>(
     () => pv.chartSlice
@@ -83,6 +84,8 @@ export default function Pipeline() {
   const recordTypePopoverRef = useRef<HTMLDivElement>(null)
   const closeDateThRef = useRef<HTMLTableHeaderCellElement>(null)
   const closeDatePopoverRef = useRef<HTMLDivElement>(null)
+  const forecastThRef = useRef<HTMLTableHeaderCellElement>(null)
+  const forecastPopoverRef = useRef<HTMLDivElement>(null)
 
   const loadData = useCallback(() => {
     getPipelineOverview({
@@ -113,13 +116,17 @@ export default function Pipeline() {
         ? stageThRef
         : openFilter === 'record_type'
           ? recordTypeThRef
-          : closeDateThRef
+          : openFilter === 'close_date'
+            ? closeDateThRef
+            : forecastThRef
     const popRef =
       openFilter === 'stage'
         ? stagePopoverRef
         : openFilter === 'record_type'
           ? recordTypePopoverRef
-          : closeDatePopoverRef
+          : openFilter === 'close_date'
+            ? closeDatePopoverRef
+            : forecastPopoverRef
     const handleClick = (e: MouseEvent) => {
       const t = e.target as Node
       if (thRef.current?.contains(t) || popRef.current?.contains(t)) return
@@ -258,8 +265,16 @@ export default function Pipeline() {
     return months.sort().reverse()
   }, [rows])
 
+  const forecastOptions = useMemo(() => {
+    const vals = [...new Set(rows.map((r) => r.forecast_category ?? '—'))].sort()
+    return vals
+  }, [rows])
+
   const displayRows = useMemo(() => {
     let out = sortedRows
+    if (filterForecast.length > 0) {
+      out = out.filter((r) => filterForecast.includes(r.forecast_category ?? '—'))
+    }
     if (filterCloseDate.length > 0) {
       out = out.filter((r) => {
         const m = toMonthKey(r.close_date ?? null)
@@ -277,7 +292,7 @@ export default function Pipeline() {
       })
     }
     return out
-  }, [sortedRows, filterCloseDate, chartSliceFilter])
+  }, [sortedRows, filterForecast, filterCloseDate, chartSliceFilter])
 
   const grandTotalDisplay = useMemo(() => {
     if (chartSliceFilter == null && filterCloseDate.length === 0) return grand_total
@@ -333,6 +348,7 @@ export default function Pipeline() {
     stage: 'stage_name',
     record_type: 'record_type_name',
     close_date: 'close_date',
+    forecast_category: 'forecast_category',
   }
 
   const thFilter = (
@@ -711,7 +727,8 @@ export default function Pipeline() {
       {(chartSliceFilter != null ||
         filterStage.length > 0 ||
         filterRecordType.length > 0 ||
-        filterCloseDate.length > 0) && (
+        filterCloseDate.length > 0 ||
+        filterForecast.length > 0) && (
         <p style={{ marginBottom: '1rem', display: 'flex', alignItems: 'center', gap: '0.75rem', flexWrap: 'wrap' }}>
           {chartSliceFilter != null && (
             <span style={{ fontSize: '0.85rem', color: 'var(--text)' }}>
@@ -721,13 +738,14 @@ export default function Pipeline() {
               <strong>{chartSliceFilter.stage}</strong>
             </span>
           )}
-          {(filterStage.length > 0 || filterRecordType.length > 0 || filterCloseDate.length > 0 || chartSliceFilter != null) && (
+          {(filterStage.length > 0 || filterRecordType.length > 0 || filterCloseDate.length > 0 || filterForecast.length > 0 || chartSliceFilter != null) && (
             <button
               type="button"
               onClick={() => {
                 setFilterStage([])
                 setFilterRecordType([])
                 setFilterCloseDate([])
+                setFilterForecast([])
                 setChartSliceFilter(null)
                 setOpenFilter(null)
               }}
@@ -753,6 +771,7 @@ export default function Pipeline() {
               {th('account_name', 'Account', 'left')}
               {th('opportunity_name', 'Opportunity', 'left')}
               {thFilter('stage', 'Stage', stageThRef, stagePopoverRef, data.stages ?? [], filterStage, setFilterStage)}
+              {thFilter('forecast_category', 'Forecast', forecastThRef, forecastPopoverRef, forecastOptions, filterForecast, setFilterForecast)}
               {thFilter('record_type', 'Record type', recordTypeThRef, recordTypePopoverRef, data.record_types ?? [], filterRecordType, setFilterRecordType)}
               {thFilter('close_date', 'Close date', closeDateThRef, closeDatePopoverRef, closeDateOptions, filterCloseDate, setFilterCloseDate, formatMonthLabel)}
               {th('arr', 'ARR', 'right')}
@@ -761,7 +780,7 @@ export default function Pipeline() {
           <tbody>
             <tr style={{ borderBottom: '1px solid var(--border)', fontWeight: 600, background: 'var(--surface)' }}>
               <td style={{ padding: '0.5rem 0.75rem', color: 'var(--text-muted)' }}>Total</td>
-              <td style={{ padding: '0.5rem 0.75rem' }} colSpan={4} />
+              <td style={{ padding: '0.5rem 0.75rem' }} colSpan={5} />
               <td style={{ textAlign: 'right', padding: '0.5rem 0.75rem', color: 'var(--text)' }}>{fmtMoney(grandTotalDisplay)}</td>
             </tr>
             {displayRows.map((row) => (
@@ -805,6 +824,7 @@ export default function Pipeline() {
                   )}
                 </td>
                 <td style={{ padding: '0.5rem 0.75rem', whiteSpace: 'nowrap' }}>{row.stage_name}</td>
+                <td style={{ padding: '0.5rem 0.75rem', whiteSpace: 'nowrap' }}>{row.forecast_category ?? '—'}</td>
                 <td style={{ padding: '0.5rem 0.75rem', whiteSpace: 'nowrap' }}>{row.record_type_name}</td>
                 <td style={{ padding: '0.5rem 0.75rem', whiteSpace: 'nowrap' }}>{row.close_date ?? '—'}</td>
                 <td style={{ textAlign: 'right', padding: '0.5rem 0.75rem', fontWeight: 500 }}>{fmtMoney(row.arr)}</td>
@@ -814,7 +834,7 @@ export default function Pipeline() {
           <tfoot>
             <tr style={{ borderTop: '2px solid var(--border)', fontWeight: 600 }}>
               <td style={{ padding: '0.5rem 0.75rem', color: 'var(--text)' }}>Total</td>
-              <td style={{ padding: '0.5rem 0.75rem' }} colSpan={4} />
+              <td style={{ padding: '0.5rem 0.75rem' }} colSpan={5} />
               <td style={{ textAlign: 'right', padding: '0.5rem 0.75rem', color: 'var(--text)' }}>{fmtMoney(grandTotalDisplay)}</td>
             </tr>
           </tfoot>

@@ -4073,6 +4073,28 @@ async def post_forecast_snapshot(db: AsyncSession = Depends(get_db)):
     return {"ok": True, "months_saved": saved, "snapshot_date": datetime.now(EST).date().isoformat()}
 
 
+@app.get("/api/forecast/observations")
+async def get_forecast_observations(db: AsyncSession = Depends(get_db)):
+    """Return the most recent AI forecast observations (pipeline health bullets)."""
+    import json as _json_obs2
+    row = (await db.execute(
+        select(AIForecastObservations).order_by(AIForecastObservations.scored_at.desc()).limit(1)
+    )).scalars().first()
+    if not row:
+        return {"observations": [], "scored_at": None, "quarter_label": None}
+    obs = []
+    if row.observations_json:
+        try:
+            obs = _json_obs2.loads(row.observations_json)
+        except Exception:
+            obs = []
+    return {
+        "observations": obs,
+        "scored_at": row.scored_at.isoformat() if row.scored_at else None,
+        "quarter_label": row.quarter_label,
+    }
+
+
 @app.get("/api/forecast/accuracy")
 async def get_forecast_accuracy(db: AsyncSession = Depends(get_db)):
     """

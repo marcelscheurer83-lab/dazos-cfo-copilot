@@ -1383,6 +1383,18 @@ export async function getAIForecastCurrentQuarter(): Promise<AIForecastResponse>
   return r.json()
 }
 
+export type AIObservationsResponse = {
+  observations: string[]
+  scored_at: string | null
+  quarter_label: string | null
+}
+
+export async function getAIObservations(): Promise<AIObservationsResponse> {
+  const r = await apiFetch('/forecast/observations')
+  if (!r.ok) throw new Error(`Observations fetch failed: HTTP ${r.status}`)
+  return r.json()
+}
+
 export async function triggerAIRescore(): Promise<{ ok: boolean; scored?: number; error?: string }> {
   const r = await apiFetch('/forecast/ai-rescore', { method: 'POST' })
   if (!r.ok) throw new Error(`AI rescore failed: HTTP ${r.status}`)

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { getPipelineOverview, type PipelineOverviewResponse } from '../api'
+import { getAIObservations, getPipelineOverview, type AIObservationsResponse, type PipelineOverviewResponse } from '../api'
 import { loadPipelineFilters, savePipelineFilters } from '../tableFilterStorage'
 
 type FilterColumn = 'stage' | 'record_type' | 'close_date' | 'forecast_category' | 'deal_tier'
@@ -64,6 +64,7 @@ function mergedPipelineChartStage(stageName: string | null | undefined): string 
 export default function Pipeline() {
   const [data, setData] = useState<PipelineOverviewResponse | null>(null)
   const [err, setErr] = useState<string | null>(null)
+  const [observations, setObservations] = useState<AIObservationsResponse | null>(null)
   const [sortKey, setSortKey] = useState<SortKey>('arr')
   const [sortDir, setSortDir] = useState<SortDir>('desc')
   const storedPipeline = useRef<ReturnType<typeof loadPipelineFilters> | null>(null)
@@ -103,6 +104,10 @@ export default function Pipeline() {
   useEffect(() => {
     loadData()
   }, [loadData])
+
+  useEffect(() => {
+    getAIObservations().then(setObservations).catch(() => {})
+  }, [])
 
   useEffect(() => {
     savePipelineFilters({
@@ -488,8 +493,49 @@ export default function Pipeline() {
   return (
     <>
       <h1 style={{ margin: '0 0 1.5rem', fontSize: '1.5rem', fontWeight: 600, color: 'var(--text)' }}>Pipeline</h1>
+      {/* ── Observations + Charts row ── */}
       {chartDataByStage.months.length > 0 && (
-        <div style={{ marginBottom: '1.5rem', maxWidth: '100%', display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '2rem', alignItems: 'stretch' }}>
+        <div style={{ marginBottom: '1.5rem', maxWidth: '100%', display: 'grid', gridTemplateColumns: '280px 1fr 1fr', gap: '1.5rem', alignItems: 'stretch' }}>
+
+          {/* Observations card */}
+          <div style={{
+            background: 'var(--surface)',
+            border: '1px solid var(--border)',
+            borderRadius: 8,
+            padding: '1rem 1rem 0.85rem',
+            display: 'flex',
+            flexDirection: 'column',
+            minHeight: 180,
+          }}>
+            <p style={{ margin: '0 0 0.15rem', fontSize: '0.65rem', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.07em', color: '#38bdf8' }}>
+              Dazos Forecast Agent
+            </p>
+            <p style={{ margin: '0 0 0.75rem', fontSize: '0.72rem', fontWeight: 600, color: 'var(--text)', letterSpacing: '0.02em' }}>
+              Observations
+            </p>
+            {!observations && (
+              <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)', marginTop: 'auto' }}>Loading…</p>
+            )}
+            {observations && observations.observations.length === 0 && (
+              <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)', lineHeight: 1.5 }}>
+                No observations yet. Run the AI rescore from the Forecast view to generate insights.
+              </p>
+            )}
+            {observations && observations.observations.length > 0 && (
+              <>
+                <ul style={{ margin: 0, paddingLeft: '1.1rem', display: 'flex', flexDirection: 'column', gap: '0.5rem', flex: 1 }}>
+                  {observations.observations.map((obs, i) => (
+                    <li key={i} style={{ fontSize: '0.8rem', color: 'var(--text)', lineHeight: 1.55 }}>{obs}</li>
+                  ))}
+                </ul>
+                {observations.scored_at && (
+                  <p style={{ margin: '0.75rem 0 0', fontSize: '0.68rem', color: 'var(--text-muted)' }}>
+                    Updated {new Date(observations.scored_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}
+                  </p>
+                )}
+              </>
+            )}
+          </div>
               <div style={{ minWidth: 0, display: 'flex', flexDirection: 'column' }}>
                 <div style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text)', marginBottom: '0.5rem' }}>Open pipeline by close month and stage (ARR)</div>
                 <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', background: 'var(--bg)', padding: '0.75rem 1rem', borderRadius: 6 }}>

@@ -418,216 +418,243 @@ export default function DashboardCurrentSummary({ title = 'Current Performance' 
         </p>
       )}
 
-      <div
-        style={{
-          display: 'grid',
-          gridTemplateColumns: 'repeat(auto-fill, minmax(min(320px, 100%), 1fr))',
-          gap: '1.25rem',
-          minWidth: 0,
-          width: '100%',
-        }}
-      >
-        {!isFixedQuarterDashboard(title) && (
-          <div
-            style={{
-              display: 'flex',
-              flexWrap: 'wrap',
-              gap: '1.25rem',
-              alignItems: 'stretch',
-              gridColumn: '1 / -1',
-              ...(overviewOnly ? { width: '100%', boxSizing: 'border-box' } : {}),
-            }}
-          >
-            <div style={{ ...dashboardArrStatCardStyle, ...(overviewOnly ? { flex: '1 1 0', minWidth: 0 } : {}) }}>
-              <div style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '0.35rem', textAlign: 'center' }}>
-                Live ARR
-              </div>
-              {arrErr && (
-                <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)', textAlign: 'center', margin: 0 }}>{arrErr}</p>
-              )}
-              {!arrErr && liveArrTotal != null && (
-                <div style={{ fontSize: '1.75rem', fontWeight: 700, color: 'var(--text)', textAlign: 'center' }}>
-                  {new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 }).format(liveArrTotal)}
-                </div>
-              )}
-              {!arrErr && liveArrTotal == null && (
-                <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)', textAlign: 'center', margin: 0 }}>Loading…</p>
-              )}
-            </div>
+      {/* ── Current Performance: 2-column layout (KPI stats + ARR Bridge left | tables right) ── */}
+      {overviewOnly && (
+        <div style={{ display: 'grid', gridTemplateColumns: '45fr 55fr', gap: '1.25rem', width: '100%', alignItems: 'start' }}>
 
-            <div style={{ ...dashboardArrStatCardStyle, ...(overviewOnly ? { flex: '1 1 0', minWidth: 0 } : {}) }}>
-              <div
-                style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '0.35rem', textAlign: 'center', lineHeight: 1.3, maxWidth: 220 }}
-                title="Live ARR plus Closed Won opportunities with a contract start after today."
-              >
-                Contracted ARR
-              </div>
-              {arrErr && (
-                <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)', textAlign: 'center', margin: 0 }}>{arrErr}</p>
-              )}
-              {!arrErr && liveCarrTotal != null && (
-                <div style={{ fontSize: '1.75rem', fontWeight: 700, color: 'var(--text)', textAlign: 'center' }}>
-                  {new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 }).format(liveCarrTotal)}
-                </div>
-              )}
-              {!arrErr && liveCarrTotal == null && (
-                <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)', textAlign: 'center', margin: 0 }}>Loading…</p>
-              )}
-            </div>
+          {/* LEFT column: KPI stat cards in 3×2 grid + ARR Bridge below */}
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '1.25rem' }}>
+            {!isFixedQuarterDashboard(title) && (
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '1.25rem' }}>
 
-            <div style={{ ...dashboardArrStatCardStyle, ...(overviewOnly ? { flex: '1 1 0', minWidth: 0 } : {}) }}>
-              <div
-                style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '0.35rem', textAlign: 'center', lineHeight: 1.3, maxWidth: 220 }}
-                title="Contracted ARR today minus ARR active at end of Dec '25 — net new ARR added year-to-date."
-              >
-                Net New Contracted ARR YTD
-              </div>
-              {arrErr && (
-                <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)', textAlign: 'center', margin: 0 }}>{arrErr}</p>
-              )}
-              {!arrErr && netNewCarrYtd != null && (
-                <>
-                  <div style={{ fontSize: '1.75rem', fontWeight: 700, color: 'var(--text)', textAlign: 'center' }}>
-                    {new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 }).format(netNewCarrYtd)}
-                  </div>
-                  {overviewTargets?.net_new_carr_ytd_target != null && overviewTargets.net_new_carr_ytd_target !== 0 && (
-                    <div style={{ fontSize: '0.85rem', color: 'var(--text-muted)', textAlign: 'center', marginTop: '0.2rem' }}>
-                      {`(${Math.round(netNewCarrYtd / overviewTargets.net_new_carr_ytd_target * 100)}% of plan)`}
+                <div style={{ ...dashboardArrStatCardStyle, flex: undefined }}>
+                  <div style={{ fontSize: '0.8rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '0.35rem', textAlign: 'center' }}>Live ARR</div>
+                  {arrErr && <p style={{ fontSize: '0.75rem', color: 'var(--text-muted)', textAlign: 'center', margin: 0 }}>{arrErr}</p>}
+                  {!arrErr && liveArrTotal != null && (
+                    <div style={{ fontSize: '1.4rem', fontWeight: 700, color: 'var(--text)', textAlign: 'center' }}>
+                      {new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 }).format(liveArrTotal)}
                     </div>
                   )}
-                </>
-              )}
-              {!arrErr && netNewCarrYtd == null && (
-                <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)', textAlign: 'center', margin: 0 }}>Loading…</p>
-              )}
-            </div>
-
-            {/* ── ARR Growth YoY ── */}
-            <div style={{ ...dashboardArrStatCardStyle, ...(overviewOnly ? { flex: '1 1 0', minWidth: 0 } : {}) }}>
-              <div style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '0.35rem', textAlign: 'center' }}>
-                ARR Growth YoY
-              </div>
-              {yoyGrowth != null ? (
-                <div style={{ fontSize: '1.75rem', fontWeight: 700, textAlign: 'center', color: yoyGrowth >= 20 ? 'var(--positive, #22c55e)' : yoyGrowth >= 0 ? '#f59e0b' : 'var(--negative, #ef4444)' }}>
-                  {yoyGrowth}%
+                  {!arrErr && liveArrTotal == null && <p style={{ fontSize: '0.75rem', color: 'var(--text-muted)', textAlign: 'center', margin: 0 }}>Loading…</p>}
                 </div>
-              ) : (
-                <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)', textAlign: 'center', margin: 0 }}>Loading…</p>
-              )}
+
+                <div style={{ ...dashboardArrStatCardStyle, flex: undefined }}>
+                  <div style={{ fontSize: '0.8rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '0.35rem', textAlign: 'center', lineHeight: 1.3 }}
+                    title="Live ARR plus Closed Won opportunities with a contract start after today.">
+                    Contracted ARR
+                  </div>
+                  {arrErr && <p style={{ fontSize: '0.75rem', color: 'var(--text-muted)', textAlign: 'center', margin: 0 }}>{arrErr}</p>}
+                  {!arrErr && liveCarrTotal != null && (
+                    <div style={{ fontSize: '1.4rem', fontWeight: 700, color: 'var(--text)', textAlign: 'center' }}>
+                      {new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 }).format(liveCarrTotal)}
+                    </div>
+                  )}
+                  {!arrErr && liveCarrTotal == null && <p style={{ fontSize: '0.75rem', color: 'var(--text-muted)', textAlign: 'center', margin: 0 }}>Loading…</p>}
+                </div>
+
+                <div style={{ ...dashboardArrStatCardStyle, flex: undefined }}>
+                  <div style={{ fontSize: '0.8rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '0.35rem', textAlign: 'center', lineHeight: 1.3 }}
+                    title="Contracted ARR today minus ARR active at end of Dec '25 — net new ARR added year-to-date.">
+                    Net New Contracted ARR YTD
+                  </div>
+                  {arrErr && <p style={{ fontSize: '0.75rem', color: 'var(--text-muted)', textAlign: 'center', margin: 0 }}>{arrErr}</p>}
+                  {!arrErr && netNewCarrYtd != null && (
+                    <>
+                      <div style={{ fontSize: '1.4rem', fontWeight: 700, color: 'var(--text)', textAlign: 'center' }}>
+                        {new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 }).format(netNewCarrYtd)}
+                      </div>
+                      {overviewTargets?.net_new_carr_ytd_target != null && overviewTargets.net_new_carr_ytd_target !== 0 && (
+                        <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)', textAlign: 'center', marginTop: '0.2rem' }}>
+                          {`(${Math.round(netNewCarrYtd / overviewTargets.net_new_carr_ytd_target * 100)}% of plan)`}
+                        </div>
+                      )}
+                    </>
+                  )}
+                  {!arrErr && netNewCarrYtd == null && <p style={{ fontSize: '0.75rem', color: 'var(--text-muted)', textAlign: 'center', margin: 0 }}>Loading…</p>}
+                </div>
+
+                <div style={{ ...dashboardArrStatCardStyle, flex: undefined }}>
+                  <div style={{ fontSize: '0.8rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '0.35rem', textAlign: 'center' }}>ARR Growth YoY</div>
+                  {yoyGrowth != null ? (
+                    <div style={{ fontSize: '1.4rem', fontWeight: 700, textAlign: 'center', color: yoyGrowth >= 20 ? 'var(--positive, #22c55e)' : yoyGrowth >= 0 ? '#f59e0b' : 'var(--negative, #ef4444)' }}>
+                      {yoyGrowth}%
+                    </div>
+                  ) : <p style={{ fontSize: '0.75rem', color: 'var(--text-muted)', textAlign: 'center', margin: 0 }}>Loading…</p>}
+                </div>
+
+                <div style={{ ...dashboardArrStatCardStyle, flex: undefined }}>
+                  <div style={{ fontSize: '0.8rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '0.35rem', textAlign: 'center' }}>Net Revenue Retention</div>
+                  {nrr12m != null ? (
+                    <>
+                      <div style={{ fontSize: '1.4rem', fontWeight: 700, textAlign: 'center', color: nrr12m >= 100 ? 'var(--positive, #22c55e)' : nrr12m >= 85 ? '#f59e0b' : 'var(--negative, #ef4444)' }}>
+                        {nrr12m}%
+                      </div>
+                      <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)', textAlign: 'center', marginTop: '0.2rem' }}>Trailing 12M</div>
+                    </>
+                  ) : <p style={{ fontSize: '0.75rem', color: 'var(--text-muted)', textAlign: 'center', margin: 0 }}>Loading…</p>}
+                </div>
+
+                <div style={{ ...dashboardArrStatCardStyle, flex: undefined }}>
+                  <div style={{ fontSize: '0.8rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '0.35rem', textAlign: 'center' }}>Gross Revenue Retention</div>
+                  {grr12m != null ? (
+                    <>
+                      <div style={{ fontSize: '1.4rem', fontWeight: 700, textAlign: 'center', color: grr12m >= 90 ? 'var(--positive, #22c55e)' : grr12m >= 75 ? '#f59e0b' : 'var(--negative, #ef4444)' }}>
+                        {grr12m}%
+                      </div>
+                      <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)', textAlign: 'center', marginTop: '0.2rem' }}>Trailing 12M</div>
+                    </>
+                  ) : <p style={{ fontSize: '0.75rem', color: 'var(--text-muted)', textAlign: 'center', margin: 0 }}>Loading…</p>}
+                </div>
+
+              </div>
+            )}
+
+            {/* ARR Bridge below KPI cards */}
+            <ArrBridgeSummaryBlock bridgeMonths={bridgeMonths} />
+          </div>
+
+          {/* RIGHT column: Bookings, Renewals, Cash stacked */}
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '1.25rem' }}>
+
+            <div style={{ ...blockStyle }}>
+              <div style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text)', marginBottom: '0.5rem' }}>Bookings (ARR)</div>
+              {bookingsErr && <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>{normalizeFetchError(bookingsErr, 'Bookings')}</p>}
+              {!bookingsErr && bookingsMTD && <BookingsMTDBlock data={bookingsMTD} overviewOnly={overviewOnly} hidePipeCov={false} />}
+              {!bookingsErr && !bookingsMTD && <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>Loading…</p>}
             </div>
 
-            {/* ── T12M NRR ── */}
-            <div style={{ ...dashboardArrStatCardStyle, ...(overviewOnly ? { flex: '1 1 0', minWidth: 0 } : {}) }}>
-              <div style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '0.35rem', textAlign: 'center' }}>
-                Net Revenue Retention
-              </div>
-              {nrr12m != null ? (
-                <>
-                  <div style={{ fontSize: '1.75rem', fontWeight: 700, textAlign: 'center', color: nrr12m >= 100 ? 'var(--positive, #22c55e)' : nrr12m >= 85 ? '#f59e0b' : 'var(--negative, #ef4444)' }}>
-                    {nrr12m}%
-                  </div>
-                  <div style={{ fontSize: '0.85rem', color: 'var(--text-muted)', textAlign: 'center', marginTop: '0.2rem' }}>Trailing 12M</div>
-                </>
-              ) : (
-                <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)', textAlign: 'center', margin: 0 }}>Loading…</p>
-              )}
+            <div style={{ ...blockStyle }}>
+              <div style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text)', marginBottom: '0.5rem' }}>Renewals (ARR)</div>
+              {renewalsErr && <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>{renewalsErr}</p>}
+              {!renewalsErr && renewalsMTD && <RenewalsMTDBlock data={renewalsMTD} overviewOnly={overviewOnly} />}
+              {!renewalsErr && !renewalsMTD && <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>Loading…</p>}
             </div>
 
-            {/* ── T12M GRR ── */}
-            <div style={{ ...dashboardArrStatCardStyle, ...(overviewOnly ? { flex: '1 1 0', minWidth: 0 } : {}) }}>
-              <div style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '0.35rem', textAlign: 'center' }}>
-                Gross Revenue Retention
-              </div>
-              {grr12m != null ? (
-                <>
-                  <div style={{ fontSize: '1.75rem', fontWeight: 700, textAlign: 'center', color: grr12m >= 90 ? 'var(--positive, #22c55e)' : grr12m >= 75 ? '#f59e0b' : 'var(--negative, #ef4444)' }}>
-                    {grr12m}%
-                  </div>
-                  <div style={{ fontSize: '0.85rem', color: 'var(--text-muted)', textAlign: 'center', marginTop: '0.2rem' }}>Trailing 12M</div>
-                </>
-              ) : (
-                <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)', textAlign: 'center', margin: 0 }}>Loading…</p>
-              )}
+            <div style={{ ...blockStyle }}>
+              <div style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text)', marginBottom: '0.5rem' }}>Cash</div>
+              {cashErr && <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>{normalizeFetchError(cashErr, 'Cash')}</p>}
+              {!cashErr && cashMTD && <CashMTDBlock data={cashMTD} overviewOnly={overviewOnly} />}
+              {!cashErr && !cashMTD && <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>Loading…</p>}
             </div>
 
           </div>
-        )}
-
-        {/* Block 1: Bookings (+ ARR Bridge table in overview mode) */}
-        <div style={{
-          gridColumn: '1 / -1',
-          display: overviewOnly ? 'grid' : 'flex',
-          gridTemplateColumns: overviewOnly ? '55fr 45fr' : undefined,
-          gap: '1.25rem',
-          alignItems: 'flex-start',
-          minWidth: 0,
-          width: '100%',
-          boxSizing: 'border-box',
-        }}>
-          <div style={{ ...blockStyle, minWidth: 0, ...(overviewOnly ? {} : { flex: '1 1 auto' }) }}>
-            <div style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text)', marginBottom: '0.5rem' }}>
-              Bookings (ARR)
-            </div>
-            {bookingsErr && (
-              <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>{normalizeFetchError(bookingsErr, 'Bookings')}</p>
-            )}
-            {!bookingsErr && bookingsMTD && (
-              <BookingsMTDBlock data={bookingsMTD} overviewOnly={overviewOnly} hidePipeCov={isFixedQuarterDashboard(title)} />
-            )}
-            {!bookingsErr && !bookingsMTD && (
-              <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>Loading…</p>
-            )}
-          </div>
-
-          {/* ARR Bridge summary — overview only */}
-          {overviewOnly && <ArrBridgeSummaryBlock bridgeMonths={bridgeMonths} />}
         </div>
+      )}
 
-        {/* Renewals (same periods as Bookings / Cash) */}
+      {/* ── Fixed quarter dashboards (Q1, Q2 etc): original full-width grid layout ── */}
+      {!overviewOnly && (
         <div
           style={{
-            ...blockStyle,
-            gridColumn: '1 / -1',
+            display: 'grid',
+            gridTemplateColumns: 'repeat(auto-fill, minmax(min(320px, 100%), 1fr))',
+            gap: '1.25rem',
             minWidth: 0,
-            ...(overviewOnly ? overviewMtdBlockLayout : {}),
+            width: '100%',
           }}
         >
-          <div style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text)', marginBottom: '0.5rem' }}>
-            Renewals (ARR)
-          </div>
-          {renewalsErr && (
-            <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>{renewalsErr}</p>
+          {!isFixedQuarterDashboard(title) && (
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: '1.25rem', alignItems: 'stretch', gridColumn: '1 / -1' }}>
+              <div style={{ ...dashboardArrStatCardStyle }}>
+                <div style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '0.35rem', textAlign: 'center' }}>Live ARR</div>
+                {arrErr && <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)', textAlign: 'center', margin: 0 }}>{arrErr}</p>}
+                {!arrErr && liveArrTotal != null && (
+                  <div style={{ fontSize: '1.75rem', fontWeight: 700, color: 'var(--text)', textAlign: 'center' }}>
+                    {new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 }).format(liveArrTotal)}
+                  </div>
+                )}
+                {!arrErr && liveArrTotal == null && <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)', textAlign: 'center', margin: 0 }}>Loading…</p>}
+              </div>
+              <div style={{ ...dashboardArrStatCardStyle }}>
+                <div style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '0.35rem', textAlign: 'center', lineHeight: 1.3, maxWidth: 220 }}
+                  title="Live ARR plus Closed Won opportunities with a contract start after today.">
+                  Contracted ARR
+                </div>
+                {arrErr && <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)', textAlign: 'center', margin: 0 }}>{arrErr}</p>}
+                {!arrErr && liveCarrTotal != null && (
+                  <div style={{ fontSize: '1.75rem', fontWeight: 700, color: 'var(--text)', textAlign: 'center' }}>
+                    {new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 }).format(liveCarrTotal)}
+                  </div>
+                )}
+                {!arrErr && liveCarrTotal == null && <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)', textAlign: 'center', margin: 0 }}>Loading…</p>}
+              </div>
+              <div style={{ ...dashboardArrStatCardStyle }}>
+                <div style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '0.35rem', textAlign: 'center', lineHeight: 1.3, maxWidth: 220 }}
+                  title="Contracted ARR today minus ARR active at end of Dec '25 — net new ARR added year-to-date.">
+                  Net New Contracted ARR YTD
+                </div>
+                {arrErr && <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)', textAlign: 'center', margin: 0 }}>{arrErr}</p>}
+                {!arrErr && netNewCarrYtd != null && (
+                  <>
+                    <div style={{ fontSize: '1.75rem', fontWeight: 700, color: 'var(--text)', textAlign: 'center' }}>
+                      {new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 }).format(netNewCarrYtd)}
+                    </div>
+                    {overviewTargets?.net_new_carr_ytd_target != null && overviewTargets.net_new_carr_ytd_target !== 0 && (
+                      <div style={{ fontSize: '0.85rem', color: 'var(--text-muted)', textAlign: 'center', marginTop: '0.2rem' }}>
+                        {`(${Math.round(netNewCarrYtd / overviewTargets.net_new_carr_ytd_target * 100)}% of plan)`}
+                      </div>
+                    )}
+                  </>
+                )}
+                {!arrErr && netNewCarrYtd == null && <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)', textAlign: 'center', margin: 0 }}>Loading…</p>}
+              </div>
+              <div style={{ ...dashboardArrStatCardStyle }}>
+                <div style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '0.35rem', textAlign: 'center' }}>ARR Growth YoY</div>
+                {yoyGrowth != null ? (
+                  <div style={{ fontSize: '1.75rem', fontWeight: 700, textAlign: 'center', color: yoyGrowth >= 20 ? 'var(--positive, #22c55e)' : yoyGrowth >= 0 ? '#f59e0b' : 'var(--negative, #ef4444)' }}>
+                    {yoyGrowth}%
+                  </div>
+                ) : <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)', textAlign: 'center', margin: 0 }}>Loading…</p>}
+              </div>
+              <div style={{ ...dashboardArrStatCardStyle }}>
+                <div style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '0.35rem', textAlign: 'center' }}>Net Revenue Retention</div>
+                {nrr12m != null ? (
+                  <>
+                    <div style={{ fontSize: '1.75rem', fontWeight: 700, textAlign: 'center', color: nrr12m >= 100 ? 'var(--positive, #22c55e)' : nrr12m >= 85 ? '#f59e0b' : 'var(--negative, #ef4444)' }}>
+                      {nrr12m}%
+                    </div>
+                    <div style={{ fontSize: '0.85rem', color: 'var(--text-muted)', textAlign: 'center', marginTop: '0.2rem' }}>Trailing 12M</div>
+                  </>
+                ) : <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)', textAlign: 'center', margin: 0 }}>Loading…</p>}
+              </div>
+              <div style={{ ...dashboardArrStatCardStyle }}>
+                <div style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '0.35rem', textAlign: 'center' }}>Gross Revenue Retention</div>
+                {grr12m != null ? (
+                  <>
+                    <div style={{ fontSize: '1.75rem', fontWeight: 700, textAlign: 'center', color: grr12m >= 90 ? 'var(--positive, #22c55e)' : grr12m >= 75 ? '#f59e0b' : 'var(--negative, #ef4444)' }}>
+                      {grr12m}%
+                    </div>
+                    <div style={{ fontSize: '0.85rem', color: 'var(--text-muted)', textAlign: 'center', marginTop: '0.2rem' }}>Trailing 12M</div>
+                  </>
+                ) : <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)', textAlign: 'center', margin: 0 }}>Loading…</p>}
+              </div>
+            </div>
           )}
-          {!renewalsErr && renewalsMTD && <RenewalsMTDBlock data={renewalsMTD} overviewOnly={overviewOnly} />}
-          {!renewalsErr && !renewalsMTD && (
-            <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>Loading…</p>
-          )}
-        </div>
 
-        {/* Block 2: Cash */}
-        <div
-          style={{
-            ...blockStyle,
-            gridColumn: '1 / -1',
-            minWidth: 0,
-            ...(overviewOnly ? overviewMtdBlockLayout : {}),
-          }}
-        >
-          <div style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text)', marginBottom: '0.5rem' }}>
-            Cash
+          <div style={{ gridColumn: '1 / -1', display: 'flex', gap: '1.25rem', alignItems: 'flex-start', minWidth: 0, width: '100%', boxSizing: 'border-box' }}>
+            <div style={{ ...blockStyle, minWidth: 0, flex: '1 1 auto' }}>
+              <div style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text)', marginBottom: '0.5rem' }}>Bookings (ARR)</div>
+              {bookingsErr && <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>{normalizeFetchError(bookingsErr, 'Bookings')}</p>}
+              {!bookingsErr && bookingsMTD && <BookingsMTDBlock data={bookingsMTD} overviewOnly={false} hidePipeCov={isFixedQuarterDashboard(title)} />}
+              {!bookingsErr && !bookingsMTD && <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>Loading…</p>}
+            </div>
           </div>
-          {cashErr && (
-            <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>{normalizeFetchError(cashErr, 'Cash')}</p>
-          )}
-          {!cashErr && cashMTD && (
-            <CashMTDBlock data={cashMTD} overviewOnly={overviewOnly} />
-          )}
-          {!cashErr && !cashMTD && (
-            <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>Loading…</p>
-          )}
-        </div>
 
-      </div>
+          <div style={{ ...blockStyle, gridColumn: '1 / -1', minWidth: 0 }}>
+            <div style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text)', marginBottom: '0.5rem' }}>Renewals (ARR)</div>
+            {renewalsErr && <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>{renewalsErr}</p>}
+            {!renewalsErr && renewalsMTD && <RenewalsMTDBlock data={renewalsMTD} overviewOnly={false} />}
+            {!renewalsErr && !renewalsMTD && <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>Loading…</p>}
+          </div>
+
+          <div style={{ ...blockStyle, gridColumn: '1 / -1', minWidth: 0 }}>
+            <div style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text)', marginBottom: '0.5rem' }}>Cash</div>
+            {cashErr && <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>{normalizeFetchError(cashErr, 'Cash')}</p>}
+            {!cashErr && cashMTD && <CashMTDBlock data={cashMTD} overviewOnly={false} />}
+            {!cashErr && !cashMTD && <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>Loading…</p>}
+          </div>
+
+        </div>
+      )}
     </>
   )
 }

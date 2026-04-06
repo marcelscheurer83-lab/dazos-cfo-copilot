@@ -79,6 +79,7 @@ export default function Pipeline() {
     () => pv.chartSlice
   )
   const [openFilter, setOpenFilter] = useState<FilterColumn | null>(null)
+  const [aiTooltip, setAiTooltip] = useState<{ text: string; x: number; y: number } | null>(null)
   const stageThRef = useRef<HTMLTableHeaderCellElement>(null)
   const stagePopoverRef = useRef<HTMLDivElement>(null)
   const recordTypeThRef = useRef<HTMLTableHeaderCellElement>(null)
@@ -847,8 +848,12 @@ export default function Pipeline() {
                 <td style={{ padding: '0.5rem 0.75rem', whiteSpace: 'nowrap' }}>{row.deal_tier ?? '—'}</td>
                 <td style={{ padding: '0.5rem 0.75rem', whiteSpace: 'nowrap' }}>{row.forecast_category ?? '—'}</td>
                 <td
-                  style={{ textAlign: 'right', padding: '0.5rem 0.75rem', whiteSpace: 'nowrap', color: '#38bdf8', fontWeight: 600 }}
-                  title={row.ai_reasoning ?? undefined}
+                  style={{ textAlign: 'right', padding: '0.5rem 0.75rem', whiteSpace: 'nowrap', color: '#38bdf8', fontWeight: 600, cursor: row.ai_reasoning ? 'help' : 'default' }}
+                  onMouseEnter={row.ai_reasoning ? (e) => {
+                    const rect = (e.target as HTMLElement).getBoundingClientRect()
+                    setAiTooltip({ text: row.ai_reasoning!, x: rect.left, y: rect.bottom + 6 })
+                  } : undefined}
+                  onMouseLeave={() => setAiTooltip(null)}
                 >
                   {row.ai_probability != null ? `${(row.ai_probability * 100).toFixed(0)}%` : '—'}
                 </td>
@@ -874,6 +879,33 @@ export default function Pipeline() {
         <p style={{ fontSize: '0.9rem', color: 'var(--text-muted)', marginTop: '0.5rem' }}>
           No rows match the chart selection. Click the same stack again or use Clear all filters.
         </p>
+      )}
+
+      {/* AI reasoning tooltip */}
+      {aiTooltip && (
+        <div
+          style={{
+            position: 'fixed',
+            top: aiTooltip.y,
+            left: Math.min(aiTooltip.x, window.innerWidth - 340),
+            zIndex: 9999,
+            background: 'var(--surface)',
+            border: '1px solid var(--border)',
+            borderRadius: 8,
+            padding: '0.65rem 0.9rem',
+            maxWidth: 320,
+            fontSize: '0.82rem',
+            color: 'var(--text)',
+            lineHeight: 1.55,
+            boxShadow: '0 4px 16px rgba(0,0,0,0.25)',
+            pointerEvents: 'none',
+          }}
+        >
+          <p style={{ margin: '0 0 0.3rem', fontSize: '0.72rem', fontWeight: 600, color: '#38bdf8', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+            AI Reasoning
+          </p>
+          {aiTooltip.text}
+        </div>
       )}
     </>
   )

@@ -274,6 +274,46 @@ async def _migrate_db() -> None:
             await db.commit()
         except Exception:
             await db.rollback()
+        # Recreate ai_forecast_observations table to replace the old single-column UNIQUE(scored_at)
+        # with the composite UNIQUE(scored_at, obs_type) required for multiple observation types.
+        # Safe: copies existing data, only runs when old schema is detected.
+        try:
+            # Detect old schema: unique index on scored_at alone (no obs_type index)
+            idx_rows = (await db.execute(_text(
+                "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='ai_forecast_observations'"
+            ))).fetchall()
+            idx_names = [r[0] for r in idx_rows]
+            needs_rebuild = any("scored_at" in n and "obs_type" not in n for n in idx_names)
+            if needs_rebuild:
+                await db.execute(_text("""
+                    CREATE TABLE IF NOT EXISTS _ai_obs_new (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        scored_at DATETIME NOT NULL,
+                        obs_type VARCHAR(16) NOT NULL DEFAULT 'forecast',
+                        quarter_label VARCHAR(16),
+                        observations_json TEXT,
+                        created_at DATETIME DEFAULT (CURRENT_TIMESTAMP),
+                        UNIQUE (scored_at, obs_type)
+                    )
+                """))
+                await db.execute(_text("""
+                    INSERT OR IGNORE INTO _ai_obs_new
+                        (id, scored_at, obs_type, quarter_label, observations_json, created_at)
+                    SELECT id,
+                           scored_at,
+                           COALESCE(obs_type, 'forecast'),
+                           quarter_label,
+                           observations_json,
+                           created_at
+                    FROM ai_forecast_observations
+                """))
+                await db.execute(_text("DROP TABLE ai_forecast_observations"))
+                await db.execute(_text("ALTER TABLE _ai_obs_new RENAME TO ai_forecast_observations"))
+                await db.commit()
+        except Exception as rebuild_err:
+            await db.rollback()
+            import logging as _log_m
+            _log_m.getLogger(__name__).warning("ai_forecast_observations table rebuild skipped: %s", rebuild_err)
 
 
 @asynccontextmanager
@@ -5441,6 +5481,7 @@ async def _run_ai_forecast_scoring(db: AsyncSession) -> dict:
         logger.warning("Failed to generate forecast observations: %s", obs_err)
 
     # ── Generate pipeline-health observations (stage/tier/velocity focus) ────
+    # Uses its own DB session so any failure cannot corrupt the main session (DealAIScore inserts).
     try:
         import json as _json3
         import calendar as _cal3
@@ -5544,19 +5585,20 @@ async def _run_ai_forecast_scoring(db: AsyncSession) -> dict:
         pipe_obs_raw = pipe_obs_response.choices[0].message.content or "{}"
         pipeline_observations: list[str] = _json3.loads(pipe_obs_raw).get("observations", [])
 
-        await db.execute(
-            delete(AIForecastObservations).where(
-                AIForecastObservations.scored_at == scored_at,
-                AIForecastObservations.obs_type == "pipeline",
+        async with AsyncSessionLocal() as pipe_db:
+            await pipe_db.execute(
+                delete(AIForecastObservations).where(
+                    AIForecastObservations.scored_at == scored_at,
+                    AIForecastObservations.obs_type == "pipeline",
+                )
             )
-        )
-        db.add(AIForecastObservations(
-            scored_at=scored_at,
-            obs_type="pipeline",
-            quarter_label=q_label2,
-            observations_json=_json3.dumps(pipeline_observations),
-        ))
-        await db.commit()
+            pipe_db.add(AIForecastObservations(
+                scored_at=scored_at,
+                obs_type="pipeline",
+                quarter_label=q_label2,
+                observations_json=_json3.dumps(pipeline_observations),
+            ))
+            await pipe_db.commit()
     except Exception as pipe_obs_err:
         logger.warning("Failed to generate pipeline observations: %s", pipe_obs_err)
 

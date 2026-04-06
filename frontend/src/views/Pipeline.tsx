@@ -106,7 +106,7 @@ export default function Pipeline() {
   }, [loadData])
 
   useEffect(() => {
-    getAIObservations().then(setObservations).catch(() => {})
+    getAIObservations('pipeline').then(setObservations).catch(() => {})
   }, [])
 
   useEffect(() => {
@@ -495,7 +495,7 @@ export default function Pipeline() {
       <h1 style={{ margin: '0 0 1.5rem', fontSize: '1.5rem', fontWeight: 600, color: 'var(--text)' }}>Pipeline</h1>
       {/* ── Observations + Charts row ── */}
       {chartDataByStage.months.length > 0 && (
-        <div style={{ marginBottom: '1.5rem', maxWidth: '100%', display: 'grid', gridTemplateColumns: '280px 1fr 1fr', gap: '1.5rem', alignItems: 'stretch' }}>
+        <div style={{ marginBottom: '1.5rem', maxWidth: '100%', display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '1.5rem', alignItems: 'stretch' }}>
 
           {/* Observations card */}
           <div style={{

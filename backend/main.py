@@ -252,11 +252,12 @@ async def _migrate_db() -> None:
     """Add new columns to existing tables created before recent schema updates."""
     from sqlalchemy import text as _text
     new_cols = [
-        ("opportunities", "next_step",    "TEXT"),
-        ("opportunities", "lead_type",    "VARCHAR(128)"),
-        ("opportunities", "current_crm",  "VARCHAR(128)"),
-        ("opportunities", "current_voip", "VARCHAR(128)"),
-        ("opportunities", "deal_tier",    "VARCHAR(64)"),
+        ("opportunities",          "next_step",    "TEXT"),
+        ("opportunities",          "lead_type",    "VARCHAR(128)"),
+        ("opportunities",          "current_crm",  "VARCHAR(128)"),
+        ("opportunities",          "current_voip", "VARCHAR(128)"),
+        ("opportunities",          "deal_tier",    "VARCHAR(64)"),
+        ("ai_forecast_observations", "obs_type",   "VARCHAR(16)"),
     ]
     async with AsyncSessionLocal() as db:
         for tbl, col, col_type in new_cols:
@@ -265,6 +266,14 @@ async def _migrate_db() -> None:
                 await db.commit()
             except Exception:
                 await db.rollback()  # column already exists — safe to ignore
+        # Back-fill obs_type = 'forecast' for rows that pre-date this migration
+        try:
+            await db.execute(_text(
+                "UPDATE ai_forecast_observations SET obs_type = 'forecast' WHERE obs_type IS NULL"
+            ))
+            await db.commit()
+        except Exception:
+            await db.rollback()
 
 
 @asynccontextmanager
@@ -4074,14 +4083,21 @@ async def post_forecast_snapshot(db: AsyncSession = Depends(get_db)):
 
 
 @app.get("/api/forecast/observations")
-async def get_forecast_observations(db: AsyncSession = Depends(get_db)):
-    """Return the most recent AI forecast observations (pipeline health bullets)."""
+async def get_forecast_observations(
+    type: str = "forecast",
+    db: AsyncSession = Depends(get_db),
+):
+    """Return the most recent AI observations. type='forecast' (default) or 'pipeline'."""
     import json as _json_obs2
     row = (await db.execute(
-        select(AIForecastObservations).order_by(AIForecastObservations.scored_at.desc()).limit(1)
+        select(AIForecastObservations)
+        .where(AIForecastObservations.obs_type == type)
+        .order_by(AIForecastObservations.scored_at.desc())
+        .limit(1)
     )).scalars().first()
     if not row:
-        return {"observations": [], "scored_at": None, "quarter_label": None}
+        # fall back: if pipeline type not yet generated, return empty rather than wrong type
+        return {"observations": [], "scored_at": None, "quarter_label": None, "obs_type": type}
     obs = []
     if row.observations_json:
         try:
@@ -4092,6 +4108,7 @@ async def get_forecast_observations(db: AsyncSession = Depends(get_db)):
         "observations": obs,
         "scored_at": row.scored_at.isoformat() if row.scored_at else None,
         "quarter_label": row.quarter_label,
+        "obs_type": type,
     }
 
 
@@ -5407,17 +5424,141 @@ async def _run_ai_forecast_scoring(db: AsyncSession) -> dict:
         obs_raw = obs_response.choices[0].message.content or "{}"
         observations = _json2.loads(obs_raw).get("observations", [])
 
-        # Upsert observations for this run
+        # Upsert forecast observations for this run
         await db.execute(
-            delete(AIForecastObservations).where(AIForecastObservations.scored_at == scored_at)
+            delete(AIForecastObservations).where(
+                AIForecastObservations.scored_at == scored_at,
+                AIForecastObservations.obs_type == "forecast",
+            )
         )
         db.add(AIForecastObservations(
             scored_at=scored_at,
+            obs_type="forecast",
             quarter_label=q_label2,
             observations_json=_json2.dumps(observations),
         ))
     except Exception as obs_err:
-        logger.warning("Failed to generate observations: %s", obs_err)
+        logger.warning("Failed to generate forecast observations: %s", obs_err)
+
+    # ── Generate pipeline-health observations (stage/tier/velocity focus) ────
+    try:
+        import json as _json3
+        import calendar as _cal3
+        from datetime import date as _date3
+
+        today_est3 = datetime.now(EST).date()
+
+        # Build pipeline summary: per-tier and per-stage breakdown + velocity signals
+        tier_bucket: dict[str, dict] = {}
+        stage_bucket: dict[str, dict] = {}
+        stale_deals: list[dict] = []   # no activity in 21+ days
+        tier_change_deals: list[str] = []  # deals where Deal_Tier changed recently
+
+        for o in open_opps:
+            arr = _pipeline_arr(o)
+            tier = o.deal_tier or "No Tier"
+            stage = o.stage_name or "Unknown"
+
+            # Tier bucket
+            b = tier_bucket.setdefault(tier, {"count": 0, "total_arr": 0.0, "close_pushes": 0, "stage_changes": 0})
+            b["count"] += 1
+            b["total_arr"] += arr
+
+            # Stage bucket
+            s = stage_bucket.setdefault(stage, {"count": 0, "total_arr": 0.0})
+            s["count"] += 1
+            s["total_arr"] += arr
+
+            # Field history signals
+            fh = hist_by_opp.get(o.sf_id or "", [])
+            close_pushes = len([h for h in fh if h.field == "CloseDate"])
+            stage_changes = len([h for h in fh if h.field == "StageName"])
+            tier_changes = len([h for h in fh if h.field == "Deal_Tier__c"])
+            b["close_pushes"] += close_pushes
+            b["stage_changes"] += stage_changes
+            if tier_changes > 0:
+                tier_change_deals.append(f"{o.account_name} ({tier_changes}x, now {tier})")
+
+            # Activity recency
+            opp_acts3 = activities_by_opp.get(o.sf_id or "", [])
+            if opp_acts3 and opp_acts3[0].activity_date:
+                days_inactive = (today_est3 - opp_acts3[0].activity_date).days
+            else:
+                days_inactive = 999
+            if days_inactive >= 21 and arr > 5000:
+                stale_deals.append({
+                    "account": o.account_name,
+                    "arr": round(arr),
+                    "tier": tier,
+                    "stage": stage,
+                    "days_inactive": days_inactive if days_inactive < 999 else None,
+                })
+
+        # Sort tier buckets by total ARR descending
+        tier_summary = [
+            {
+                "tier": t,
+                "count": v["count"],
+                "total_arr": round(v["total_arr"]),
+                "avg_arr": round(v["total_arr"] / v["count"]) if v["count"] else 0,
+                "close_pushes": v["close_pushes"],
+                "stage_changes": v["stage_changes"],
+            }
+            for t, v in sorted(tier_bucket.items(), key=lambda x: -x[1]["total_arr"])
+        ]
+        stage_summary = [
+            {"stage": s, "count": v["count"], "total_arr": round(v["total_arr"])}
+            for s, v in sorted(stage_bucket.items(), key=lambda x: -x[1]["total_arr"])
+        ]
+        stale_deals.sort(key=lambda x: -(x["arr"] or 0))
+
+        pipeline_summary = {
+            "quarter": q_label2,
+            "total_open_deals": len(open_opps),
+            "total_open_arr": round(sum(_pipeline_arr(o) for o in open_opps)),
+            "by_tier": tier_summary,
+            "by_stage": stage_summary,
+            "stale_deals_21d": stale_deals[:8],
+            "tier_changed_recently": tier_change_deals[:6],
+        }
+
+        pipe_prompt = (
+            f"You are a SaaS VP of Sales advisor generating a pipeline health briefing for {q_label2}. "
+            "Analyze the open pipeline data below and write 4-6 concise bullet-point observations. "
+            "Focus on: deal tier distribution and concentration risk, stage velocity and bottlenecks, "
+            "close-date push frequency by tier, stale deals (no recent activity) that are material ARR risks, "
+            "tier changes as a signal of deal momentum, and any patterns that suggest pipeline quality issues. "
+            "Be specific with deal counts and ARR amounts. Write for a CFO/CEO/VP Sales audience — direct, no fluff. "
+            "Return ONLY valid JSON: {\"observations\": [\"bullet 1\", \"bullet 2\", ...]}"
+        )
+        pipe_obs_response = await client.chat.completions.create(
+            model=_AI_SCORING_MODEL,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": pipe_prompt},
+                {"role": "user", "content": _json3.dumps(pipeline_summary, default=str)},
+            ],
+            temperature=0.3,
+            max_tokens=900,
+        )
+        pipe_obs_raw = pipe_obs_response.choices[0].message.content or "{}"
+        pipeline_observations: list[str] = _json3.loads(pipe_obs_raw).get("observations", [])
+
+        await db.execute(
+            delete(AIForecastObservations).where(
+                AIForecastObservations.scored_at == scored_at,
+                AIForecastObservations.obs_type == "pipeline",
+            )
+        )
+        db.add(AIForecastObservations(
+            scored_at=scored_at,
+            obs_type="pipeline",
+            quarter_label=q_label2,
+            observations_json=_json3.dumps(pipeline_observations),
+        ))
+        await db.commit()
+    except Exception as pipe_obs_err:
+        logger.warning("Failed to generate pipeline observations: %s", pipe_obs_err)
 
     return {"ok": True, "scored": scored_total, "scored_at": scored_at.isoformat()}
 

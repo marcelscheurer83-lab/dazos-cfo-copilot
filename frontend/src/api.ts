@@ -1387,10 +1387,11 @@ export type AIObservationsResponse = {
   observations: string[]
   scored_at: string | null
   quarter_label: string | null
+  obs_type?: string
 }
 
-export async function getAIObservations(): Promise<AIObservationsResponse> {
-  const r = await apiFetch('/forecast/observations')
+export async function getAIObservations(type: 'forecast' | 'pipeline' = 'forecast'): Promise<AIObservationsResponse> {
+  const r = await apiFetch(`/forecast/observations?type=${type}`)
   if (!r.ok) throw new Error(`Observations fetch failed: HTTP ${r.status}`)
   return r.json()
 }

@@ -554,8 +554,17 @@ export default function DashboardCurrentSummary({ title = 'Current Performance' 
         )}
 
         {/* Block 1: Bookings (+ ARR Bridge table in overview mode) */}
-        <div style={{ gridColumn: '1 / -1', display: 'flex', gap: '1.25rem', alignItems: 'flex-start', minWidth: 0, ...(overviewOnly ? { width: '100%' } : {}) }}>
-          <div style={{ ...blockStyle, minWidth: 0, ...(overviewOnly ? { flex: '0 0 55%', boxSizing: 'border-box' } : { flex: '1 1 auto' }) }}>
+        <div style={{
+          gridColumn: '1 / -1',
+          display: overviewOnly ? 'grid' : 'flex',
+          gridTemplateColumns: overviewOnly ? '55fr 45fr' : undefined,
+          gap: '1.25rem',
+          alignItems: 'flex-start',
+          minWidth: 0,
+          width: '100%',
+          boxSizing: 'border-box',
+        }}>
+          <div style={{ ...blockStyle, minWidth: 0, ...(overviewOnly ? {} : { flex: '1 1 auto' }) }}>
             <div style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text)', marginBottom: '0.5rem' }}>
               Bookings (ARR)
             </div>

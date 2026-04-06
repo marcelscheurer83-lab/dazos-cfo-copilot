@@ -147,6 +147,7 @@ class Opportunity(Base):
     lead_type = Column(String(128), nullable=True)       # e.g. Lead_Type__c
     current_crm = Column(String(128), nullable=True)     # e.g. Current_CRM__c
     current_voip = Column(String(128), nullable=True)    # e.g. Current_VOIP__c
+    deal_tier = Column(String(64), nullable=True)         # Deal_Tier__c (Commit / Strong Upside / Weak Upside / Hail Mary)
     synced_at = Column(DateTime, server_default=func.now())
 
 

@@ -256,6 +256,7 @@ async def _migrate_db() -> None:
         ("opportunities", "lead_type",    "VARCHAR(128)"),
         ("opportunities", "current_crm",  "VARCHAR(128)"),
         ("opportunities", "current_voip", "VARCHAR(128)"),
+        ("opportunities", "deal_tier",    "VARCHAR(64)"),
     ]
     async with AsyncSessionLocal() as db:
         for tbl, col, col_type in new_cols:
@@ -767,6 +768,7 @@ _SALESFORCE_MIDTERM_CANCELLATION_FIELD = (os.getenv("SALESFORCE_MIDTERM_CANCELLA
 _SF_LEAD_TYPE_FIELD       = (os.getenv("SALESFORCE_LEAD_TYPE_FIELD",       "Lead_Type__c")).strip()
 _SF_CURRENT_CRM_FIELD     = (os.getenv("SALESFORCE_CURRENT_CRM_FIELD",     "Current_CRM__c")).strip()
 _SF_CURRENT_VOIP_FIELD    = (os.getenv("SALESFORCE_CURRENT_VOIP_FIELD",    "Current_VOIP__c")).strip()
+_SF_DEAL_TIER_FIELD       = (os.getenv("SALESFORCE_DEAL_TIER_FIELD",       "Deal_Tier__c")).strip()
 
 # Optional: line item term (months) and dates for period-weighted ARR (e.g. 3 mo @ $650 + 21 mo @ $1300 -> ARR = (3*650+21*1300)/24*12).
 _SALESFORCE_LINE_ITEM_TERM_FIELD = (os.getenv("SALESFORCE_LINE_ITEM_TERM_FIELD") or "").strip()  # e.g. Term__c
@@ -802,6 +804,8 @@ def _opp_soql_extra_fields() -> str:
         parts.append(_SF_CURRENT_CRM_FIELD)
     if _SF_CURRENT_VOIP_FIELD:
         parts.append(_SF_CURRENT_VOIP_FIELD)
+    if _SF_DEAL_TIER_FIELD:
+        parts.append(_SF_DEAL_TIER_FIELD)
     return ", " + ", ".join(parts) if parts else ""
 
 
@@ -832,6 +836,8 @@ def _opp_soql_extra_fields_no_renewal_date() -> str:
         parts.append(_SF_CURRENT_CRM_FIELD)
     if _SF_CURRENT_VOIP_FIELD:
         parts.append(_SF_CURRENT_VOIP_FIELD)
+    if _SF_DEAL_TIER_FIELD:
+        parts.append(_SF_DEAL_TIER_FIELD)
     return ", " + ", ".join(parts) if parts else ""
 DEFAULT_OPPORTUNITY_SOQL = (
     "SELECT Id, Name, Amount, CloseDate, StageName, Type, RecordType.Name, "
@@ -1624,6 +1630,7 @@ async def _run_salesforce_sync(db: AsyncSession) -> dict:
             lead_type=(rec.get(_SF_LEAD_TYPE_FIELD) or "").strip() or None if _SF_LEAD_TYPE_FIELD else None,
             current_crm=(rec.get(_SF_CURRENT_CRM_FIELD) or "").strip() or None if _SF_CURRENT_CRM_FIELD else None,
             current_voip=(rec.get(_SF_CURRENT_VOIP_FIELD) or "").strip() or None if _SF_CURRENT_VOIP_FIELD else None,
+            deal_tier=(rec.get(_SF_DEAL_TIER_FIELD) or "").strip() or None if _SF_DEAL_TIER_FIELD else None,
         )
         db.add(opp)
 
@@ -9262,11 +9269,14 @@ async def get_pipeline_overview(
     segments_set: set[str] = set()
     stages_set: set[str] = set()
     record_types_set: set[str] = set()
+    deal_tiers_set: set[str] = set()
     for o in open_opps_all:
         seg = account_segment.get(o.account_id) if o.account_id else DEFAULT_SEGMENT
         segments_set.add(seg)
         stages_set.add(_canonical_stage_name(o.stage_name))
         record_types_set.add(o.record_type_name or "—")
+        if o.deal_tier:
+            deal_tiers_set.add(o.deal_tier)
     # Apply filters (case-insensitive match)
     def _norm(s: str) -> str:
         return (s or "").strip().lower()
@@ -9332,6 +9342,7 @@ async def get_pipeline_overview(
             "opportunity_name": o.name or "—",
             "stage_name": _canonical_stage_name(o.stage_name),
             "forecast_category": (o.forecast_category or "").strip() or None,
+            "deal_tier": (o.deal_tier or "").strip() or None,
             "record_type_name": o.record_type_name or "—",
             "close_date": o.close_date.isoformat() if o.close_date else None,
             "arr": arr,
@@ -9345,6 +9356,7 @@ async def get_pipeline_overview(
         "segments": sorted(segments_set),
         "stages": sorted(stages_set),
         "record_types": sorted(record_types_set),
+        "deal_tiers": sorted(deal_tiers_set),
     }
     base = os.getenv("SALESFORCE_BASE_URL", "").strip().rstrip("/")
     if base and ("salesforce.com" in base or "lightning.force.com" in base):

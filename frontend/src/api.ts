@@ -747,6 +747,7 @@ export type PipelineOverviewRow = {
   opportunity_name: string
   stage_name: string
   forecast_category: string | null
+  deal_tier: string | null
   record_type_name: string
   close_date: string | null
   arr: number
@@ -760,6 +761,7 @@ export type PipelineOverviewResponse = {
   segments: string[]
   stages: string[]
   record_types: string[]
+  deal_tiers: string[]
   salesforce_base_url?: string
 }
 

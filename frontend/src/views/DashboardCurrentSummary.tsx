@@ -509,8 +509,6 @@ export default function DashboardCurrentSummary({ title = 'Current Performance' 
               </div>
             )}
 
-            {/* ARR Bridge below KPI cards */}
-            <ArrBridgeSummaryBlock bridgeMonths={bridgeMonths} />
           </div>
 
           {/* RIGHT column: Bookings, Renewals, Cash stacked */}

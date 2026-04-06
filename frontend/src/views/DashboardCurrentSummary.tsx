@@ -239,7 +239,7 @@ function mtPeriodGridStyle(periodCount: number): React.CSSProperties {
   }
 }
 
-export default function DashboardCurrentSummary({ title = 'Current Actuals' }: { title?: string }) {
+export default function DashboardCurrentSummary({ title = 'Current Performance' }: { title?: string }) {
   const [kpi, setKpi] = useState<DashboardKPI | null>(null)
   const [bookingsMTD, setBookingsMTD] = useState<BookingsMTDResponse | null>(null)
   const [renewalsMTD, setRenewalsMTD] = useState<RenewalsMTDResponse | null>(null)
@@ -370,7 +370,7 @@ export default function DashboardCurrentSummary({ title = 'Current Actuals' }: {
   if (!kpi) return <p style={{ color: 'var(--text-muted)' }}>Loading…</p>
 
   /** Current Overview: only MTD + quarter-to-date columns (not prior two months). */
-  const overviewOnly = title === 'Current Actuals'
+  const overviewOnly = title === 'Current Performance'
 
   return (
     <>

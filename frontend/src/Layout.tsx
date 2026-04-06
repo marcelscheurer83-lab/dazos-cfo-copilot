@@ -13,7 +13,7 @@ const nav: NavItem[] = [
   {
     label: 'Dashboard',
     children: [
-      { to: '/dashboard/current-overview', label: 'Current Actuals' },
+      { to: '/dashboard/current-overview', label: 'Current Performance' },
       { to: '/go-to-market/forecast', label: 'Current Forecast' },
       { to: '/dashboard/q2-2026', label: 'Q2 2026' },
       { to: '/dashboard/q1-2026', label: 'Q1 2026' },

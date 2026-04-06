@@ -51,6 +51,12 @@ from models import (
     ARRScheduleDaily,
     ARRSchedulePeriod,
     MonthlyArrSnapshot,
+    OppFieldHistory,
+    OppNote,
+    OppActivity,
+    AIForecastObservations,
+    DealAIScore,
+    ForecastSnapshot,
 )
 from schemas import (
     KPISummary,
@@ -242,9 +248,28 @@ def _scheduled_background_jobs_wanted() -> bool:
 _ascension_ascend_cleanup_done = False
 
 
+async def _migrate_db() -> None:
+    """Add new columns to existing tables created before recent schema updates."""
+    from sqlalchemy import text as _text
+    new_cols = [
+        ("opportunities", "next_step",    "TEXT"),
+        ("opportunities", "lead_type",    "VARCHAR(128)"),
+        ("opportunities", "current_crm",  "VARCHAR(128)"),
+        ("opportunities", "current_voip", "VARCHAR(128)"),
+    ]
+    async with AsyncSessionLocal() as db:
+        for tbl, col, col_type in new_cols:
+            try:
+                await db.execute(_text(f"ALTER TABLE {tbl} ADD COLUMN {col} {col_type}"))
+                await db.commit()
+            except Exception:
+                await db.rollback()  # column already exists — safe to ignore
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await seed()
+    await _migrate_db()
     await _scrub_app_dataset_quickbooks_legacy_on_startup()
     await asyncio.to_thread(_init_api_timing_log_file_on_startup)
     await _remove_ascension_ascend_overrides()
@@ -738,6 +763,11 @@ _SALESFORCE_CONTRACT_START_DATE_FIELD = (os.getenv("SALESFORCE_CONTRACT_START_DA
 _SALESFORCE_CONTRACT_END_DATE_FIELD = (os.getenv("SALESFORCE_CONTRACT_END_DATE_FIELD") or "Contract_End_Date__c").strip() or ""
 # Optional: Midterm Cancellation on Opportunity (e.g. Midterm_Cancellation__c). When true on a Closed Lost renewal, subscription end = that opp's contract_end_date.
 _SALESFORCE_MIDTERM_CANCELLATION_FIELD = (os.getenv("SALESFORCE_MIDTERM_CANCELLATION_FIELD") or "Midterm_Cancellation__c").strip() or ""
+# AI-agent enrichment fields on Opportunity (set to empty string to disable)
+_SF_LEAD_TYPE_FIELD       = (os.getenv("SALESFORCE_LEAD_TYPE_FIELD",       "Lead_Type__c")).strip()
+_SF_CURRENT_CRM_FIELD     = (os.getenv("SALESFORCE_CURRENT_CRM_FIELD",     "Current_CRM__c")).strip()
+_SF_CURRENT_VOIP_FIELD    = (os.getenv("SALESFORCE_CURRENT_VOIP_FIELD",    "Current_VOIP__c")).strip()
+
 # Optional: line item term (months) and dates for period-weighted ARR (e.g. 3 mo @ $650 + 21 mo @ $1300 -> ARR = (3*650+21*1300)/24*12).
 _SALESFORCE_LINE_ITEM_TERM_FIELD = (os.getenv("SALESFORCE_LINE_ITEM_TERM_FIELD") or "").strip()  # e.g. Term__c
 # Try these by default so period-weighted ARR works without config; sync falls back if field doesn't exist in org
@@ -764,6 +794,14 @@ def _opp_soql_extra_fields() -> str:
     # Include ARR__c when present in org so we can fall back to it for opps without products
     parts.append("ARR__c")
     parts.append("Forecast__c")
+    # AI-agent enrichment (standard NextStep always safe; custom fields only when configured)
+    parts.append("NextStep")
+    if _SF_LEAD_TYPE_FIELD:
+        parts.append(_SF_LEAD_TYPE_FIELD)
+    if _SF_CURRENT_CRM_FIELD:
+        parts.append(_SF_CURRENT_CRM_FIELD)
+    if _SF_CURRENT_VOIP_FIELD:
+        parts.append(_SF_CURRENT_VOIP_FIELD)
     return ", " + ", ".join(parts) if parts else ""
 
 
@@ -786,6 +824,14 @@ def _opp_soql_extra_fields_no_renewal_date() -> str:
     # Include ARR__c when present in org so we can fall back to it for opps without products
     parts.append("ARR__c")
     parts.append("Forecast__c")
+    # AI-agent enrichment
+    parts.append("NextStep")
+    if _SF_LEAD_TYPE_FIELD:
+        parts.append(_SF_LEAD_TYPE_FIELD)
+    if _SF_CURRENT_CRM_FIELD:
+        parts.append(_SF_CURRENT_CRM_FIELD)
+    if _SF_CURRENT_VOIP_FIELD:
+        parts.append(_SF_CURRENT_VOIP_FIELD)
     return ", " + ", ".join(parts) if parts else ""
 DEFAULT_OPPORTUNITY_SOQL = (
     "SELECT Id, Name, Amount, CloseDate, StageName, Type, RecordType.Name, "
@@ -1574,6 +1620,10 @@ async def _run_salesforce_sync(db: AsyncSession) -> dict:
             midterm_cancellation=midterm_cancellation,
             forecast_category=forecast_cat,
             created_date=_parse_datetime(rec.get("CreatedDate")),
+            next_step=(rec.get("NextStep") or "").strip() or None,
+            lead_type=(rec.get(_SF_LEAD_TYPE_FIELD) or "").strip() or None if _SF_LEAD_TYPE_FIELD else None,
+            current_crm=(rec.get(_SF_CURRENT_CRM_FIELD) or "").strip() or None if _SF_CURRENT_CRM_FIELD else None,
+            current_voip=(rec.get(_SF_CURRENT_VOIP_FIELD) or "").strip() or None if _SF_CURRENT_VOIP_FIELD else None,
         )
         db.add(opp)
 
@@ -1701,14 +1751,119 @@ async def _run_salesforce_sync(db: AsyncSession) -> dict:
     r_count = await db.execute(q_renewal_count)
     all_open = r_count.scalars().all()
     renewal_count = sum(1 for o in all_open if _is_renewal_record_type(o.record_type_name))
+
+    # ── OpportunityFieldHistory sync ──────────────────────────────────────────
+    # Fetch stage, close-date, and amount changes for all opportunities.
+    # Used by the AI forecast scoring agent.
+    synced_field_history = 0
+    field_history_error: Optional[str] = None
+    try:
+        hist_soql = (
+            "SELECT OpportunityId, Field, OldValue, NewValue, CreatedDate "
+            "FROM OpportunityFieldHistory "
+            "WHERE Field IN ('StageName', 'CloseDate', 'Amount') "
+            "ORDER BY CreatedDate ASC"
+        )
+        hist_records = await _salesforce_query_with_retry(connector, hist_soql)
+        await db.execute(delete(OppFieldHistory))
+        seen_fh: set[tuple] = set()
+        for hrec in hist_records:
+            opp_id = hrec.get("OpportunityId")
+            field = hrec.get("Field")
+            changed_at = _parse_datetime(hrec.get("CreatedDate"))
+            if not opp_id or not field or changed_at is None:
+                continue
+            dedup_key = (opp_id, field, changed_at)
+            if dedup_key in seen_fh:
+                continue
+            seen_fh.add(dedup_key)
+            db.add(OppFieldHistory(
+                sf_opp_id=opp_id,
+                field=field,
+                old_value=str(hrec.get("OldValue")) if hrec.get("OldValue") is not None else None,
+                new_value=str(hrec.get("NewValue")) if hrec.get("NewValue") is not None else None,
+                changed_at=changed_at,
+            ))
+        synced_field_history = len(seen_fh)
+    except Exception as hist_err:
+        # Non-fatal: field history is used only by the AI agent, not core sync.
+        field_history_error = str(hist_err)
+
+    # ── Sync Opportunity Notes ────────────────────────────────────────────────
+    synced_notes = 0
+    notes_error: Optional[str] = None
+    try:
+        notes_soql = (
+            "SELECT Id, ParentId, Title, Body, CreatedDate "
+            "FROM Note ORDER BY CreatedDate DESC"
+        )
+        note_records = await _salesforce_query_with_retry(connector, notes_soql)
+        await db.execute(delete(OppNote))
+        seen_notes: set[str] = set()
+        for nrec in note_records:
+            note_id = nrec.get("Id")
+            parent_id = nrec.get("ParentId")
+            if not note_id or not parent_id or note_id in seen_notes:
+                continue
+            seen_notes.add(note_id)
+            db.add(OppNote(
+                sf_note_id=note_id,
+                sf_opp_id=parent_id,
+                title=(nrec.get("Title") or "").strip() or None,
+                body=(nrec.get("Body") or "").strip() or None,
+                created_date=_parse_datetime(nrec.get("CreatedDate")),
+            ))
+        synced_notes = len(seen_notes)
+    except Exception as notes_err:
+        notes_error = str(notes_err)
+
+    # ── Sync Opportunity Activities (Tasks) ───────────────────────────────────
+    synced_activities = 0
+    activities_error: Optional[str] = None
+    try:
+        activity_soql = (
+            "SELECT Id, WhatId, Subject, Description, ActivityDate, TaskSubtype "
+            "FROM Task WHERE WhatId != null AND ActivityDate >= LAST_N_DAYS:365 "
+            "ORDER BY ActivityDate DESC NULLS LAST"
+        )
+        activity_records = await _salesforce_query_with_retry(connector, activity_soql)
+        await db.execute(delete(OppActivity))
+        seen_tasks: set[str] = set()
+        for arec in activity_records:
+            task_id = arec.get("Id")
+            what_id = arec.get("WhatId")
+            if not task_id or not what_id or task_id in seen_tasks:
+                continue
+            seen_tasks.add(task_id)
+            db.add(OppActivity(
+                sf_task_id=task_id,
+                sf_opp_id=what_id,
+                subject=(arec.get("Subject") or "").strip() or None,
+                description=(arec.get("Description") or "").strip() or None,
+                activity_date=_parse_date(arec.get("ActivityDate")),
+                activity_type=(arec.get("TaskSubtype") or "").strip() or None,
+            ))
+        synced_activities = len(seen_tasks)
+    except Exception as act_err:
+        activities_error = str(act_err)
+
     msg = "Accounts, opportunities, and opportunity products synced."
     if _SALESFORCE_RENEWAL_DATE_FIELD and not use_renewal_date_field:
         msg += " Renewal Date field not found in Salesforce; renewals use Close Date. Check Setup → Opportunity → Fields for the correct API name, or remove SALESFORCE_RENEWAL_DATE_FIELD from .env."
+    if field_history_error:
+        msg += f" OpportunityFieldHistory sync skipped: {field_history_error}"
+    if notes_error:
+        msg += f" Notes sync skipped: {notes_error}"
+    if activities_error:
+        msg += f" Activities sync skipped: {activities_error}"
     return {
         "ok": True,
         "synced_accounts": len(account_records),
         "synced_opportunities": len(opp_records),
         "synced_line_items": len(line_records),
+        "synced_field_history": synced_field_history,
+        "synced_notes": synced_notes,
+        "synced_activities": synced_activities,
         "line_item_term_field_used": term_field_used,
         "line_item_term_fallback": line_item_term_fallback,
         "renewal_opportunities_count": renewal_count,
@@ -3339,6 +3494,106 @@ _FORECAST_ROW_NB         = 10  # row 11 (1-indexed) = New Business ARR target
 _FORECAST_ROW_EXP        = 11  # row 12 (1-indexed) = Expansion ARR target
 _FORECAST_ROW_RENEW_RATE = 51  # row 52 (1-indexed) = ARR renewal rate target
 
+# Number of historical quarters to average for in-quarter pipeline estimate
+_IQ_LOOKBACK_QUARTERS = 6
+
+
+def _quarter_bounds(year: int, q: int) -> tuple[date, date]:
+    """Return (first_day, last_day) for the given quarter."""
+    start_month = (q - 1) * 3 + 1
+    end_month = start_month + 2
+    last_day = calendar.monthrange(year, end_month)[1]
+    return date(year, start_month, 1), date(year, end_month, last_day)
+
+
+async def _compute_in_quarter_rates(db: AsyncSession) -> dict:
+    """Compute average historical in-quarter pipeline contribution per month-of-quarter position.
+
+    For each past quarter (up to _IQ_LOOKBACK_QUARTERS), calculate:
+      - Total closed won NB ARR that closed in month M of the quarter AND was created in the same quarter
+      - Same for Expansion
+
+    Returns:
+      {
+        "nb":  [avg_m1, avg_m2, avg_m3],   # absolute ARR, not rates
+        "exp": [avg_m1, avg_m2, avg_m3],
+        "quarters_used": N,
+      }
+    """
+    today = datetime.now(EST).date()
+    # Current quarter — exclude it (partial, biases the estimate)
+    cur_q = (today.month - 1) // 3 + 1
+    cur_q_start, _ = _quarter_bounds(today.year, cur_q)
+
+    # Load all closed won NB + Expansion opps with both dates
+    result = await db.execute(select(Opportunity))
+    all_opps: list[Opportunity] = list(result.scalars().all())
+    rt_overrides = await _get_record_type_overrides(db)
+
+    def _eff_rt_iq(o: Opportunity) -> str:
+        _key = (o.sf_id or "").strip()
+        _ov = rt_overrides.get(_key) or (rt_overrides.get(_key[:15]) if len(_key) >= 15 else None)
+        return (_ov or o.record_type_name or "").strip()
+
+    closed_opps = [
+        o for o in all_opps
+        if _is_closed_won_stage(o.stage_name)
+        and o.close_date is not None
+        and o.created_date is not None
+        and not _is_renewal_record_type(_eff_rt_iq(o))
+        and o.close_date < cur_q_start  # completed quarters only
+    ]
+
+    from collections import defaultdict
+    buckets: dict[tuple, dict] = defaultdict(lambda: {"nb": 0.0, "exp": 0.0})
+
+    for o in closed_opps:
+        cd = o.close_date  # type: ignore[assignment]
+        q = (cd.month - 1) // 3 + 1
+        q_start, _ = _quarter_bounds(cd.year, q)
+        month_pos = (cd.month - q_start.month)  # 0, 1, or 2
+
+        created = o.created_date.date() if hasattr(o.created_date, "date") else o.created_date  # type: ignore[union-attr]
+        _q_end = _quarter_bounds(q_start.year, q)[1]
+        if not (q_start <= created <= _q_end):
+            continue  # not in-quarter
+
+        rt = _eff_rt_iq(o)
+        if _is_new_business_record_type(rt):
+            arr = max(0.0, float(o.opportunity_arr or 0))
+            buckets[(cd.year, q, month_pos)]["nb"] += arr
+        elif _is_expansion_record_type(rt) or _is_amendment_record_type(rt):
+            arr = _booking_arr_expansion_or_arr_c(o)
+            buckets[(cd.year, q, month_pos)]["exp"] += arr
+
+    # Group by quarter, collect per-month-position values
+    quarters_seen: set[tuple[int, int]] = set()
+    for (yr, q, _mp) in buckets:
+        quarters_seen.add((yr, q))
+
+    # Sort quarters descending, take up to _IQ_LOOKBACK_QUARTERS
+    sorted_quarters = sorted(quarters_seen, reverse=True)[:_IQ_LOOKBACK_QUARTERS]
+    if not sorted_quarters:
+        return {"nb": [0.0, 0.0, 0.0], "exp": [0.0, 0.0, 0.0], "quarters_used": 0}
+
+    nb_by_pos: dict[int, list[float]] = {0: [], 1: [], 2: []}
+    exp_by_pos: dict[int, list[float]] = {0: [], 1: [], 2: []}
+
+    for (yr, q) in sorted_quarters:
+        for pos in range(3):
+            key = (yr, q, pos)
+            nb_by_pos[pos].append(buckets[key]["nb"])
+            exp_by_pos[pos].append(buckets[key]["exp"])
+
+    def _avg(vals: list[float]) -> float:
+        return round(sum(vals) / len(vals), 2) if vals else 0.0
+
+    return {
+        "nb":  [_avg(nb_by_pos[0]),  _avg(nb_by_pos[1]),  _avg(nb_by_pos[2])],
+        "exp": [_avg(exp_by_pos[0]), _avg(exp_by_pos[1]), _avg(exp_by_pos[2])],
+        "quarters_used": len(sorted_quarters),
+    }
+
 
 @app.get("/api/forecast/current-quarter")
 async def get_forecast_current_quarter(db: AsyncSession = Depends(get_db)):
@@ -3420,6 +3675,41 @@ async def get_forecast_current_quarter(db: AsyncSession = Depends(get_db)):
         v = row[col] if col < len(row) else None
         return _to_float_sheet(v)
 
+    # ── load latest AI scores for pipeline weighting ─────────────────────────
+    latest_ai_at_r = await db.execute(select(func.max(DealAIScore.scored_at)))
+    latest_ai_at = latest_ai_at_r.scalar_one_or_none()
+    ai_prob_map: dict[str, float] = {}
+    if latest_ai_at:
+        ai_scores_r = await db.execute(
+            select(DealAIScore).where(DealAIScore.scored_at == latest_ai_at)
+        )
+        for s in ai_scores_r.scalars().all():
+            ai_prob_map[s.sf_opp_id] = s.probability
+
+    def _ai_weighted(o: Opportunity, weights: dict[str, float]) -> float:
+        """ARR × AI probability if scored, else fall back to Forecast__c categorical weight."""
+        sf_id = o.sf_id or ""
+        if sf_id in ai_prob_map:
+            return _pipeline_arr(o) * ai_prob_map[sf_id]
+        fc = (o.forecast_category or "").strip()
+        return _pipeline_arr(o) * weights.get(fc, 0.0)
+
+    # ── in-quarter pipeline estimate ─────────────────────────────────────────
+    iq_rates = await _compute_in_quarter_rates(db)
+    # month_pos: 0=first month of quarter, 1=second, 2=third
+    q_start_mk = months[0]
+
+    def _iq_est(rates_list: list, mk: str, actuals: float, pipe_weighted: float) -> float:
+        """Expected additional ARR from deals yet to enter the pipeline this quarter.
+        Only applied to future months or to the portion of current month not yet captured.
+        For months where we have substantial actuals+pipeline vs. the historical average,
+        we floor at 0 (no double-counting)."""
+        pos = months.index(mk)
+        hist_avg = rates_list[pos]
+        already_captured = actuals + pipe_weighted
+        # In-quarter estimate = max(0, historical average - what's already captured)
+        return max(0.0, round(hist_avg - already_captured, 2))
+
     # ── build per-month data ─────────────────────────────────────────────────
     nb_months, exp_months, renewal_months = [], [], []
 
@@ -3441,16 +3731,25 @@ async def get_forecast_current_quarter(db: AsyncSession = Depends(get_db)):
             and not _is_excluded_from_bookings_nb_only(o, _eff_rt(o))
             and o.close_date and d_start <= o.close_date <= d_end
         ]
-        nb_pipe_weighted = sum(_weighted(o, _FC_NB_EXP_WEIGHTS) for o in nb_open)
-        nb_pipe_raw      = sum(_pipeline_arr(o) for o in nb_open)
+        nb_pipe_weighted    = sum(_weighted(o, _FC_NB_EXP_WEIGHTS) for o in nb_open)
+        nb_pipe_ai_weighted = sum(_ai_weighted(o, _FC_NB_EXP_WEIGHTS) for o in nb_open)
+        nb_pipe_raw         = sum(_pipeline_arr(o) for o in nb_open)
 
+        nb_forecast_val    = round(nb_actual + nb_pipe_weighted, 2)
+        nb_forecast_ai_val = round(nb_actual + nb_pipe_ai_weighted, 2)
+        nb_iq = _iq_est(iq_rates["nb"], mk, nb_actual, nb_pipe_ai_weighted)
         nb_months.append({
             "month": mk,
             "actuals": round(nb_actual, 2),
             "pipeline_weighted": round(nb_pipe_weighted, 2),
+            "pipeline_ai_weighted": round(nb_pipe_ai_weighted, 2),
             "pipeline_raw": round(nb_pipe_raw, 2),
-            "forecast": round(nb_actual + nb_pipe_weighted, 2),
+            "forecast": nb_forecast_val,
+            "forecast_ai": nb_forecast_ai_val,
+            "in_quarter_est": nb_iq,
+            "adjusted_forecast": round(nb_forecast_ai_val + nb_iq, 2),
             "target": _sheet_target(_FORECAST_ROW_NB, mk),
+            "has_ai_scores": len(ai_prob_map) > 0,
         })
 
         # ── Expansion ─────────────────────────────────────────────────────
@@ -3467,16 +3766,25 @@ async def get_forecast_current_quarter(db: AsyncSession = Depends(get_db)):
             and _is_expansion_record_type(_eff_rt(o))
             and o.close_date and d_start <= o.close_date <= d_end
         ]
-        exp_pipe_weighted = sum(_weighted(o, _FC_NB_EXP_WEIGHTS) for o in exp_open)
-        exp_pipe_raw      = sum(_pipeline_arr(o) for o in exp_open)
+        exp_pipe_weighted    = sum(_weighted(o, _FC_NB_EXP_WEIGHTS) for o in exp_open)
+        exp_pipe_ai_weighted = sum(_ai_weighted(o, _FC_NB_EXP_WEIGHTS) for o in exp_open)
+        exp_pipe_raw         = sum(_pipeline_arr(o) for o in exp_open)
 
+        exp_forecast_val    = round(exp_actual + exp_pipe_weighted, 2)
+        exp_forecast_ai_val = round(exp_actual + exp_pipe_ai_weighted, 2)
+        exp_iq = _iq_est(iq_rates["exp"], mk, exp_actual, exp_pipe_ai_weighted)
         exp_months.append({
             "month": mk,
             "actuals": round(exp_actual, 2),
             "pipeline_weighted": round(exp_pipe_weighted, 2),
+            "pipeline_ai_weighted": round(exp_pipe_ai_weighted, 2),
             "pipeline_raw": round(exp_pipe_raw, 2),
-            "forecast": round(exp_actual + exp_pipe_weighted, 2),
+            "forecast": exp_forecast_val,
+            "forecast_ai": exp_forecast_ai_val,
+            "in_quarter_est": exp_iq,
+            "adjusted_forecast": round(exp_forecast_ai_val + exp_iq, 2),
             "target": _sheet_target(_FORECAST_ROW_EXP, mk),
+            "has_ai_scores": len(ai_prob_map) > 0,
         })
 
         # ── Renewals ──────────────────────────────────────────────────────
@@ -3569,23 +3877,291 @@ async def get_forecast_current_quarter(db: AsyncSession = Depends(get_db)):
         "expansion": exp_months,
         "renewals": renewal_months,
         "quarter_totals": {
-            "nb_actuals":       _sum(nb_months,  "actuals"),
-            "nb_forecast":      _sum(nb_months,  "forecast"),
-            "nb_target":        _sum(nb_months,  "target") if all(m["target"] for m in nb_months) else None,
-            "exp_actuals":      _sum(exp_months, "actuals"),
-            "exp_forecast":     _sum(exp_months, "forecast"),
-            "exp_target":       _sum(exp_months, "target") if all(m["target"] for m in exp_months) else None,
-            "total_actuals":    round(_sum(nb_months, "actuals") + _sum(exp_months, "actuals"), 2),
-            "total_forecast":   round(_sum(nb_months, "forecast") + _sum(exp_months, "forecast"), 2),
-            "renewal_due":      _sum(renewal_months, "due_arr"),
-            "renewal_won":      _sum(renewal_months, "won_arr"),
-            "renewal_forecast": _sum(renewal_months, "forecast_arr"),
-            "rate_actual":      _avg(renewal_months, "rate_actual"),
-            "rate_forecast":    _avg(renewal_months, "rate_forecast"),
-            "rate_target":      _avg(renewal_months, "rate_target"),
+            "nb_actuals":              _sum(nb_months,  "actuals"),
+            "nb_forecast":             _sum(nb_months,  "forecast"),
+            "nb_forecast_ai":          _sum(nb_months,  "forecast_ai"),
+            "nb_in_quarter_est":       _sum(nb_months,  "in_quarter_est"),
+            "nb_adjusted_forecast":    _sum(nb_months,  "adjusted_forecast"),
+            "nb_target":               _sum(nb_months,  "target") if all(m["target"] for m in nb_months) else None,
+            "exp_actuals":             _sum(exp_months, "actuals"),
+            "exp_forecast":            _sum(exp_months, "forecast"),
+            "exp_forecast_ai":         _sum(exp_months, "forecast_ai"),
+            "exp_in_quarter_est":      _sum(exp_months, "in_quarter_est"),
+            "exp_adjusted_forecast":   _sum(exp_months, "adjusted_forecast"),
+            "exp_target":              _sum(exp_months, "target") if all(m["target"] for m in exp_months) else None,
+            "total_actuals":           round(_sum(nb_months, "actuals") + _sum(exp_months, "actuals"), 2),
+            "total_forecast":          round(_sum(nb_months, "forecast") + _sum(exp_months, "forecast"), 2),
+            "total_forecast_ai":       round(_sum(nb_months, "forecast_ai") + _sum(exp_months, "forecast_ai"), 2),
+            "total_in_quarter_est":    round(_sum(nb_months, "in_quarter_est") + _sum(exp_months, "in_quarter_est"), 2),
+            "total_adjusted_forecast": round(_sum(nb_months, "adjusted_forecast") + _sum(exp_months, "adjusted_forecast"), 2),
+            "has_ai_scores":           len(ai_prob_map) > 0,
+            "renewal_due":           _sum(renewal_months, "due_arr"),
+            "renewal_won":           _sum(renewal_months, "won_arr"),
+            "renewal_forecast":      _sum(renewal_months, "forecast_arr"),
+            "rate_actual":           _avg(renewal_months, "rate_actual"),
+            "rate_forecast":         _avg(renewal_months, "rate_forecast"),
+            "rate_target":           _avg(renewal_months, "rate_target"),
         },
+        "in_quarter_quarters_used": iq_rates["quarters_used"],
         "salesforce_base_url": base or None,
     }
+
+
+@app.get("/api/forecast/ai-current-quarter")
+async def get_ai_forecast_current_quarter(db: AsyncSession = Depends(get_db)):
+    """
+    AI-powered deal forecast for the current quarter.
+    Uses LLM-generated win-probability scores (DealAIScore) to compute a per-month and quarterly
+    AI forecast for NB + Expansion opportunities. Complements the weighted-pipeline forecast.
+    Returns last_scored_at so the UI can show data freshness.
+    Returns empty scores if no AI scoring has run yet (ENABLE_AI_FORECAST_SCORING=1 in .env).
+    """
+    now_est = datetime.now(EST)
+    q_num = (now_est.month - 1) // 3 + 1
+    q_start_month = (q_num - 1) * 3 + 1
+    months = [
+        f"{now_est.year}-{str(q_start_month + i).zfill(2)}"
+        for i in range(3)
+    ]
+    q_label = f"Q{q_num} '{str(now_est.year)[2:]}"
+
+    # ── Latest DealAIScore per opportunity (most recent scored_at) ─────────────
+    latest_scored_at_r = await db.execute(
+        select(func.max(DealAIScore.scored_at))
+    )
+    last_scored_at = latest_scored_at_r.scalar_one_or_none()
+
+    scores_map: dict[str, DealAIScore] = {}
+    observations: list[str] = []
+    if last_scored_at is not None:
+        # Get scores from the most recent scoring run
+        scores_r = await db.execute(
+            select(DealAIScore).where(DealAIScore.scored_at == last_scored_at)
+        )
+        for s in scores_r.scalars().all():
+            scores_map[s.sf_opp_id] = s
+        # Load observations for this run
+        try:
+            obs_r = await db.execute(
+                select(AIForecastObservations).where(AIForecastObservations.scored_at == last_scored_at)
+            )
+            obs_row = obs_r.scalars().first()
+            if obs_row and obs_row.observations_json:
+                import json as _json_obs
+                observations = _json_obs.loads(obs_row.observations_json)
+        except Exception:
+            pass
+
+    # ── Load open NB + Expansion opportunities ────────────────────────────────
+    result = await db.execute(select(Opportunity))
+    all_opps: list[Opportunity] = list(result.scalars().all())
+    rt_overrides = await _get_record_type_overrides(db)
+
+    def _eff_rt_ai_fcst(o: Opportunity) -> str:
+        _key = (o.sf_id or "").strip()
+        _ov = rt_overrides.get(_key) or (rt_overrides.get(_key[:15]) if len(_key) >= 15 else None)
+        return (_ov or o.record_type_name or "").strip()
+
+    # Use the same NB+Expansion filters as get_forecast_current_quarter so numbers align exactly
+    open_sf_ids_fcst = {
+        o.sf_id for o in all_opps
+        if not _is_closed_won_stage(o.stage_name)
+        and not _is_closed_lost_stage(o.stage_name)
+        and o.sf_id
+    }
+    opp_to_line_arr_fcst = await _line_item_arr_for_opportunities(db, open_sf_ids_fcst)
+
+    def _pipeline_arr(o: Opportunity) -> float:
+        if o.mrr is not None and o.mrr != 0:
+            return round(float(o.mrr) * PIPELINE_ARR_MULTIPLIER, 2)
+        return opp_to_line_arr_fcst.get(o.sf_id, 0.0)
+
+    def _tomonthkey(d: Optional[date]) -> Optional[str]:
+        if not d:
+            return None
+        return f"{d.year}-{str(d.month).zfill(2)}"
+
+    # ── Per-month roll-up — same NB+Exp filters as main forecast endpoint ─────
+    month_data = []
+    for mk in months:
+        y, m_int = int(mk[:4]), int(mk[5:])
+        import calendar as _cal
+        d_start = date(y, m_int, 1)
+        d_end = date(y, m_int, _cal.monthrange(y, m_int)[1])
+
+        nb_opps_m = [
+            o for o in all_opps
+            if not _is_closed_won_stage(o.stage_name)
+            and not _is_closed_lost_stage(o.stage_name)
+            and _is_new_business_record_type(_eff_rt_ai_fcst(o))
+            and not _is_excluded_from_bookings_nb_only(o, _eff_rt_ai_fcst(o))
+            and o.close_date and d_start <= o.close_date <= d_end
+        ]
+        exp_opps_m = [
+            o for o in all_opps
+            if not _is_closed_won_stage(o.stage_name)
+            and not _is_closed_lost_stage(o.stage_name)
+            and _is_expansion_record_type(_eff_rt_ai_fcst(o))
+            and o.close_date and d_start <= o.close_date <= d_end
+        ]
+        month_opps = nb_opps_m + exp_opps_m
+
+        ai_forecast = 0.0
+        top_deals = []
+        for o in month_opps:
+            arr = _pipeline_arr(o)
+            score = scores_map.get(o.sf_id or "")
+            prob = score.probability if score else None
+            # Mirror _ai_weighted from main forecast: use AI prob if scored, else Forecast__c fallback
+            if prob is not None:
+                effective_weight = prob
+            else:
+                fc = (o.forecast_category or "").strip()
+                effective_weight = _FC_NB_EXP_WEIGHTS.get(fc, 0.0)
+            ai_contribution = arr * effective_weight
+            ai_forecast += ai_contribution
+            top_deals.append({
+                "sf_opp_id": o.sf_id,
+                "account_name": o.account_name,
+                "opportunity_name": o.name,
+                "arr": round(arr, 0),
+                "probability": round(prob, 3) if prob is not None else None,
+                "effective_weight": round(effective_weight, 3),
+                "ai_contribution": round(ai_contribution, 0),
+                "reasoning": score.reasoning if score else None,
+                "stage": o.stage_name,
+                "forecast_category": o.forecast_category,
+                "record_type": _eff_rt_ai_fcst(o),
+            })
+        top_deals.sort(key=lambda x: -(x["arr"] or 0))
+        month_data.append({
+            "month": mk,
+            "ai_forecast": round(ai_forecast, 2),
+            "deal_count": len(month_opps),
+            "scored_deal_count": sum(1 for d in top_deals if d["probability"] is not None),
+            "top_deals": top_deals[:10],
+        })
+
+    total_ai_forecast = sum(m["ai_forecast"] for m in month_data)
+
+    base = os.getenv("SALESFORCE_BASE_URL", "").strip().rstrip("/")
+    return {
+        "quarter": q_label,
+        "months": months,
+        "month_data": month_data,
+        "total_ai_forecast": round(total_ai_forecast, 2),
+        "last_scored_at": last_scored_at.isoformat() if last_scored_at else None,
+        "total_scored_deals": len(scores_map),
+        "salesforce_base_url": base or None,
+        "observations": observations,
+    }
+
+
+@app.post("/api/forecast/snapshot")
+async def post_forecast_snapshot(db: AsyncSession = Depends(get_db)):
+    """Save a forecast snapshot for today. Called automatically on 1st of each month by the scheduler.
+    Can also be triggered on-demand via this endpoint."""
+    saved = await _take_forecast_snapshot(db)
+    await db.commit()
+    return {"ok": True, "months_saved": saved, "snapshot_date": datetime.now(EST).date().isoformat()}
+
+
+@app.get("/api/forecast/accuracy")
+async def get_forecast_accuracy(db: AsyncSession = Depends(get_db)):
+    """
+    Forecast accuracy analysis: compare historical snapshots to final actuals.
+    For each past month with a snapshot, shows forecast (at start of month, start of quarter)
+    vs. actual bookings. Also shows AI forecast accuracy where available.
+    """
+    today = datetime.now(EST).date()
+
+    # Load all snapshots
+    snaps_r = await db.execute(
+        select(ForecastSnapshot).order_by(ForecastSnapshot.snapshot_date, ForecastSnapshot.target_month)
+    )
+    all_snaps: list[ForecastSnapshot] = list(snaps_r.scalars().all())
+
+    if not all_snaps:
+        return {"rows": [], "message": "No forecast snapshots yet. Snapshots are taken automatically on the 1st of each month."}
+
+    # Get all unique target months that have snapshots
+    target_months = sorted({s.target_month for s in all_snaps})
+
+    # For each target month, get actuals (final closed won ARR)
+    rows = []
+    for mk in target_months:
+        y, m = int(mk[:4]), int(mk[5:])
+        d_start = date(y, m, 1)
+        d_end = date(y, m, calendar.monthrange(y, m)[1])
+
+        # Is this month complete?
+        is_complete = d_end < today
+        actuals_end = d_end if is_complete else today
+
+        _total, nb_actual, _exp = await _closed_won_arr_in_range(db, d_start, actuals_end)
+        _exp_total, _nb2, exp_mid = await _closed_won_arr_in_range(db, d_start, actuals_end)
+        exp_upon = await _closed_won_renewal_expansion_arr_in_range(db, d_start, actuals_end)
+        exp_actual = round(exp_mid + exp_upon, 2)
+        total_actual = round(nb_actual + exp_actual, 2)
+
+        # Group snapshots for this month by snapshot_date
+        month_snaps = [s for s in all_snaps if s.target_month == mk]
+        month_snaps.sort(key=lambda s: s.snapshot_date)
+
+        snap_entries = []
+        for s in month_snaps:
+            snap_entries.append({
+                "snapshot_date": s.snapshot_date.isoformat(),
+                "nb_forecast": s.nb_forecast,
+                "nb_adjusted_forecast": s.nb_adjusted_forecast,
+                "nb_ai_forecast": s.nb_ai_forecast,
+                "exp_forecast": s.exp_forecast,
+                "exp_adjusted_forecast": s.exp_adjusted_forecast,
+                "exp_ai_forecast": s.exp_ai_forecast,
+                "total_forecast": s.total_forecast,
+                "total_adjusted_forecast": s.total_adjusted_forecast,
+            })
+
+        # Accuracy vs. earliest snapshot (start-of-month forecast)
+        earliest = month_snaps[0] if month_snaps else None
+        acc_weighted = round(total_actual / earliest.total_forecast * 100, 1) if (earliest and earliest.total_forecast and earliest.total_forecast > 0 and is_complete) else None
+        acc_adjusted = round(total_actual / earliest.total_adjusted_forecast * 100, 1) if (earliest and earliest.total_adjusted_forecast and earliest.total_adjusted_forecast > 0 and is_complete) else None
+        acc_ai = round(total_actual / (earliest.nb_ai_forecast or 0 + earliest.exp_ai_forecast or 0) * 100, 1) if (earliest and earliest.nb_ai_forecast and earliest.exp_ai_forecast and is_complete) else None
+
+        rows.append({
+            "month": mk,
+            "is_complete": is_complete,
+            "nb_actual": round(nb_actual, 2),
+            "exp_actual": round(exp_actual, 2),
+            "total_actual": total_actual,
+            "snapshots": snap_entries,
+            "earliest_snapshot_date": earliest.snapshot_date.isoformat() if earliest else None,
+            "weighted_forecast_at_snap": earliest.total_forecast if earliest else None,
+            "adjusted_forecast_at_snap": earliest.total_adjusted_forecast if earliest else None,
+            "accuracy_weighted_pct": acc_weighted,
+            "accuracy_adjusted_pct": acc_adjusted,
+            "accuracy_ai_pct": acc_ai,
+        })
+
+    return {
+        "rows": rows,
+        "snapshot_count": len(all_snaps),
+        "message": "Snapshots are taken on the 1st of each month. Accuracy % shown only for complete months.",
+    }
+
+
+@app.post("/api/forecast/ai-rescore")
+async def post_ai_rescore(db: AsyncSession = Depends(get_db)):
+    """
+    On-demand trigger for AI forecast scoring. Runs _run_ai_forecast_scoring immediately.
+    Requires OPENAI_API_KEY in .env. Does NOT require ENABLE_AI_FORECAST_SCORING.
+    """
+    result = await _run_ai_forecast_scoring(db)
+    if result.get("ok"):
+        await db.commit()
+    else:
+        await db.rollback()
+    return result
 
 
 @app.post("/api/arr-snapshot/refresh")
@@ -4368,13 +4944,465 @@ async def _take_salesforce_eod_snapshot(db: AsyncSession) -> None:
     await _materialize_arr_schedule_daily(db, payload, today_est)
 
 
+async def _take_forecast_snapshot(db: AsyncSession) -> int:
+    """Save a point-in-time snapshot of the current quarter forecast.
+    Called automatically on the 1st of each month and via POST /api/forecast/snapshot.
+    Returns the number of month rows saved."""
+    from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+    today = datetime.now(EST).date()
+    q_start_mo = ((today.month - 1) // 3) * 3 + 1
+    q_year = today.year
+    months = [f"{q_year}-{(q_start_mo + i):02d}" for i in range(3)]
+
+    # Get the current forecast data by calling the same logic inline
+    # We re-use the endpoint's DB session — just call the core helper
+    # Build a minimal version: load actuals + pipeline + in-quarter estimates
+
+    def _mk_to_date_range(mk: str) -> tuple[date, date]:
+        y, m = int(mk[:4]), int(mk[5:])
+        return date(y, m, 1), date(y, m, calendar.monthrange(y, m)[1])
+
+    _q = select(Opportunity)
+    _r = await db.execute(_q)
+    all_opps: list[Opportunity] = list(_r.scalars().all())
+    overrides = await _get_record_type_overrides(db)
+
+    def _eff_rt_snap(o: Opportunity) -> str:
+        _key = (o.sf_id or "").strip()
+        _ov = overrides.get(_key) or (overrides.get(_key[:15]) if len(_key) >= 15 else None)
+        return (_ov or o.record_type_name or "").strip()
+
+    open_sf_ids = {o.sf_id for o in all_opps if not _is_closed_won_stage(o.stage_name) and not _is_closed_lost_stage(o.stage_name) and o.sf_id}
+    opp_to_line_arr = await _line_item_arr_for_opportunities(db, open_sf_ids)
+
+    def _pipeline_arr_snap(o: Opportunity) -> float:
+        if o.mrr is not None and o.mrr != 0:
+            return round(float(o.mrr) * PIPELINE_ARR_MULTIPLIER, 2)
+        return opp_to_line_arr.get(o.sf_id, 0.0)
+
+    iq_rates = await _compute_in_quarter_rates(db)
+
+    # Latest AI scores
+    latest_ai_r = await db.execute(select(func.max(DealAIScore.scored_at)))
+    latest_ai_at = latest_ai_r.scalar_one_or_none()
+    ai_scores: dict[str, float] = {}
+    if latest_ai_at:
+        ai_r = await db.execute(select(DealAIScore).where(DealAIScore.scored_at == latest_ai_at))
+        for s in ai_r.scalars().all():
+            ai_scores[s.sf_opp_id] = s.probability
+
+    saved = 0
+    for mk in months:
+        d_start, d_end = _mk_to_date_range(mk)
+        actuals_end = today if mk == today.strftime("%Y-%m") else d_end
+
+        _nb_total, nb_actual, _nb_exp = await _closed_won_arr_in_range(db, d_start, actuals_end)
+        _exp_total, _exp_nb, exp_mid = await _closed_won_arr_in_range(db, d_start, actuals_end)
+        exp_upon = await _closed_won_renewal_expansion_arr_in_range(db, d_start, actuals_end)
+        exp_actual = round(exp_mid + exp_upon, 2)
+
+        def _weighted_snap(o: Opportunity) -> float:
+            fc = (o.forecast_category or "").strip()
+            w = _FC_NB_EXP_WEIGHTS.get(fc, 0.0)
+            return _pipeline_arr_snap(o) * w
+
+        nb_open = [o for o in all_opps if not _is_closed_won_stage(o.stage_name) and not _is_closed_lost_stage(o.stage_name) and _is_new_business_record_type(_eff_rt_snap(o)) and not _is_excluded_from_bookings_nb_only(o, _eff_rt_snap(o)) and o.close_date and d_start <= o.close_date <= d_end]
+        exp_open = [o for o in all_opps if not _is_closed_won_stage(o.stage_name) and not _is_closed_lost_stage(o.stage_name) and _is_expansion_record_type(_eff_rt_snap(o)) and o.close_date and d_start <= o.close_date <= d_end]
+
+        nb_pipe_w = sum(_weighted_snap(o) for o in nb_open)
+        exp_pipe_w = sum(_weighted_snap(o) for o in exp_open)
+
+        nb_forecast = round(nb_actual + nb_pipe_w, 2)
+        exp_forecast = round(exp_actual + exp_pipe_w, 2)
+
+        pos = months.index(mk)
+        nb_iq = max(0.0, round(iq_rates["nb"][pos] - nb_actual - nb_pipe_w, 2))
+        exp_iq = max(0.0, round(iq_rates["exp"][pos] - exp_actual - exp_pipe_w, 2))
+
+        nb_ai = sum(_pipeline_arr_snap(o) * ai_scores.get(o.sf_id or "", 0.0) for o in nb_open)
+        exp_ai = sum(_pipeline_arr_snap(o) * ai_scores.get(o.sf_id or "", 0.0) for o in exp_open)
+
+        snap_row = ForecastSnapshot(
+            snapshot_date=today,
+            target_month=mk,
+            nb_actuals=round(nb_actual, 2),
+            nb_pipeline_weighted=round(nb_pipe_w, 2),
+            nb_in_quarter_est=nb_iq,
+            nb_forecast=nb_forecast,
+            nb_adjusted_forecast=round(nb_forecast + nb_iq, 2),
+            nb_target=None,
+            exp_actuals=round(exp_actual, 2),
+            exp_pipeline_weighted=round(exp_pipe_w, 2),
+            exp_in_quarter_est=exp_iq,
+            exp_forecast=exp_forecast,
+            exp_adjusted_forecast=round(exp_forecast + exp_iq, 2),
+            exp_target=None,
+            total_forecast=round(nb_forecast + exp_forecast, 2),
+            total_adjusted_forecast=round(nb_forecast + nb_iq + exp_forecast + exp_iq, 2),
+            total_target=None,
+            nb_ai_forecast=round(nb_actual + nb_ai, 2) if ai_scores else None,
+            exp_ai_forecast=round(exp_actual + exp_ai, 2) if ai_scores else None,
+        )
+        # Upsert: replace existing snapshot for same date + month
+        await db.execute(
+            delete(ForecastSnapshot).where(
+                ForecastSnapshot.snapshot_date == today,
+                ForecastSnapshot.target_month == mk,
+            )
+        )
+        db.add(snap_row)
+        saved += 1
+
+    return saved
+
+
+_AI_SCORING_MODEL = os.getenv("AI_FORECAST_MODEL", "gpt-4o-mini")
+_AI_SCORING_MAX_BATCH = 10  # max deals per LLM call — reduced from 20 to fit richer context (notes, activity)
+
+
+async def _run_ai_forecast_scoring(db: AsyncSession) -> dict:
+    """Score all open NB + Expansion opportunities with an LLM using field history as context.
+    Upserts results into DealAIScore. Returns a summary dict. Non-fatal on LLM errors."""
+    openai_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not openai_key:
+        return {"ok": False, "error": "OPENAI_API_KEY not set — AI scoring skipped."}
+
+    try:
+        import openai as _openai
+    except ImportError:
+        return {"ok": False, "error": "openai package not installed — run: pip install openai"}
+
+    client = _openai.AsyncOpenAI(api_key=openai_key)
+
+    # ── Load open NB + Expansion opportunities ────────────────────────────────
+    result = await db.execute(select(Opportunity))
+    all_opps: list[Opportunity] = list(result.scalars().all())
+    rt_overrides = await _get_record_type_overrides(db)
+
+    def _eff_rt_ai(o: Opportunity) -> str:
+        _key = (o.sf_id or "").strip()
+        _ov = rt_overrides.get(_key) or (rt_overrides.get(_key[:15]) if len(_key) >= 15 else None)
+        return (_ov or o.record_type_name or "").strip()
+
+    open_opps = [
+        o for o in all_opps
+        if not _is_closed_won_stage(o.stage_name)
+        and not _is_closed_lost_stage(o.stage_name)
+        and not _is_renewal_record_type(_eff_rt_ai(o))
+    ]
+    if not open_opps:
+        return {"ok": True, "scored": 0, "message": "No open NB/Expansion opportunities to score."}
+
+    # ── Load field history keyed by opp sf_id ─────────────────────────────────
+    hist_result = await db.execute(
+        select(OppFieldHistory).order_by(OppFieldHistory.changed_at)
+    )
+    hist_rows: list[OppFieldHistory] = list(hist_result.scalars().all())
+    hist_by_opp: dict[str, list[OppFieldHistory]] = {}
+    for h in hist_rows:
+        hist_by_opp.setdefault(h.sf_opp_id, []).append(h)
+
+    # Load notes and activities (non-fatal if tables don't exist yet)
+    notes_by_opp: dict[str, list[OppNote]] = {}
+    try:
+        notes_result = await db.execute(select(OppNote).order_by(OppNote.created_date.desc()))
+        for n in notes_result.scalars().all():
+            notes_by_opp.setdefault(n.sf_opp_id, []).append(n)
+    except Exception:
+        pass
+
+    activities_by_opp: dict[str, list[OppActivity]] = {}
+    try:
+        acts_result = await db.execute(select(OppActivity).order_by(OppActivity.activity_date.desc()))
+        for a in acts_result.scalars().all():
+            activities_by_opp.setdefault(a.sf_opp_id, []).append(a)
+    except Exception:
+        pass
+
+    open_sf_ids_ai = {o.sf_id for o in open_opps if o.sf_id}
+    opp_to_line_arr_ai = await _line_item_arr_for_opportunities(db, open_sf_ids_ai)
+
+    def _pipeline_arr(o: Opportunity) -> float:
+        if o.mrr is not None and o.mrr != 0:
+            return round(float(o.mrr) * PIPELINE_ARR_MULTIPLIER, 2)
+        return opp_to_line_arr_ai.get(o.sf_id, 0.0)
+
+    today_est = datetime.now(EST).date()
+
+    def _build_deal_context(o: Opportunity) -> dict:
+        history = hist_by_opp.get(o.sf_id or "", [])
+
+        # Stage progression
+        stage_hist = [h for h in history if h.field == "StageName"]
+        stage_progression = []
+        for i, h in enumerate(stage_hist):
+            next_change = stage_hist[i + 1].changed_at if i + 1 < len(stage_hist) else datetime.now(EST)
+            diff = (next_change.date() if hasattr(next_change, "date") else next_change) - \
+                   (h.changed_at.date() if hasattr(h.changed_at, "date") else h.changed_at)
+            days = max(0, diff.days)
+            stage_progression.append({"stage": h.new_value, "days_in_stage": days})
+
+        # Close date pushes
+        close_hist = [h for h in history if h.field == "CloseDate"]
+        close_date_pushes = 0
+        total_days_pushed = 0
+        for h in close_hist:
+            try:
+                old_d = date.fromisoformat(str(h.old_value)[:10]) if h.old_value else None
+                new_d = date.fromisoformat(str(h.new_value)[:10]) if h.new_value else None
+                if old_d and new_d:
+                    diff = (new_d - old_d).days
+                    if diff > 0:
+                        close_date_pushes += 1
+                        total_days_pushed += diff
+            except (ValueError, TypeError):
+                pass
+
+        # Amount changes
+        amount_hist = [h for h in history if h.field == "Amount"]
+        amount_changes = []
+        for h in amount_hist:
+            try:
+                old_a = float(h.old_value) if h.old_value else None
+                new_a = float(h.new_value) if h.new_value else None
+                if old_a is not None and new_a is not None:
+                    amount_changes.append({"from": round(old_a, 0), "to": round(new_a, 0)})
+            except (ValueError, TypeError):
+                pass
+
+        # Notes (most recent 3, title + first 300 chars of body)
+        opp_notes = notes_by_opp.get(o.sf_id or "", [])
+        notes_summary = [
+            {
+                "title": n.title,
+                "excerpt": (n.body or "")[:300],
+                "date": str(n.created_date.date()) if n.created_date and hasattr(n.created_date, "date") else str(n.created_date) if n.created_date else None,
+            }
+            for n in opp_notes[:3]
+        ]
+
+        # Recent activity (last 10 tasks)
+        opp_acts = activities_by_opp.get(o.sf_id or "", [])
+        recent_activity = [
+            {
+                "type": a.activity_type or "Task",
+                "subject": a.subject,
+                "date": str(a.activity_date) if a.activity_date else None,
+            }
+            for a in opp_acts[:10]
+        ]
+        days_since_last_activity = None
+        if opp_acts and opp_acts[0].activity_date:
+            days_since_last_activity = (today_est - opp_acts[0].activity_date).days
+
+        arr = _pipeline_arr(o)
+        days_until_close = (o.close_date - today_est).days if o.close_date else None
+        days_since_created = None
+        if o.created_date:
+            cd = o.created_date.date() if hasattr(o.created_date, "date") else o.created_date
+            days_since_created = (today_est - cd).days
+
+        ctx: dict = {
+            "sf_opp_id": o.sf_id,
+            "name": o.name,
+            "account": o.account_name,
+            "owner": o.owner_name,
+            "stage": o.stage_name,
+            "forecast_category": o.forecast_category,
+            "arr": round(arr, 0),
+            "close_date": str(o.close_date) if o.close_date else None,
+            "days_until_close": days_until_close,
+            "days_since_created": days_since_created,
+            "stage_progression": stage_progression[-10:],
+            "close_date_pushes": close_date_pushes,
+            "total_days_pushed": total_days_pushed,
+            "amount_changes": amount_changes[-5:],
+            "next_step": o.next_step,
+            "days_since_last_activity": days_since_last_activity,
+            "recent_activity": recent_activity,
+            "notes": notes_summary,
+        }
+        # Include prospect context fields only when available
+        if o.lead_type:
+            ctx["lead_type"] = o.lead_type
+        if o.current_crm:
+            ctx["current_crm"] = o.current_crm
+        if o.current_voip:
+            ctx["current_voip"] = o.current_voip
+        return ctx
+
+    scored_total = 0
+    scored_at = datetime.now(EST)
+    logger = logging.getLogger(__name__)
+
+    # ── Process in batches ────────────────────────────────────────────────────
+    for batch_start in range(0, len(open_opps), _AI_SCORING_MAX_BATCH):
+        batch = open_opps[batch_start: batch_start + _AI_SCORING_MAX_BATCH]
+        contexts = [_build_deal_context(o) for o in batch]
+        import json as _json
+
+        system_prompt = (
+            "You are a SaaS sales analyst. You will receive a list of open sales opportunities "
+            "with stage history, close-date changes, deal size, next steps, recent activity, and notes. "
+            "For each deal, assign a win probability (0.0 to 1.0) representing the likelihood "
+            "the deal closes as Closed Won within 90 days of its current close date. "
+            "Consider: stage velocity, close-date stability (fewer pushes = better), "
+            "forecast category alignment, days until close, recency of activity (stale = lower), "
+            "next step clarity (specific action = higher), and note content (positive signals like pricing "
+            "discussions or scheduled demos = higher; concerns or silence = lower). "
+            "Return ONLY valid JSON in this exact schema with no extra text:\n"
+            '{"scores": [{"sf_opp_id": "<id>", "probability": <float 0-1>, "reasoning": "<1-2 sentences>"}]}'
+        )
+
+        user_content = _json.dumps({"opportunities": contexts}, default=str)
+
+        try:
+            response = await client.chat.completions.create(
+                model=_AI_SCORING_MODEL,
+                response_format={"type": "json_object"},
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_content},
+                ],
+                temperature=0.1,
+                max_tokens=6000,
+            )
+            raw = response.choices[0].message.content or "{}"
+            parsed = _json.loads(raw)
+            scores_list: list[dict] = parsed.get("scores", [])
+        except Exception as llm_err:
+            logger.exception("AI scoring LLM call failed for batch starting at %d: %s", batch_start, llm_err)
+            continue
+
+        score_map = {s["sf_opp_id"]: s for s in scores_list if "sf_opp_id" in s}
+
+        for o, ctx in zip(batch, contexts):
+            sf_id = o.sf_id
+            score_entry = score_map.get(sf_id)
+            if not score_entry:
+                continue
+            try:
+                prob = float(score_entry.get("probability", 0.5))
+                prob = max(0.0, min(1.0, prob))
+            except (TypeError, ValueError):
+                prob = 0.5
+            reasoning = str(score_entry.get("reasoning", ""))[:1000]
+
+            # Upsert: delete previous score for this opp from same run date, insert new
+            await db.execute(
+                delete(DealAIScore).where(
+                    DealAIScore.sf_opp_id == sf_id,
+                    DealAIScore.scored_at >= datetime.combine(today_est, datetime.min.time()),
+                )
+            )
+            db.add(DealAIScore(
+                sf_opp_id=sf_id,
+                scored_at=scored_at,
+                probability=prob,
+                reasoning=reasoning,
+                model_used=_AI_SCORING_MODEL,
+                input_snapshot_json=_json.dumps(ctx, default=str)[:8000],
+            ))
+            scored_total += 1
+
+    # ── Generate executive observations ──────────────────────────────────────
+    observations: list[str] = []
+    try:
+        import json as _json2
+
+        # Build a compact pipeline summary for the observations prompt
+        now_est2 = datetime.now(EST)
+        q_num2 = (now_est2.month - 1) // 3 + 1
+        q_start2 = (q_num2 - 1) * 3 + 1
+        months2 = [f"{now_est2.year}-{(q_start2 + i):02d}" for i in range(3)]
+        q_label2 = f"Q{q_num2} '{str(now_est2.year)[2:]}"
+
+        # Load freshly written scores for this run
+        scores_r2 = await db.execute(
+            select(DealAIScore).where(DealAIScore.scored_at == scored_at)
+        )
+        run_scores: list[DealAIScore] = list(scores_r2.scalars().all())
+        score_prob_by_id = {s.sf_opp_id: s.probability for s in run_scores}
+
+        month_summaries = []
+        for mk in months2:
+            y2, m2 = int(mk[:4]), int(mk[5:])
+            import calendar as _cal2
+            d_s = date(y2, m2, 1)
+            d_e = date(y2, m2, _cal2.monthrange(y2, m2)[1])
+            month_opps = [
+                o for o in open_opps
+                if o.close_date and d_s <= o.close_date <= d_e
+            ]
+            month_scored = [(o, score_prob_by_id[o.sf_id]) for o in month_opps if o.sf_id in score_prob_by_id]
+            total_arr = sum(_pipeline_arr(o) for o in month_opps)
+            weighted_arr = sum(_pipeline_arr(o) * p for o, p in month_scored)
+            avg_prob = (sum(p for _, p in month_scored) / len(month_scored)) if month_scored else 0
+            high_conf = [(o.account_name, round(_pipeline_arr(o)), round(p * 100)) for o, p in month_scored if p >= 0.7][:3]
+            at_risk = [(o.account_name, round(_pipeline_arr(o)), round(p * 100)) for o, p in month_scored if p < 0.3 and _pipeline_arr(o) > 10000][:3]
+            close_pushes = sum(
+                len([h for h in hist_by_opp.get(o.sf_id or "", []) if h.field == "CloseDate"])
+                for o in month_opps
+            )
+            month_summaries.append({
+                "month": mk,
+                "total_pipeline_arr": round(total_arr),
+                "ai_weighted_arr": round(weighted_arr),
+                "avg_probability_pct": round(avg_prob * 100, 1),
+                "deals_total": len(month_opps),
+                "deals_scored": len(month_scored),
+                "high_confidence_deals": high_conf,
+                "at_risk_deals": at_risk,
+                "total_close_date_pushes": close_pushes,
+            })
+
+        obs_prompt = (
+            f"You are a SaaS CFO advisor generating a pipeline health briefing for the executive team for {q_label2}. "
+            "Based on the AI-scored pipeline data below, write 4-6 concise bullet-point observations. "
+            "Cover: overall forecast confidence, month-by-month risk, concentration risk (few large deals), "
+            "deal velocity signals, and any notable patterns from high/at-risk deals. "
+            "Be specific with numbers. Write for a CFO/CEO audience — direct, no fluff. "
+            "Return ONLY valid JSON: {\"observations\": [\"bullet 1\", \"bullet 2\", ...]}"
+        )
+        obs_response = await client.chat.completions.create(
+            model=_AI_SCORING_MODEL,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": obs_prompt},
+                {"role": "user", "content": _json2.dumps({"quarter": q_label2, "months": month_summaries}, default=str)},
+            ],
+            temperature=0.3,
+            max_tokens=1000,
+        )
+        obs_raw = obs_response.choices[0].message.content or "{}"
+        observations = _json2.loads(obs_raw).get("observations", [])
+
+        # Upsert observations for this run
+        await db.execute(
+            delete(AIForecastObservations).where(AIForecastObservations.scored_at == scored_at)
+        )
+        db.add(AIForecastObservations(
+            scored_at=scored_at,
+            quarter_label=q_label2,
+            observations_json=_json2.dumps(observations),
+        ))
+    except Exception as obs_err:
+        logger.warning("Failed to generate observations: %s", obs_err)
+
+    return {"ok": True, "scored": scored_total, "scored_at": scored_at.isoformat()}
+
+
 async def _scheduled_salesforce_jobs() -> None:
     """Hourly Salesforce sync only if ENABLE_SCHEDULED_BACKGROUND_SYNC; daily EOD at 23:59:59 EST if ENABLE_SCHEDULED_EOD_SNAPSHOT (default on).
     EOD snapshots whatever is already in SQLite (typically last Dashboard → Refresh app data)."""
     scheduled_eod = os.getenv("ENABLE_SCHEDULED_EOD_SNAPSHOT", "1").lower() not in ("0", "false", "no")
     scheduled_hourly_sf = os.getenv("ENABLE_SCHEDULED_BACKGROUND_SYNC", "").lower() in ("1", "true", "yes")
+    scheduled_ai_scoring = os.getenv("ENABLE_AI_FORECAST_SCORING", "").lower() in ("1", "true", "yes")
     last_sync_hour: Optional[tuple[date, int]] = None  # (date_est, hour_est)
     last_eod_date: Optional[date] = None
+    last_ai_score_date: Optional[date] = None
+    last_forecast_snapshot_date: Optional[date] = None
 
     while True:
         try:
@@ -4382,6 +5410,10 @@ async def _scheduled_salesforce_jobs() -> None:
             today_est = now_est.date()
             run_hourly = scheduled_hourly_sf and now_est.minute == 59 and now_est.second >= 59
             run_eod = scheduled_eod and now_est.hour == 23 and now_est.minute == 59
+            # AI scoring runs nightly at 00:30 EST (after midnight, giving SF sync time to finish)
+            run_ai = scheduled_ai_scoring and now_est.hour == 0 and now_est.minute == 30
+            # Daily forecast snapshot at 01:00 EST (after SF sync + AI scoring)
+            run_forecast_snap = now_est.hour == 1 and now_est.minute == 0
 
             if run_hourly and (last_sync_hour is None or last_sync_hour != (today_est, now_est.hour)):
                 async with _salesforce_sync_lock:
@@ -4409,6 +5441,38 @@ async def _scheduled_salesforce_jobs() -> None:
                             logging.getLogger(__name__).exception(
                                 "EOD snapshot failed for %s: %s", today_est.isoformat(), e
                             )
+
+            if run_forecast_snap and (last_forecast_snapshot_date is None or last_forecast_snapshot_date != today_est):
+                async with AsyncSessionLocal() as session:
+                    try:
+                        saved = await _take_forecast_snapshot(session)
+                        await session.commit()
+                        last_forecast_snapshot_date = today_est
+                        logging.getLogger(__name__).info(
+                            "Forecast snapshot taken for %s (%d months saved)", today_est.isoformat(), saved
+                        )
+                    except Exception as e:
+                        await session.rollback()
+                        logging.getLogger(__name__).exception("Forecast snapshot failed: %s", e)
+
+            if run_ai and (last_ai_score_date is None or last_ai_score_date != today_est):
+                async with AsyncSessionLocal() as session:
+                    try:
+                        ai_result = await _run_ai_forecast_scoring(session)
+                        if ai_result.get("ok"):
+                            await session.commit()
+                            last_ai_score_date = today_est
+                            logging.getLogger(__name__).info(
+                                "AI forecast scoring complete: %s deals scored", ai_result.get("scored", 0)
+                            )
+                        else:
+                            await session.rollback()
+                            logging.getLogger(__name__).warning(
+                                "AI forecast scoring skipped: %s", ai_result.get("error", "unknown")
+                            )
+                    except Exception as e:
+                        await session.rollback()
+                        logging.getLogger(__name__).exception("AI forecast scoring failed: %s", e)
 
         except asyncio.CancelledError:
             raise
@@ -8239,6 +9303,17 @@ async def get_pipeline_overview(
             mrr = _line_item_effective_total(li)
             opp_to_arr_from_lines[opp_sf_id] = opp_to_arr_from_lines.get(opp_sf_id, 0) + mrr * PIPELINE_ARR_MULTIPLIER
         opp_to_arr_from_lines = {k: round(v, 2) for k, v in opp_to_arr_from_lines.items()}
+    # ── Latest AI scores ──────────────────────────────────────────────────────
+    latest_ai_r = await db.execute(select(func.max(DealAIScore.scored_at)))
+    latest_ai_at = latest_ai_r.scalar_one_or_none()
+    ai_scores: dict[str, DealAIScore] = {}
+    if latest_ai_at is not None:
+        ai_r = await db.execute(
+            select(DealAIScore).where(DealAIScore.scored_at == latest_ai_at)
+        )
+        for s in ai_r.scalars().all():
+            ai_scores[s.sf_opp_id] = s
+
     rows = []
     grand_total = 0.0
     for o in open_opps:
@@ -8248,6 +9323,7 @@ async def get_pipeline_overview(
             arr = opp_to_arr_from_lines.get(o.sf_id, 0)
         grand_total += arr
         seg = account_segment.get(o.account_id) if o.account_id else DEFAULT_SEGMENT
+        ai_score = ai_scores.get(o.sf_id or "")
         rows.append({
             "account_id": o.account_id,
             "account_name": o.account_name or "—",
@@ -8259,6 +9335,8 @@ async def get_pipeline_overview(
             "record_type_name": o.record_type_name or "—",
             "close_date": o.close_date.isoformat() if o.close_date else None,
             "arr": arr,
+            "ai_probability": round(ai_score.probability, 3) if ai_score else None,
+            "ai_reasoning": ai_score.reasoning if ai_score else None,
         })
     rows.sort(key=lambda x: -x["arr"])
     out = {

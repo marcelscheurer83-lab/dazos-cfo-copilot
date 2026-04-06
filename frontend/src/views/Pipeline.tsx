@@ -775,12 +775,13 @@ export default function Pipeline() {
               {thFilter('record_type', 'Record type', recordTypeThRef, recordTypePopoverRef, data.record_types ?? [], filterRecordType, setFilterRecordType)}
               {thFilter('close_date', 'Close date', closeDateThRef, closeDatePopoverRef, closeDateOptions, filterCloseDate, setFilterCloseDate, formatMonthLabel)}
               {th('arr', 'ARR', 'right')}
+              <th style={{ padding: '0.5rem 0.75rem', textAlign: 'right', color: 'var(--text-muted)', fontWeight: 500, whiteSpace: 'nowrap' }}>AI %</th>
             </tr>
           </thead>
           <tbody>
             <tr style={{ borderBottom: '1px solid var(--border)', fontWeight: 600, background: 'var(--surface)' }}>
               <td style={{ padding: '0.5rem 0.75rem', color: 'var(--text-muted)' }}>Total</td>
-              <td style={{ padding: '0.5rem 0.75rem' }} colSpan={5} />
+              <td style={{ padding: '0.5rem 0.75rem' }} colSpan={6} />
               <td style={{ textAlign: 'right', padding: '0.5rem 0.75rem', color: 'var(--text)' }}>{fmtMoney(grandTotalDisplay)}</td>
             </tr>
             {displayRows.map((row) => (
@@ -828,13 +829,19 @@ export default function Pipeline() {
                 <td style={{ padding: '0.5rem 0.75rem', whiteSpace: 'nowrap' }}>{row.record_type_name}</td>
                 <td style={{ padding: '0.5rem 0.75rem', whiteSpace: 'nowrap' }}>{row.close_date ?? '—'}</td>
                 <td style={{ textAlign: 'right', padding: '0.5rem 0.75rem', fontWeight: 500 }}>{fmtMoney(row.arr)}</td>
+                <td
+                  style={{ textAlign: 'right', padding: '0.5rem 0.75rem', whiteSpace: 'nowrap', color: '#38bdf8', fontWeight: 600 }}
+                  title={row.ai_reasoning ?? undefined}
+                >
+                  {row.ai_probability != null ? `${(row.ai_probability * 100).toFixed(0)}%` : '—'}
+                </td>
               </tr>
             ))}
           </tbody>
           <tfoot>
             <tr style={{ borderTop: '2px solid var(--border)', fontWeight: 600 }}>
               <td style={{ padding: '0.5rem 0.75rem', color: 'var(--text)' }}>Total</td>
-              <td style={{ padding: '0.5rem 0.75rem' }} colSpan={5} />
+              <td style={{ padding: '0.5rem 0.75rem' }} colSpan={6} />
               <td style={{ textAlign: 'right', padding: '0.5rem 0.75rem', color: 'var(--text)' }}>{fmtMoney(grandTotalDisplay)}</td>
             </tr>
           </tfoot>

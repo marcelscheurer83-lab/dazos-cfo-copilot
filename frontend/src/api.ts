@@ -750,6 +750,8 @@ export type PipelineOverviewRow = {
   record_type_name: string
   close_date: string | null
   arr: number
+  ai_probability: number | null
+  ai_reasoning: string | null
 }
 
 export type PipelineOverviewResponse = {
@@ -1230,18 +1232,28 @@ export type ForecastMonthNB = {
   month: string
   actuals: number
   pipeline_weighted: number
+  pipeline_ai_weighted: number
   pipeline_raw: number
   forecast: number
+  forecast_ai: number
+  in_quarter_est: number
+  adjusted_forecast: number
   target: number | null
+  has_ai_scores: boolean
 }
 
 export type ForecastMonthExp = {
   month: string
   actuals: number
   pipeline_weighted: number
+  pipeline_ai_weighted: number
   pipeline_raw: number
   forecast: number
+  forecast_ai: number
+  in_quarter_est: number
+  adjusted_forecast: number
   target: number | null
+  has_ai_scores: boolean
 }
 
 export type ForecastMonthRenewal = {
@@ -1259,12 +1271,22 @@ export type ForecastMonthRenewal = {
 export type ForecastQuarterTotals = {
   nb_actuals: number
   nb_forecast: number
+  nb_forecast_ai: number
+  nb_in_quarter_est: number
+  nb_adjusted_forecast: number
   nb_target: number | null
   exp_actuals: number
   exp_forecast: number
+  exp_forecast_ai: number
+  exp_in_quarter_est: number
+  exp_adjusted_forecast: number
   exp_target: number | null
   total_actuals: number
   total_forecast: number
+  total_forecast_ai: number
+  total_in_quarter_est: number
+  total_adjusted_forecast: number
+  has_ai_scores: boolean
   renewal_due: number
   renewal_won: number
   renewal_forecast: number
@@ -1280,12 +1302,88 @@ export type ForecastResponse = {
   expansion: ForecastMonthExp[]
   renewals: ForecastMonthRenewal[]
   quarter_totals: ForecastQuarterTotals
+  in_quarter_quarters_used: number
   salesforce_base_url: string | null
+}
+
+export type ForecastAccuracyRow = {
+  month: string
+  is_complete: boolean
+  nb_actual: number
+  exp_actual: number
+  total_actual: number
+  earliest_snapshot_date: string | null
+  weighted_forecast_at_snap: number | null
+  adjusted_forecast_at_snap: number | null
+  accuracy_weighted_pct: number | null
+  accuracy_adjusted_pct: number | null
+  accuracy_ai_pct: number | null
+}
+
+export type ForecastAccuracyResponse = {
+  rows: ForecastAccuracyRow[]
+  snapshot_count: number
+  message: string
+}
+
+export async function getForecastAccuracy(): Promise<ForecastAccuracyResponse> {
+  const r = await apiFetch('/forecast/accuracy')
+  if (!r.ok) throw new Error(`Forecast accuracy fetch failed: HTTP ${r.status}`)
+  return r.json()
+}
+
+export async function triggerForecastSnapshot(): Promise<{ ok: boolean; months_saved: number; snapshot_date: string }> {
+  const r = await apiFetch('/forecast/snapshot', { method: 'POST' })
+  if (!r.ok) throw new Error(`Snapshot failed: HTTP ${r.status}`)
+  return r.json()
 }
 
 export async function getForecastCurrentQuarter(): Promise<ForecastResponse> {
   const r = await apiFetch('/forecast/current-quarter')
   if (!r.ok) throw new Error(`Forecast fetch failed: HTTP ${r.status}`)
+  return r.json()
+}
+
+export type AIDealScore = {
+  sf_opp_id: string
+  account_name: string | null
+  opportunity_name: string | null
+  arr: number
+  probability: number | null
+  ai_contribution: number
+  reasoning: string | null
+  stage: string | null
+  forecast_category: string | null
+}
+
+export type AIForecastMonth = {
+  month: string
+  ai_forecast: number
+  deal_count: number
+  scored_deal_count: number
+  top_deals: AIDealScore[]
+}
+
+export type AIForecastResponse = {
+  quarter: string
+  months: string[]
+  month_data: AIForecastMonth[]
+  total_ai_forecast: number
+  last_scored_at: string | null
+  total_scored_deals: number
+  salesforce_base_url: string | null
+  observations: string[]
+}
+
+export async function getAIForecastCurrentQuarter(): Promise<AIForecastResponse> {
+  const r = await apiFetch('/forecast/ai-current-quarter')
+  if (!r.ok) throw new Error(`AI forecast fetch failed: HTTP ${r.status}`)
+  return r.json()
+}
+
+export async function triggerAIRescore(): Promise<{ ok: boolean; scored?: number; error?: string }> {
+  const r = await apiFetch('/forecast/ai-rescore', { method: 'POST' })
+  if (!r.ok) throw new Error(`AI rescore failed: HTTP ${r.status}`)
   return r.json()
 }
 

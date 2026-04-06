@@ -791,10 +791,10 @@ export default function Pipeline() {
               {thFilter('stage', 'Stage', stageThRef, stagePopoverRef, data.stages ?? [], filterStage, setFilterStage)}
               {thFilter('deal_tier', 'Deal Tier', dealTierThRef, dealTierPopoverRef, dealTierOptions, filterDealTier, setFilterDealTier)}
               {thFilter('forecast_category', 'Forecast', forecastThRef, forecastPopoverRef, forecastOptions, filterForecast, setFilterForecast)}
+              <th style={{ padding: '0.5rem 0.75rem', textAlign: 'right', color: 'var(--text-muted)', fontWeight: 500, whiteSpace: 'nowrap' }}>AI %</th>
               {thFilter('record_type', 'Record type', recordTypeThRef, recordTypePopoverRef, data.record_types ?? [], filterRecordType, setFilterRecordType)}
               {thFilter('close_date', 'Close date', closeDateThRef, closeDatePopoverRef, closeDateOptions, filterCloseDate, setFilterCloseDate, formatMonthLabel)}
               {th('arr', 'ARR', 'right')}
-              <th style={{ padding: '0.5rem 0.75rem', textAlign: 'right', color: 'var(--text-muted)', fontWeight: 500, whiteSpace: 'nowrap' }}>AI %</th>
             </tr>
           </thead>
           <tbody>
@@ -846,15 +846,15 @@ export default function Pipeline() {
                 <td style={{ padding: '0.5rem 0.75rem', whiteSpace: 'nowrap' }}>{row.stage_name}</td>
                 <td style={{ padding: '0.5rem 0.75rem', whiteSpace: 'nowrap' }}>{row.deal_tier ?? '—'}</td>
                 <td style={{ padding: '0.5rem 0.75rem', whiteSpace: 'nowrap' }}>{row.forecast_category ?? '—'}</td>
-                <td style={{ padding: '0.5rem 0.75rem', whiteSpace: 'nowrap' }}>{row.record_type_name}</td>
-                <td style={{ padding: '0.5rem 0.75rem', whiteSpace: 'nowrap' }}>{row.close_date ?? '—'}</td>
-                <td style={{ textAlign: 'right', padding: '0.5rem 0.75rem', fontWeight: 500 }}>{fmtMoney(row.arr)}</td>
                 <td
                   style={{ textAlign: 'right', padding: '0.5rem 0.75rem', whiteSpace: 'nowrap', color: '#38bdf8', fontWeight: 600 }}
                   title={row.ai_reasoning ?? undefined}
                 >
                   {row.ai_probability != null ? `${(row.ai_probability * 100).toFixed(0)}%` : '—'}
                 </td>
+                <td style={{ padding: '0.5rem 0.75rem', whiteSpace: 'nowrap' }}>{row.record_type_name}</td>
+                <td style={{ padding: '0.5rem 0.75rem', whiteSpace: 'nowrap' }}>{row.close_date ?? '—'}</td>
+                <td style={{ textAlign: 'right', padding: '0.5rem 0.75rem', fontWeight: 500 }}>{fmtMoney(row.arr)}</td>
               </tr>
             ))}
           </tbody>

@@ -553,53 +553,50 @@ export default function Pipeline() {
   return (
     <>
       <h1 style={{ margin: '0 0 1.5rem', fontSize: '1.5rem', fontWeight: 600, color: 'var(--text)' }}>Pipeline</h1>
-      {/* ── Observations + Charts row ── */}
+      {/* ── Observations card (full-width) ── */}
+      <div style={{
+        background: 'var(--surface)',
+        border: '1px solid var(--border)',
+        borderRadius: 8,
+        padding: '0.85rem 1rem',
+        marginBottom: '1.5rem',
+      }}>
+        <p style={{ margin: '0 0 0.15rem', fontSize: '0.65rem', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.07em', color: '#38bdf8' }}>
+          Dazos Forecast Agent
+        </p>
+        <p style={{ margin: '0 0 0.6rem', fontSize: '0.72rem', fontWeight: 600, color: 'var(--text)', letterSpacing: '0.02em' }}>
+          Observations
+        </p>
+        {!observations && (
+          <p style={{ margin: 0, fontSize: '0.8rem', color: 'var(--text-muted)' }}>Loading…</p>
+        )}
+        {observations && observations.observations.length === 0 && (
+          <p style={{ margin: 0, fontSize: '0.8rem', color: 'var(--text-muted)', lineHeight: 1.5 }}>
+            No pipeline observations yet — run AI scoring from the Forecast view.
+          </p>
+        )}
+        {observations && observations.observations.length > 0 && (
+          <ul style={{ margin: 0, paddingLeft: '1.1rem', display: 'flex', flexDirection: 'column', gap: '0.4rem' }}>
+            {observations.observations.map((obs, i) => (
+              <li key={i} style={{ fontSize: '0.8rem', color: 'var(--text)', lineHeight: 1.55 }}>{obs}</li>
+            ))}
+          </ul>
+        )}
+        {observations && (observations.scored_at ?? observations.last_ai_run_at) && (
+          <p style={{ margin: '0.6rem 0 0', fontSize: '0.68rem', color: 'var(--text-muted)' }}>
+            {observations.scored_at ? 'Updated' : 'Last scored'}{' '}
+            {new Date((observations.scored_at ?? observations.last_ai_run_at)!).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}
+          </p>
+        )}
+      </div>
+
+      {/* ── Charts 2×2 grid ── */}
       {chartDataByStage.months.length > 0 && (
         <>
-        {/* Single unified grid: observations (left, spans 2 rows) + 2×2 charts (right) */}
-        <div style={{ marginBottom: '1.5rem', maxWidth: '100%', display: 'grid', gridTemplateColumns: '300px 1fr 1fr', gridTemplateRows: 'auto auto', gap: '1.5rem' }}>
+        <div style={{ marginBottom: '1.5rem', maxWidth: '100%', display: 'grid', gridTemplateColumns: '1fr 1fr', gridTemplateRows: 'auto auto', gap: '1.5rem' }}>
 
-          {/* Observations card — spans both chart rows */}
-          <div style={{
-            gridColumn: '1',
-            gridRow: '1 / 3',
-            background: 'var(--surface)',
-            border: '1px solid var(--border)',
-            borderRadius: 8,
-            padding: '1rem 1rem 0.85rem',
-            display: 'flex',
-            flexDirection: 'column',
-          }}>
-            <p style={{ margin: '0 0 0.15rem', fontSize: '0.65rem', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.07em', color: '#38bdf8' }}>
-              Dazos Forecast Agent
-            </p>
-            <p style={{ margin: '0 0 0.75rem', fontSize: '0.72rem', fontWeight: 600, color: 'var(--text)', letterSpacing: '0.02em' }}>
-              Observations
-            </p>
-            {!observations && (
-              <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)', marginTop: 'auto' }}>Loading…</p>
-            )}
-            {observations && observations.observations.length === 0 && (
-              <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)', lineHeight: 1.5 }}>
-                No pipeline observations yet — run AI scoring from the Forecast view.
-              </p>
-            )}
-            {observations && observations.observations.length > 0 && (
-              <ul style={{ margin: 0, paddingLeft: '1.1rem', display: 'flex', flexDirection: 'column', gap: '0.5rem', flex: 1 }}>
-                {observations.observations.map((obs, i) => (
-                  <li key={i} style={{ fontSize: '0.8rem', color: 'var(--text)', lineHeight: 1.55 }}>{obs}</li>
-                ))}
-              </ul>
-            )}
-            {observations && (observations.scored_at ?? observations.last_ai_run_at) && (
-              <p style={{ margin: '0.75rem 0 0', fontSize: '0.68rem', color: 'var(--text-muted)' }}>
-                {observations.scored_at ? 'Updated' : 'Last scored'}{' '}
-                {new Date((observations.scored_at ?? observations.last_ai_run_at)!).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}
-              </p>
-            )}
-          </div>
-          {/* Stage ARR chart — row 1, col 2 */}
-              <div style={{ gridColumn: '2', gridRow: '1', minWidth: 0, display: 'flex', flexDirection: 'column' }}>
+          {/* Stage ARR chart — row 1, col 1 */}
+              <div style={{ gridColumn: '1', gridRow: '1', minWidth: 0, display: 'flex', flexDirection: 'column' }}>
                 <div style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text)', marginBottom: '0.5rem' }}>Open pipeline by close month and stage (ARR)</div>
                 <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', background: 'var(--bg)', padding: '0.75rem 1rem', borderRadius: 6 }}>
                   <div style={{ display: 'flex', gap: 0, fontSize: '0.75rem' }}>
@@ -736,8 +733,8 @@ export default function Pipeline() {
                   </div>
                 </div>
               </div>
-          {/* Stage Count chart — row 1, col 3 */}
-              <div style={{ gridColumn: '3', gridRow: '1', minWidth: 0, display: 'flex', flexDirection: 'column' }}>
+          {/* Stage Count chart — row 1, col 2 */}
+              <div style={{ gridColumn: '2', gridRow: '1', minWidth: 0, display: 'flex', flexDirection: 'column' }}>
                 <div style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text)', marginBottom: '0.5rem' }}>Open pipeline by close month and stage (# opportunities)</div>
                 <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', background: 'var(--bg)', padding: '0.75rem 1rem', borderRadius: 6 }}>
                   <div style={{ display: 'flex', gap: 0, fontSize: '0.75rem' }}>
@@ -850,8 +847,8 @@ export default function Pipeline() {
                 </div>
               </div>
 
-          {/* Tier ARR chart — row 2, col 2 */}
-            <div style={{ gridColumn: '2', gridRow: '2', minWidth: 0, display: 'flex', flexDirection: 'column' }}>
+          {/* Tier ARR chart — row 2, col 1 */}
+            <div style={{ gridColumn: '1', gridRow: '2', minWidth: 0, display: 'flex', flexDirection: 'column' }}>
               <div style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text)', marginBottom: '0.5rem' }}>Open pipeline by close month and tier (ARR)</div>
               <div style={{ flex: 1, background: 'var(--bg)', padding: '0.75rem 1rem', borderRadius: 6 }}>
                 <div style={{ display: 'flex', gap: 0, fontSize: '0.75rem' }}>
@@ -927,8 +924,8 @@ export default function Pipeline() {
               </div>
             </div>
 
-          {/* Tier Count chart — row 2, col 3 */}
-            <div style={{ gridColumn: '3', gridRow: '2', minWidth: 0, display: 'flex', flexDirection: 'column' }}>
+          {/* Tier Count chart — row 2, col 2 */}
+            <div style={{ gridColumn: '2', gridRow: '2', minWidth: 0, display: 'flex', flexDirection: 'column' }}>
               <div style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text)', marginBottom: '0.5rem' }}>Open pipeline by close month and tier (# opportunities)</div>
               <div style={{ flex: 1, background: 'var(--bg)', padding: '0.75rem 1rem', borderRadius: 6 }}>
                 <div style={{ display: 'flex', gap: 0, fontSize: '0.75rem' }}>

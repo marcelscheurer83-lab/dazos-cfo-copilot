@@ -1,9 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import {
   getRenewalsOverview,
+  getAIObservations,
   type RenewalsChartMonth,
   type RenewalsOverviewResponse,
   type RenewalsOverviewRow,
+  type AIObservationsResponse,
 } from '../api'
 import { loadRenewalsFilters, saveRenewalsFilters } from '../tableFilterStorage'
 
@@ -173,6 +175,7 @@ type SortDir = 'asc' | 'desc'
 export default function Renewals() {
   const [data, setData] = useState<RenewalsOverviewResponse | null>(null)
   const [err, setErr] = useState<string | null>(null)
+  const [renewalObs, setRenewalObs] = useState<AIObservationsResponse | null>(null)
   const [sortKey, setSortKey] = useState<SortKey>('renewal_date')
   const [sortDir, setSortDir] = useState<SortDir>('desc')
   const storedRenewals = useRef<ReturnType<typeof loadRenewalsFilters> | null>(null)
@@ -205,6 +208,7 @@ export default function Renewals() {
 
   useEffect(() => {
     loadData()
+    getAIObservations('renewals').then(setRenewalObs).catch(() => setRenewalObs(null))
   }, [loadData])
 
   useEffect(() => {
@@ -836,6 +840,43 @@ export default function Renewals() {
   return (
     <>
       <h1 style={{ margin: '0 0 1.5rem', fontSize: '1.5rem', fontWeight: 600, color: 'var(--text)' }}>Renewals</h1>
+
+      {/* Dazos Forecast Agent — Renewals Observations */}
+      <div style={{
+        background: 'var(--surface)',
+        border: '1px solid var(--border)',
+        borderRadius: 8,
+        padding: '0.85rem 1rem',
+        marginBottom: '1.5rem',
+      }}>
+        <p style={{ margin: '0 0 0.15rem', fontSize: '0.65rem', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.07em', color: '#38bdf8' }}>
+          Dazos Forecast Agent
+        </p>
+        <p style={{ margin: '0 0 0.6rem', fontSize: '0.72rem', fontWeight: 600, color: 'var(--text)', letterSpacing: '0.02em' }}>
+          Observations
+        </p>
+        {renewalObs === null && (
+          <p style={{ margin: 0, fontSize: '0.8rem', color: 'var(--text-muted)' }}>Loading…</p>
+        )}
+        {renewalObs !== null && renewalObs.observations.length === 0 && (
+          <p style={{ margin: 0, fontSize: '0.8rem', color: 'var(--text-muted)', lineHeight: 1.5 }}>
+            No renewals observations yet — run AI scoring from the Forecast view.
+          </p>
+        )}
+        {renewalObs !== null && renewalObs.observations.length > 0 && (
+          <ul style={{ margin: 0, paddingLeft: '1.1rem', display: 'flex', flexDirection: 'column', gap: '0.4rem' }}>
+            {renewalObs.observations.map((obs, i) => (
+              <li key={i} style={{ fontSize: '0.8rem', color: 'var(--text)', lineHeight: 1.55 }}>{obs}</li>
+            ))}
+          </ul>
+        )}
+        {renewalObs && (renewalObs.scored_at ?? renewalObs.last_ai_run_at) && (
+          <p style={{ margin: '0.6rem 0 0', fontSize: '0.68rem', color: 'var(--text-muted)' }}>
+            {renewalObs.scored_at ? 'Updated' : 'Last scored'}{' '}
+            {new Date((renewalObs.scored_at ?? renewalObs.last_ai_run_at)!).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}
+          </p>
+        )}
+      </div>
 
       {chartRows.length > 0 && (
         <div style={{ marginBottom: '1.5rem', maxWidth: '100%', display: 'flex', gap: '2rem', flexWrap: 'wrap' }}>

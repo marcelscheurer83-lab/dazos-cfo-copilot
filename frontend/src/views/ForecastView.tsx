@@ -6,12 +6,14 @@ import {
 import {
   getForecastCurrentQuarter,
   getAIForecastCurrentQuarter,
+  getAIObservations,
   triggerAIRescore,
   ForecastResponse,
   ForecastMonthNB,
   ForecastMonthExp,
   ForecastMonthRenewal,
   AIForecastResponse,
+  AIObservationsResponse,
 } from '../api'
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -684,11 +686,15 @@ export default function ForecastView() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [aiData, setAiData] = useState<AIForecastResponse | null>(null)
+  const [renewalObs, setRenewalObs] = useState<AIObservationsResponse | null>(null)
 
   const loadAI = () => {
     getAIForecastCurrentQuarter()
       .then(setAiData)
       .catch(() => setAiData(null))
+    getAIObservations('renewals')
+      .then(setRenewalObs)
+      .catch(() => setRenewalObs(null))
   }
 
   useEffect(() => {
@@ -772,6 +778,43 @@ export default function ForecastView() {
 
         {/* ── RIGHT: Renewals ────────────────────────────────────────────── */}
         <div style={{ minWidth: 0 }}>
+          {/* Renewals Observations card */}
+          <div style={{
+            background: 'var(--surface)',
+            border: '1px solid var(--border)',
+            borderRadius: 8,
+            padding: '0.85rem 1rem',
+            marginBottom: '1.25rem',
+          }}>
+            <p style={{ margin: '0 0 0.15rem', fontSize: '0.65rem', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.07em', color: '#38bdf8' }}>
+              Dazos Forecast Agent
+            </p>
+            <p style={{ margin: '0 0 0.6rem', fontSize: '0.72rem', fontWeight: 600, color: 'var(--text)', letterSpacing: '0.02em' }}>
+              Renewals Observations
+            </p>
+            {renewalObs === null && (
+              <p style={{ margin: 0, fontSize: '0.8rem', color: 'var(--text-muted)' }}>Loading…</p>
+            )}
+            {renewalObs !== null && renewalObs.observations.length === 0 && (
+              <p style={{ margin: 0, fontSize: '0.8rem', color: 'var(--text-muted)', lineHeight: 1.5 }}>
+                No renewals observations yet — run AI scoring from the button below.
+              </p>
+            )}
+            {renewalObs !== null && renewalObs.observations.length > 0 && (
+              <ul style={{ margin: 0, paddingLeft: '1.1rem', display: 'flex', flexDirection: 'column', gap: '0.4rem' }}>
+                {renewalObs.observations.map((obs, i) => (
+                  <li key={i} style={{ fontSize: '0.8rem', color: 'var(--text)', lineHeight: 1.55 }}>{obs}</li>
+                ))}
+              </ul>
+            )}
+            {renewalObs && (renewalObs.scored_at ?? renewalObs.last_ai_run_at) && (
+              <p style={{ margin: '0.6rem 0 0', fontSize: '0.68rem', color: 'var(--text-muted)' }}>
+                {renewalObs.scored_at ? 'Updated' : 'Last scored'}{' '}
+                {new Date((renewalObs.scored_at ?? renewalObs.last_ai_run_at)!).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}
+              </p>
+            )}
+          </div>
+
           {/* Renewals KPI row */}
           <div style={{ display: 'flex', gap: '0.6rem', marginBottom: '1.25rem' }}>
             <KpiCard label="Renewal Rate Actual"   value={fmtPct(qt.rate_actual)}   sub={`${quarter} QTD`} />

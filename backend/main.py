@@ -258,6 +258,17 @@ async def _migrate_db() -> None:
         ("opportunities",          "current_voip", "VARCHAR(128)"),
         ("opportunities",          "deal_tier",    "VARCHAR(64)"),
         ("ai_forecast_observations", "obs_type",   "VARCHAR(16)"),
+        # Account customer health fields
+        ("accounts", "health_score",              "FLOAT"),
+        ("accounts", "risk_score",                "FLOAT"),
+        ("accounts", "product_usage_score",       "FLOAT"),
+        ("accounts", "financial_score",           "FLOAT"),
+        ("accounts", "customer_engagement_score", "FLOAT"),
+        ("accounts", "support_score",             "FLOAT"),
+        ("accounts", "customer_journey_phase",    "VARCHAR(64)"),
+        ("accounts", "payment_status",            "VARCHAR(64)"),
+        ("accounts", "outstanding_balance",       "FLOAT"),
+        ("accounts", "overdue_invoice_count",     "INTEGER"),
     ]
     async with AsyncSessionLocal() as db:
         for tbl, col, col_type in new_cols:
@@ -790,6 +801,31 @@ _SF_LEAD_TYPE_FIELD       = (os.getenv("SALESFORCE_LEAD_TYPE_FIELD",       "Lead
 _SF_CURRENT_CRM_FIELD     = (os.getenv("SALESFORCE_CURRENT_CRM_FIELD",     "Current_CRM__c")).strip()
 _SF_CURRENT_VOIP_FIELD    = (os.getenv("SALESFORCE_CURRENT_VOIP_FIELD",    "Current_VOIP__c")).strip()
 _SF_DEAL_TIER_FIELD       = (os.getenv("SALESFORCE_DEAL_TIER_FIELD",       "Deal_Tier__c")).strip()
+
+# Account health / risk fields (synced from Salesforce; configurable via env vars)
+_SF_ACC_HEALTH_SCORE_FIELD      = (os.getenv("SF_ACCOUNT_HEALTH_SCORE_FIELD",       "Master_Health_Score_Calc__c")).strip()
+_SF_ACC_RISK_SCORE_FIELD        = (os.getenv("SF_ACCOUNT_RISK_SCORE_FIELD",         "Risk_Score__c")).strip()
+_SF_ACC_PRODUCT_USAGE_FIELD     = (os.getenv("SF_ACCOUNT_PRODUCT_USAGE_SCORE_FIELD","Product_Usage_Score__c")).strip()
+_SF_ACC_FINANCIAL_SCORE_FIELD   = (os.getenv("SF_ACCOUNT_FINANCIAL_SCORE_FIELD",    "Financial_Score__c")).strip()
+_SF_ACC_ENGAGEMENT_SCORE_FIELD  = (os.getenv("SF_ACCOUNT_ENGAGEMENT_SCORE_FIELD",   "Customer_Engagement_Score__c")).strip()
+_SF_ACC_SUPPORT_SCORE_FIELD     = (os.getenv("SF_ACCOUNT_SUPPORT_SCORE_FIELD",      "Support_Score__c")).strip()
+_SF_ACC_JOURNEY_PHASE_FIELD     = (os.getenv("SF_ACCOUNT_JOURNEY_PHASE_FIELD",      "Customer_Journey_Phase__c")).strip()
+_SF_ACC_PAYMENT_STATUS_FIELD    = (os.getenv("SF_ACCOUNT_PAYMENT_STATUS_FIELD",     "Payment_Status__c")).strip()
+_SF_ACC_OUTSTANDING_BAL_FIELD   = (os.getenv("SF_ACCOUNT_OUTSTANDING_BAL_FIELD",    "Outstanding_Balance__c")).strip()
+_SF_ACC_OVERDUE_INV_FIELD       = (os.getenv("SF_ACCOUNT_OVERDUE_INV_FIELD",        "Overdue_Invoice_Count__c")).strip()
+
+_ALL_ACC_HEALTH_FIELDS = [
+    _SF_ACC_HEALTH_SCORE_FIELD, _SF_ACC_RISK_SCORE_FIELD, _SF_ACC_PRODUCT_USAGE_FIELD,
+    _SF_ACC_FINANCIAL_SCORE_FIELD, _SF_ACC_ENGAGEMENT_SCORE_FIELD, _SF_ACC_SUPPORT_SCORE_FIELD,
+    _SF_ACC_JOURNEY_PHASE_FIELD, _SF_ACC_PAYMENT_STATUS_FIELD,
+    _SF_ACC_OUTSTANDING_BAL_FIELD, _SF_ACC_OVERDUE_INV_FIELD,
+]
+
+
+def _account_soql_health_fields() -> str:
+    """Extra Account fields for customer health data (optional; graceful fallback if absent in org)."""
+    parts = [f for f in _ALL_ACC_HEALTH_FIELDS if f]
+    return (", " + ", ".join(parts)) if parts else ""
 
 # Optional: line item term (months) and dates for period-weighted ARR (e.g. 3 mo @ $650 + 21 mo @ $1300 -> ARR = (3*650+21*1300)/24*12).
 _SALESFORCE_LINE_ITEM_TERM_FIELD = (os.getenv("SALESFORCE_LINE_ITEM_TERM_FIELD") or "").strip()  # e.g. Term__c
@@ -1331,6 +1367,14 @@ DEFAULT_SEGMENT = "SMB/ MM"
 DEFAULT_ACCOUNT_SOQL = (
     "SELECT Id, Name, Type, Account_Status__c, Industry, AnnualRevenue, NumberOfEmployees, "
     "BillingCountry, BillingCity, BillingState, Phone, Website, Segment__c, Customer_Success_Manager__c, Customer_Success_Manager__r.Name, Account_Executive__c, "
+    "Partner_Affiliate_Revenue_Share__c, Owner.Name, CreatedDate"
+    + _account_soql_health_fields()
+    + " FROM Account ORDER BY Name"
+)
+# Fallback without health fields (used when any health field is invalid in the org)
+DEFAULT_ACCOUNT_SOQL_NO_HEALTH = (
+    "SELECT Id, Name, Type, Account_Status__c, Industry, AnnualRevenue, NumberOfEmployees, "
+    "BillingCountry, BillingCity, BillingState, Phone, Website, Segment__c, Customer_Success_Manager__c, Customer_Success_Manager__r.Name, Account_Executive__c, "
     "Partner_Affiliate_Revenue_Share__c, Owner.Name, CreatedDate "
     "FROM Account ORDER BY Name"
 )
@@ -1496,10 +1540,19 @@ async def _run_salesforce_sync(db: AsyncSession) -> dict:
             "error": "Salesforce not configured. Set SALESFORCE_USERNAME, SALESFORCE_PASSWORD, and SALESFORCE_SECURITY_TOKEN in backend/.env.",
         }
 
+    use_health_fields = bool(_account_soql_health_fields())
     try:
         account_records = await _salesforce_query_with_retry(connector, DEFAULT_ACCOUNT_SOQL)
     except Exception as e:
-        return {"ok": False, "error": f"Accounts sync failed: {e}"}
+        err_str = str(e)
+        if use_health_fields and ("INVALID_FIELD" in err_str or "No such column" in err_str.lower() or "invalid field" in err_str.lower()):
+            try:
+                account_records = await _salesforce_query_with_retry(connector, DEFAULT_ACCOUNT_SOQL_NO_HEALTH)
+                use_health_fields = False
+            except Exception as e2:
+                return {"ok": False, "error": f"Accounts sync failed: {e2}"}
+        else:
+            return {"ok": False, "error": f"Accounts sync failed: {e}"}
 
     # Resolve CSM user names for records where only Customer_Success_Manager__c (Id) is present.
     csm_user_name_by_id: dict[str, str] = {}
@@ -1549,6 +1602,17 @@ async def _run_salesforce_sync(db: AsyncSession) -> dict:
             or csm_id
         )
 
+        def _rec_float(field: str):
+            v = rec.get(field)
+            return float(v) if v is not None else None
+
+        def _rec_int(field: str):
+            v = rec.get(field)
+            try:
+                return int(v) if v is not None else None
+            except (TypeError, ValueError):
+                return None
+
         acc = Account(
             sf_id=sf_id,
             name=rec.get("Name"),
@@ -1572,6 +1636,17 @@ async def _run_salesforce_sync(db: AsyncSession) -> dict:
             ),
             owner_name=owner_name,
             created_date=_parse_datetime(rec.get("CreatedDate")),
+            # Customer health fields (only populated when use_health_fields=True)
+            health_score=_rec_float(_SF_ACC_HEALTH_SCORE_FIELD) if use_health_fields and _SF_ACC_HEALTH_SCORE_FIELD else None,
+            risk_score=_rec_float(_SF_ACC_RISK_SCORE_FIELD) if use_health_fields and _SF_ACC_RISK_SCORE_FIELD else None,
+            product_usage_score=_rec_float(_SF_ACC_PRODUCT_USAGE_FIELD) if use_health_fields and _SF_ACC_PRODUCT_USAGE_FIELD else None,
+            financial_score=_rec_float(_SF_ACC_FINANCIAL_SCORE_FIELD) if use_health_fields and _SF_ACC_FINANCIAL_SCORE_FIELD else None,
+            customer_engagement_score=_rec_float(_SF_ACC_ENGAGEMENT_SCORE_FIELD) if use_health_fields and _SF_ACC_ENGAGEMENT_SCORE_FIELD else None,
+            support_score=_rec_float(_SF_ACC_SUPPORT_SCORE_FIELD) if use_health_fields and _SF_ACC_SUPPORT_SCORE_FIELD else None,
+            customer_journey_phase=rec.get(_SF_ACC_JOURNEY_PHASE_FIELD) if use_health_fields and _SF_ACC_JOURNEY_PHASE_FIELD else None,
+            payment_status=rec.get(_SF_ACC_PAYMENT_STATUS_FIELD) if use_health_fields and _SF_ACC_PAYMENT_STATUS_FIELD else None,
+            outstanding_balance=_rec_float(_SF_ACC_OUTSTANDING_BAL_FIELD) if use_health_fields and _SF_ACC_OUTSTANDING_BAL_FIELD else None,
+            overdue_invoice_count=_rec_int(_SF_ACC_OVERDUE_INV_FIELD) if use_health_fields and _SF_ACC_OVERDUE_INV_FIELD else None,
         )
         db.add(acc)
 
@@ -5413,6 +5488,7 @@ async def _run_ai_forecast_scoring(db: AsyncSession) -> dict:
     q_label2 = f"Q{_q_num_obs} '{str(_now_obs.year)[2:]}"
 
     # ── Generate executive observations ──────────────────────────────────────
+    _obs_status: dict[str, str] = {}  # track success/failure of each obs type for return value
     observations: list[str] = []
     try:
 
@@ -5488,8 +5564,15 @@ async def _run_ai_forecast_scoring(db: AsyncSession) -> dict:
             quarter_label=q_label2,
             observations_json=_json2.dumps(observations),
         ))
+        _obs_status["forecast"] = f"ok ({len(observations)} bullets)"
     except Exception as obs_err:
-        logger.warning("Failed to generate forecast observations: %s", obs_err)
+        _obs_status["forecast"] = f"error: {obs_err}"
+        logger.exception("Failed to generate forecast observations: %s", obs_err)
+
+    # Commit DealAIScore inserts + forecast observations before isolated sessions.
+    # SQLite allows only one writer at a time — the main session must release its
+    # write lock so the isolated AsyncSessionLocal() calls below can acquire it.
+    await db.commit()
 
     # ── Generate pipeline-health observations (stage/tier/velocity focus) ────
     # Uses its own DB session so any failure cannot corrupt the main session (DealAIScore inserts).
@@ -5600,24 +5683,178 @@ async def _run_ai_forecast_scoring(db: AsyncSession) -> dict:
         pipe_obs_raw = pipe_obs_response.choices[0].message.content or "{}"
         pipeline_observations: list[str] = _json3.loads(pipe_obs_raw).get("observations", [])
 
-        async with AsyncSessionLocal() as pipe_db:
-            # Replace pipeline observations (keep only the latest run)
-            await pipe_db.execute(
-                delete(AIForecastObservations).where(
-                    AIForecastObservations.obs_type == "pipeline",
-                )
+        await db.execute(
+            delete(AIForecastObservations).where(
+                AIForecastObservations.obs_type == "pipeline",
             )
-            pipe_db.add(AIForecastObservations(
-                scored_at=scored_at,
-                obs_type="pipeline",
-                quarter_label=q_label2,
-                observations_json=_json3.dumps(pipeline_observations),
-            ))
-            await pipe_db.commit()
+        )
+        db.add(AIForecastObservations(
+            scored_at=scored_at,
+            obs_type="pipeline",
+            quarter_label=q_label2,
+            observations_json=_json3.dumps(pipeline_observations),
+        ))
+        await db.commit()
+        _obs_status["pipeline"] = f"ok ({len(pipeline_observations)} bullets)"
     except Exception as pipe_obs_err:
+        _obs_status["pipeline"] = f"error: {pipe_obs_err}"
         logger.exception("Failed to generate pipeline observations: %s", pipe_obs_err)
 
-    return {"ok": True, "scored": scored_total, "scored_at": scored_at.isoformat()}
+    # ── Generate renewals health observations ─────────────────────────────────
+    # Analyzes open Q renewal opps with account health, risk, activity data.
+    try:
+        import json as _json4
+        import calendar as _cal4
+
+        today_ren = datetime.now(EST).date()
+        _q_num_ren = (today_ren.month - 1) // 3 + 1
+        _q_start_month_ren = (_q_num_ren - 1) * 3 + 1
+        _q_end_month_ren = _q_start_month_ren + 2
+        _q_start_date_ren = date(today_ren.year, _q_start_month_ren, 1)
+        _q_end_day_ren = _cal4.monthrange(today_ren.year, _q_end_month_ren)[1]
+        _q_end_date_ren = date(today_ren.year, _q_end_month_ren, _q_end_day_ren)
+        q_label_ren = f"Q{_q_num_ren} '{str(today_ren.year)[2:]}"
+
+        def _ren_arr(o: Opportunity) -> float:
+            if o.mrr is not None and o.mrr != 0:
+                return float(o.mrr) * 12
+            return float(o.amount or 0)
+
+        # Open renewal opps closing in the current quarter
+        ren_opps_all = [
+            o for o in all_opps
+            if _is_renewal_record_type(_eff_rt_ai(o))
+            and not _is_closed_won_stage(o.stage_name)
+            and not _is_closed_lost_stage(o.stage_name)
+        ]
+        ren_opps_q = [
+            o for o in ren_opps_all
+            if o.close_date and _q_start_date_ren <= o.close_date <= _q_end_date_ren
+        ]
+
+        # Load account health data keyed by sf_id
+        acc_ids_ren = {o.account_id for o in ren_opps_q if o.account_id}
+        acc_health: dict[str, dict] = {}
+        if acc_ids_ren:
+            acc_rows_r = await db.execute(select(Account).where(Account.sf_id.in_(acc_ids_ren)))
+            for acc in acc_rows_r.scalars().all():
+                acc_health[acc.sf_id] = {
+                    "health_score": acc.health_score,
+                    "risk_score": acc.risk_score,
+                    "product_usage_score": acc.product_usage_score,
+                    "financial_score": acc.financial_score,
+                    "customer_engagement_score": acc.customer_engagement_score,
+                    "support_score": acc.support_score,
+                    "customer_journey_phase": acc.customer_journey_phase,
+                    "payment_status": acc.payment_status,
+                    "outstanding_balance": acc.outstanding_balance,
+                    "overdue_invoice_count": acc.overdue_invoice_count,
+                    "csm": acc.customer_success_manager,
+                    "segment": acc.segment,
+                }
+
+        # Build per-opp context for LLM
+        ren_deal_contexts: list[dict] = []
+        for o in sorted(ren_opps_q, key=lambda x: -_ren_arr(x)):
+            arr = _ren_arr(o)
+            health = acc_health.get(o.account_id or "", {})
+            opp_acts_ren = activities_by_opp.get(o.sf_id or "", [])
+            if opp_acts_ren and opp_acts_ren[0].activity_date:
+                days_since_act = (today_ren - opp_acts_ren[0].activity_date).days
+                last_activity = str(opp_acts_ren[0].activity_date)
+            else:
+                days_since_act = None
+                last_activity = None
+
+            opp_notes_ren = notes_by_opp.get(o.sf_id or "", [])
+            recent_notes = [
+                {"date": str(n.created_date)[:10] if n.created_date else None, "body": (n.body or "")[:300]}
+                for n in opp_notes_ren[:2]
+            ]
+
+            fh_ren = hist_by_opp.get(o.sf_id or "", [])
+            close_pushes = len([h for h in fh_ren if h.field == "CloseDate"])
+            stage_changes = len([h for h in fh_ren if h.field == "StageName"])
+
+            ctx = {
+                "account": o.account_name,
+                "arr": round(arr),
+                "stage": o.stage_name,
+                "close_date": str(o.close_date) if o.close_date else None,
+                "forecast_category": o.forecast_category,
+                "next_step": (o.next_step or "")[:200] or None,
+                "close_date_pushes": close_pushes,
+                "stage_changes": stage_changes,
+                "days_since_last_activity": days_since_act,
+                "last_activity_date": last_activity,
+                "recent_notes": recent_notes or None,
+                # Account health
+                "health_score": health.get("health_score"),
+                "risk_score": health.get("risk_score"),
+                "product_usage_score": health.get("product_usage_score"),
+                "financial_score": health.get("financial_score"),
+                "customer_engagement_score": health.get("customer_engagement_score"),
+                "support_score": health.get("support_score"),
+                "customer_journey_phase": health.get("customer_journey_phase"),
+                "payment_status": health.get("payment_status"),
+                "outstanding_balance": health.get("outstanding_balance"),
+                "overdue_invoice_count": health.get("overdue_invoice_count"),
+                "csm": health.get("csm"),
+                "segment": health.get("segment"),
+            }
+            # Drop None values to keep context compact
+            ren_deal_contexts.append({k: v for k, v in ctx.items() if v is not None})
+
+        total_ren_arr = sum(_ren_arr(o) for o in ren_opps_q)
+        ren_payload = {
+            "quarter": q_label_ren,
+            "total_open_renewal_deals": len(ren_opps_q),
+            "total_open_renewal_arr": round(total_ren_arr),
+            "deals": ren_deal_contexts[:20],  # cap to 20 for token budget
+        }
+
+        ren_prompt = (
+            f"You are a SaaS CS/CFO advisor generating a renewal risk briefing for {q_label_ren}. "
+            "Analyze the open renewal opportunities below (including account health scores, risk flags, "
+            "product usage, financial standing, and recent activity) and write 4-6 concise bullet-point observations. "
+            "Focus on: high-risk accounts (low health/high risk scores), accounts with engagement or product usage concerns, "
+            "financial red flags (overdue invoices, outstanding balance), deals with no recent activity, "
+            "close-date push history as a churn signal, and any patterns that need CS or executive attention. "
+            "Be specific with ARR amounts and account names where relevant. "
+            "Write for a CFO/CEO/VP CS audience — direct, no fluff. "
+            "Return ONLY valid JSON: {\"observations\": [\"bullet 1\", \"bullet 2\", ...]}"
+        )
+        ren_obs_response = await client.chat.completions.create(
+            model=_AI_SCORING_MODEL,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": ren_prompt},
+                {"role": "user", "content": _json4.dumps(ren_payload, default=str)},
+            ],
+            temperature=0.3,
+            max_tokens=900,
+        )
+        ren_obs_raw = ren_obs_response.choices[0].message.content or "{}"
+        renewals_observations: list[str] = _json4.loads(ren_obs_raw).get("observations", [])
+
+        await db.execute(
+            delete(AIForecastObservations).where(
+                AIForecastObservations.obs_type == "renewals",
+            )
+        )
+        db.add(AIForecastObservations(
+            scored_at=scored_at,
+            obs_type="renewals",
+            quarter_label=q_label_ren,
+            observations_json=_json4.dumps(renewals_observations),
+        ))
+        await db.commit()
+        _obs_status["renewals"] = f"ok ({len(renewals_observations)} bullets)"
+    except Exception as ren_obs_err:
+        _obs_status["renewals"] = f"error: {ren_obs_err}"
+        logger.exception("Failed to generate renewals observations: %s", ren_obs_err)
+
+    return {"ok": True, "scored": scored_total, "scored_at": scored_at.isoformat(), "observations": _obs_status}
 
 
 async def _scheduled_salesforce_jobs() -> None:

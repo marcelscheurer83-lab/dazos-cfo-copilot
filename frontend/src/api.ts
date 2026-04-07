@@ -1398,7 +1398,7 @@ export type AIObservationsResponse = {
   last_ai_run_at: string | null
 }
 
-export async function getAIObservations(type: 'forecast' | 'pipeline' = 'forecast'): Promise<AIObservationsResponse> {
+export async function getAIObservations(type: 'forecast' | 'pipeline' | 'renewals' = 'forecast'): Promise<AIObservationsResponse> {
   const r = await apiFetch(`/forecast/observations?type=${type}`)
   if (!r.ok) throw new Error(`Observations fetch failed: HTTP ${r.status}`)
   return r.json()

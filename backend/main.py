@@ -258,6 +258,15 @@ async def _migrate_db() -> None:
         ("opportunities",          "current_voip", "VARCHAR(128)"),
         ("opportunities",          "deal_tier",    "VARCHAR(64)"),
         ("ai_forecast_observations", "obs_type",   "VARCHAR(16)"),
+        # ForecastSnapshot: full AI-adjusted + tier-weighted columns
+        ("forecast_snapshots", "nb_ai_adjusted_forecast",    "FLOAT"),
+        ("forecast_snapshots", "exp_ai_adjusted_forecast",   "FLOAT"),
+        ("forecast_snapshots", "total_ai_adjusted_forecast", "FLOAT"),
+        ("forecast_snapshots", "nb_pipeline_tier_weighted",  "FLOAT"),
+        ("forecast_snapshots", "exp_pipeline_tier_weighted", "FLOAT"),
+        ("forecast_snapshots", "nb_tier_forecast",           "FLOAT"),
+        ("forecast_snapshots", "exp_tier_forecast",          "FLOAT"),
+        ("forecast_snapshots", "total_tier_forecast",        "FLOAT"),
         # Account customer health fields
         ("accounts", "health_score",              "FLOAT"),
         ("accounts", "risk_score",                "FLOAT"),
@@ -3581,6 +3590,12 @@ _FC_NB_EXP_WEIGHTS: dict[str, float] = {
     "Best Case":  0.60,
     "Upside":     0.25,
 }
+_TIER_WEIGHTS: dict[str, float] = {
+    "tier 1": 0.90,
+    "tier 2": 0.50,
+    "tier 3": 0.25,
+    "tier 4": 0.10,
+}
 _FC_RENEWAL_WEIGHTS: dict[str, float] = {
     "Commit":           0.90,
     "Best Case":        0.70,
@@ -3796,13 +3811,6 @@ async def get_forecast_current_quarter(db: AsyncSession = Depends(get_db)):
             return _pipeline_arr(o) * ai_prob_map[sf_id]
         fc = (o.forecast_category or "").strip()
         return _pipeline_arr(o) * weights.get(fc, 0.0)
-
-    _TIER_WEIGHTS: dict[str, float] = {
-        "tier 1": 0.90,
-        "tier 2": 0.50,
-        "tier 3": 0.25,
-        "tier 4": 0.10,
-    }
 
     def _tier_weighted(o: Opportunity, fc_weights: dict[str, float]) -> float:
         """ARR × tier floor probability; falls back to Forecast__c weight when no tier is set."""
@@ -5193,8 +5201,20 @@ async def _take_forecast_snapshot(db: AsyncSession) -> int:
         nb_iq = max(0.0, round(iq_rates["nb"][pos] - nb_actual - nb_pipe_w, 2))
         exp_iq = max(0.0, round(iq_rates["exp"][pos] - exp_actual - exp_pipe_w, 2))
 
-        nb_ai = sum(_pipeline_arr_snap(o) * ai_scores.get(o.sf_id or "", 0.0) for o in nb_open)
-        exp_ai = sum(_pipeline_arr_snap(o) * ai_scores.get(o.sf_id or "", 0.0) for o in exp_open)
+        nb_ai_pipe = sum(_pipeline_arr_snap(o) * ai_scores.get(o.sf_id or "", 0.0) for o in nb_open)
+        exp_ai_pipe = sum(_pipeline_arr_snap(o) * ai_scores.get(o.sf_id or "", 0.0) for o in exp_open)
+
+        # Tier-weighted pipeline (same _TIER_WEIGHTS logic)
+        def _tier_w_snap(o: Opportunity) -> float:
+            tier = (o.deal_tier or "").lower()
+            for key, prob in _TIER_WEIGHTS.items():
+                if key in tier:
+                    return _pipeline_arr_snap(o) * prob
+            fc = (o.forecast_category or "").strip()
+            return _pipeline_arr_snap(o) * _FC_NB_EXP_WEIGHTS.get(fc, 0.0)
+
+        nb_pipe_tier = sum(_tier_w_snap(o) for o in nb_open)
+        exp_pipe_tier = sum(_tier_w_snap(o) for o in exp_open)
 
         snap_row = ForecastSnapshot(
             snapshot_date=today,
@@ -5214,8 +5234,19 @@ async def _take_forecast_snapshot(db: AsyncSession) -> int:
             total_forecast=round(nb_forecast + exp_forecast, 2),
             total_adjusted_forecast=round(nb_forecast + nb_iq + exp_forecast + exp_iq, 2),
             total_target=None,
-            nb_ai_forecast=round(nb_actual + nb_ai, 2) if ai_scores else None,
-            exp_ai_forecast=round(exp_actual + exp_ai, 2) if ai_scores else None,
+            # Legacy AI (actuals + AI pipeline, no IQ)
+            nb_ai_forecast=round(nb_actual + nb_ai_pipe, 2) if ai_scores else None,
+            exp_ai_forecast=round(exp_actual + exp_ai_pipe, 2) if ai_scores else None,
+            # Full AI forecast: actuals + AI pipeline + IQ (matches UI "Forecast (AI)")
+            nb_ai_adjusted_forecast=round(nb_actual + nb_ai_pipe + nb_iq, 2) if ai_scores else None,
+            exp_ai_adjusted_forecast=round(exp_actual + exp_ai_pipe + exp_iq, 2) if ai_scores else None,
+            total_ai_adjusted_forecast=round(nb_actual + nb_ai_pipe + nb_iq + exp_actual + exp_ai_pipe + exp_iq, 2) if ai_scores else None,
+            # Tier-weighted forecast: actuals + tier pipeline + IQ (matches UI "Forecast (Tier)")
+            nb_pipeline_tier_weighted=round(nb_pipe_tier, 2),
+            exp_pipeline_tier_weighted=round(exp_pipe_tier, 2),
+            nb_tier_forecast=round(nb_actual + nb_pipe_tier + nb_iq, 2),
+            exp_tier_forecast=round(exp_actual + exp_pipe_tier + exp_iq, 2),
+            total_tier_forecast=round(nb_actual + nb_pipe_tier + nb_iq + exp_actual + exp_pipe_tier + exp_iq, 2),
         )
         # Upsert: replace existing snapshot for same date + month
         await db.execute(

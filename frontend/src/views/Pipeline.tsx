@@ -2,13 +2,24 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { getAIObservations, getPipelineOverview, type AIObservationsResponse, type PipelineOverviewResponse } from '../api'
 import { loadPipelineFilters, savePipelineFilters } from '../tableFilterStorage'
 
-type FilterColumn = 'stage' | 'record_type' | 'close_date' | 'forecast_category' | 'deal_tier'
+type FilterColumn = 'stage' | 'record_type' | 'close_date' | 'deal_tier'
+
+/** Map deal tier label → floor probability % string shown in the Tier % column. */
+function tierPct(tier: string | null | undefined): string {
+  if (!tier) return '—'
+  const t = tier.toLowerCase()
+  if (t.includes('commit')) return '90%'
+  if (t.includes('strong')) return '50%'
+  if (t.includes('weak')) return '25%'
+    if (t.includes('hail') || t.includes('mary')) return '10%'
+  return '—'
+}
 
 function fmtMoney(n: number) {
   return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 }).format(n)
 }
 
-type SortKey = 'account_name' | 'opportunity_name' | 'stage_name' | 'record_type_name' | 'close_date' | 'arr' | 'forecast_category'
+type SortKey = 'account_name' | 'opportunity_name' | 'stage_name' | 'record_type_name' | 'close_date' | 'arr'
 type SortDir = 'asc' | 'desc'
 
 /** Same stage bucket as stacked charts (must match chartDataByStage). */
@@ -73,12 +84,13 @@ export default function Pipeline() {
   const [filterStage, setFilterStage] = useState<string[]>(() => pv.stage)
   const [filterRecordType, setFilterRecordType] = useState<string[]>(() => pv.recordType)
   const [filterCloseDate, setFilterCloseDate] = useState<string[]>(() => pv.closeDate)
-  const [filterForecast, setFilterForecast] = useState<string[]>([])
   const [filterDealTier, setFilterDealTier] = useState<string[]>([])
   /** Chart stack selection: close month + stage bucket (month null = all months). */
   const [chartSliceFilter, setChartSliceFilter] = useState<{ month: string | null; stage: string } | null>(
     () => pv.chartSlice
   )
+  /** Tier chart selection: close month + tier (month null = all months). */
+  const [tierSliceFilter, setTierSliceFilter] = useState<{ month: string | null; tier: string } | null>(null)
   const [openFilter, setOpenFilter] = useState<FilterColumn | null>(null)
   const [aiTooltip, setAiTooltip] = useState<{ text: string; x: number; y: number } | null>(null)
   const stageThRef = useRef<HTMLTableHeaderCellElement>(null)
@@ -87,8 +99,6 @@ export default function Pipeline() {
   const recordTypePopoverRef = useRef<HTMLDivElement>(null)
   const closeDateThRef = useRef<HTMLTableHeaderCellElement>(null)
   const closeDatePopoverRef = useRef<HTMLDivElement>(null)
-  const forecastThRef = useRef<HTMLTableHeaderCellElement>(null)
-  const forecastPopoverRef = useRef<HTMLDivElement>(null)
   const dealTierThRef = useRef<HTMLTableHeaderCellElement>(null)
   const dealTierPopoverRef = useRef<HTMLDivElement>(null)
 
@@ -127,9 +137,7 @@ export default function Pipeline() {
           ? recordTypeThRef
           : openFilter === 'close_date'
             ? closeDateThRef
-            : openFilter === 'deal_tier'
-              ? dealTierThRef
-              : forecastThRef
+            : dealTierThRef
     const popRef =
       openFilter === 'stage'
         ? stagePopoverRef
@@ -137,9 +145,7 @@ export default function Pipeline() {
           ? recordTypePopoverRef
           : openFilter === 'close_date'
             ? closeDatePopoverRef
-            : openFilter === 'deal_tier'
-              ? dealTierPopoverRef
-              : forecastPopoverRef
+            : dealTierPopoverRef
     const handleClick = (e: MouseEvent) => {
       const t = e.target as Node
       if (thRef.current?.contains(t) || popRef.current?.contains(t)) return
@@ -231,6 +237,50 @@ export default function Pipeline() {
     return { months, stages, arrMap, countMap, stageColors }
   }, [rows])
 
+  // Fixed tier order + colours (Tier 1 = best)
+  const TIER_ORDER = ['Tier 1 - Commit', 'Tier 2 - Strong Upside', 'Tier 3 - Weak Upside', 'Tier 4 - Hail Mary']
+  const TIER_COLORS: Record<string, string> = {
+    'Tier 1 - Commit':        '#10b981', // green
+    'Tier 2 - Strong Upside': '#3b82f6', // blue
+    'Tier 3 - Weak Upside':   '#f59e0b', // amber
+    'Tier 4 - Hail Mary':     '#ef4444', // red
+  }
+
+  const chartDataByTier = useMemo(() => {
+    const now = new Date()
+    const currentMonth = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`
+    const arrMap = new Map<string, Map<string, number>>()
+    const countMap = new Map<string, Map<string, number>>()
+    for (const r of rows) {
+      if (!r.deal_tier) continue   // only tiered deals
+      const month = toMonthKey(r.close_date ?? null)
+      if (!month || month < currentMonth) continue
+      if (!arrMap.has(month)) { arrMap.set(month, new Map()); countMap.set(month, new Map()) }
+      const tier = r.deal_tier
+      const am = arrMap.get(month)!; const cm = countMap.get(month)!
+      am.set(tier, (am.get(tier) ?? 0) + r.arr)
+      cm.set(tier, (cm.get(tier) ?? 0) + 1)
+    }
+    const months = Array.from(arrMap.keys()).sort()
+    // Only include tiers that have data
+    const tiersSet = new Set<string>()
+    arrMap.forEach((m) => m.forEach((_, t) => tiersSet.add(t)))
+    countMap.forEach((m) => m.forEach((_, t) => tiersSet.add(t)))
+    const tiers = TIER_ORDER.filter((t) => tiersSet.has(t))
+    // Dynamic ARR max: round up total across all months
+    let maxArr = 0
+    arrMap.forEach((m) => { const t = Array.from(m.values()).reduce((a, b) => a + b, 0); if (t > maxArr) maxArr = t })
+    const arrCeil = Math.max(500000, Math.ceil(maxArr / 500000) * 500000)
+    const arrTickCount = Math.min(8, arrCeil / 500000)
+    const arrTicks = Array.from({ length: arrTickCount + 1 }, (_, i) => (i / arrTickCount) * arrCeil)
+    let maxCount = 0
+    countMap.forEach((m) => { const t = Array.from(m.values()).reduce((a, b) => a + b, 0); if (t > maxCount) maxCount = t })
+    const countCeil = Math.max(10, Math.ceil(maxCount / 10) * 10)
+    const countTick = Math.ceil(countCeil / 5)
+    const countTicks = Array.from({ length: 6 }, (_, i) => i * countTick)
+    return { months, tiers, arrMap, countMap, arrCeil, arrTicks, countCeil, countTicks }
+  }, [rows])
+
   const formatMonthLabel = (month: string) => {
     const [y, m] = month.split('-')
     const d = new Date(parseInt(y, 10), parseInt(m, 10) - 1, 1)
@@ -278,11 +328,6 @@ export default function Pipeline() {
     return months.sort().reverse()
   }, [rows])
 
-  const forecastOptions = useMemo(() => {
-    const vals = [...new Set(rows.map((r) => r.forecast_category ?? '—'))].sort()
-    return vals
-  }, [rows])
-
   const dealTierOptions = useMemo(() => {
     const vals = [...new Set(rows.map((r) => r.deal_tier ?? '—'))].sort()
     return vals
@@ -290,9 +335,6 @@ export default function Pipeline() {
 
   const displayRows = useMemo(() => {
     let out = sortedRows
-    if (filterForecast.length > 0) {
-      out = out.filter((r) => filterForecast.includes(r.forecast_category ?? '—'))
-    }
     if (filterDealTier.length > 0) {
       out = out.filter((r) => filterDealTier.includes(r.deal_tier ?? '—'))
     }
@@ -312,18 +354,37 @@ export default function Pipeline() {
         return true
       })
     }
+    if (tierSliceFilter != null) {
+      out = out.filter((r) => {
+        if ((r.deal_tier ?? '') !== tierSliceFilter.tier) return false
+        if (tierSliceFilter.month != null) {
+          const m = toMonthKey(r.close_date ?? null)
+          if (m !== tierSliceFilter.month) return false
+        }
+        return true
+      })
+    }
     return out
-  }, [sortedRows, filterForecast, filterDealTier, filterCloseDate, chartSliceFilter])
+  }, [sortedRows, filterDealTier, filterCloseDate, chartSliceFilter, tierSliceFilter])
 
   const grandTotalDisplay = useMemo(() => {
-    if (chartSliceFilter == null && filterCloseDate.length === 0) return grand_total
+    if (chartSliceFilter == null && tierSliceFilter == null && filterCloseDate.length === 0) return grand_total
     return displayRows.reduce((s, r) => s + r.arr, 0)
-  }, [chartSliceFilter, filterCloseDate, grand_total, displayRows])
+  }, [chartSliceFilter, tierSliceFilter, filterCloseDate, grand_total, displayRows])
 
   const toggleChartSliceFilter = (month: string | null, stage: string) => {
+    setTierSliceFilter(null)
     setChartSliceFilter((prev) => {
       if (prev && prev.month === month && prev.stage === stage) return null
       return { month, stage }
+    })
+  }
+
+  const toggleTierSliceFilter = (month: string | null, tier: string) => {
+    setChartSliceFilter(null)
+    setTierSliceFilter((prev) => {
+      if (prev && prev.month === month && prev.tier === tier) return null
+      return { month, tier }
     })
   }
 
@@ -369,8 +430,7 @@ export default function Pipeline() {
     stage: 'stage_name',
     record_type: 'record_type_name',
     close_date: 'close_date',
-    forecast_category: 'forecast_category',
-    deal_tier: 'stage_name',  // no dedicated sort key; falls back to stage
+    deal_tier: 'stage_name',
   }
 
   const thFilter = (
@@ -495,17 +555,20 @@ export default function Pipeline() {
       <h1 style={{ margin: '0 0 1.5rem', fontSize: '1.5rem', fontWeight: 600, color: 'var(--text)' }}>Pipeline</h1>
       {/* ── Observations + Charts row ── */}
       {chartDataByStage.months.length > 0 && (
-        <div style={{ marginBottom: '1.5rem', maxWidth: '100%', display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '1.5rem', alignItems: 'stretch' }}>
+        <>
+        {/* Single unified grid: observations (left, spans 2 rows) + 2×2 charts (right) */}
+        <div style={{ marginBottom: '1.5rem', maxWidth: '100%', display: 'grid', gridTemplateColumns: '300px 1fr 1fr', gridTemplateRows: 'auto auto', gap: '1.5rem' }}>
 
-          {/* Observations card */}
+          {/* Observations card — spans both chart rows */}
           <div style={{
+            gridColumn: '1',
+            gridRow: '1 / 3',
             background: 'var(--surface)',
             border: '1px solid var(--border)',
             borderRadius: 8,
             padding: '1rem 1rem 0.85rem',
             display: 'flex',
             flexDirection: 'column',
-            minHeight: 180,
           }}>
             <p style={{ margin: '0 0 0.15rem', fontSize: '0.65rem', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.07em', color: '#38bdf8' }}>
               Dazos Forecast Agent
@@ -518,25 +581,25 @@ export default function Pipeline() {
             )}
             {observations && observations.observations.length === 0 && (
               <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)', lineHeight: 1.5 }}>
-                No observations yet. Run the AI rescore from the Forecast view to generate insights.
+                No pipeline observations yet — run AI scoring from the Forecast view.
               </p>
             )}
             {observations && observations.observations.length > 0 && (
-              <>
-                <ul style={{ margin: 0, paddingLeft: '1.1rem', display: 'flex', flexDirection: 'column', gap: '0.5rem', flex: 1 }}>
-                  {observations.observations.map((obs, i) => (
-                    <li key={i} style={{ fontSize: '0.8rem', color: 'var(--text)', lineHeight: 1.55 }}>{obs}</li>
-                  ))}
-                </ul>
-                {observations.scored_at && (
-                  <p style={{ margin: '0.75rem 0 0', fontSize: '0.68rem', color: 'var(--text-muted)' }}>
-                    Updated {new Date(observations.scored_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}
-                  </p>
-                )}
-              </>
+              <ul style={{ margin: 0, paddingLeft: '1.1rem', display: 'flex', flexDirection: 'column', gap: '0.5rem', flex: 1 }}>
+                {observations.observations.map((obs, i) => (
+                  <li key={i} style={{ fontSize: '0.8rem', color: 'var(--text)', lineHeight: 1.55 }}>{obs}</li>
+                ))}
+              </ul>
+            )}
+            {observations && (observations.scored_at ?? observations.last_ai_run_at) && (
+              <p style={{ margin: '0.75rem 0 0', fontSize: '0.68rem', color: 'var(--text-muted)' }}>
+                {observations.scored_at ? 'Updated' : 'Last scored'}{' '}
+                {new Date((observations.scored_at ?? observations.last_ai_run_at)!).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}
+              </p>
             )}
           </div>
-              <div style={{ minWidth: 0, display: 'flex', flexDirection: 'column' }}>
+          {/* Stage ARR chart — row 1, col 2 */}
+              <div style={{ gridColumn: '2', gridRow: '1', minWidth: 0, display: 'flex', flexDirection: 'column' }}>
                 <div style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text)', marginBottom: '0.5rem' }}>Open pipeline by close month and stage (ARR)</div>
                 <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', background: 'var(--bg)', padding: '0.75rem 1rem', borderRadius: 6 }}>
                   <div style={{ display: 'flex', gap: 0, fontSize: '0.75rem' }}>
@@ -673,7 +736,8 @@ export default function Pipeline() {
                   </div>
                 </div>
               </div>
-              <div style={{ minWidth: 0, display: 'flex', flexDirection: 'column' }}>
+          {/* Stage Count chart — row 1, col 3 */}
+              <div style={{ gridColumn: '3', gridRow: '1', minWidth: 0, display: 'flex', flexDirection: 'column' }}>
                 <div style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text)', marginBottom: '0.5rem' }}>Open pipeline by close month and stage (# opportunities)</div>
                 <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', background: 'var(--bg)', padding: '0.75rem 1rem', borderRadius: 6 }}>
                   <div style={{ display: 'flex', gap: 0, fontSize: '0.75rem' }}>
@@ -785,13 +849,156 @@ export default function Pipeline() {
                   </div>
                 </div>
               </div>
-        </div>
+
+          {/* Tier ARR chart — row 2, col 2 */}
+            <div style={{ gridColumn: '2', gridRow: '2', minWidth: 0, display: 'flex', flexDirection: 'column' }}>
+              <div style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text)', marginBottom: '0.5rem' }}>Open pipeline by close month and tier (ARR)</div>
+              <div style={{ flex: 1, background: 'var(--bg)', padding: '0.75rem 1rem', borderRadius: 6 }}>
+                <div style={{ display: 'flex', gap: 0, fontSize: '0.75rem' }}>
+                  <div style={{ width: 36, flexShrink: 0, height: PLOT_HEIGHT, position: 'relative', color: 'var(--text-muted)', fontSize: '0.7rem', paddingRight: 8 }}>
+                    {chartDataByTier.arrTicks.slice().reverse().map((tick, i) => (
+                      <span key={tick} style={{ position: 'absolute', right: 8, top: (i / (chartDataByTier.arrTicks.length - 1)) * PLOT_HEIGHT, transform: 'translateY(-50%)', lineHeight: 1, textAlign: 'right' }}>
+                        {tick === 0 ? '$0' : `$${(tick / 1e6).toFixed(1)}M`}
+                      </span>
+                    ))}
+                  </div>
+                  <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', paddingLeft: 4 }}>
+                    <div style={{ height: PLOT_HEIGHT, position: 'relative', flexShrink: 0 }}>
+                      <div style={{ position: 'absolute', left: 0, right: 0, top: 0, bottom: 0, pointerEvents: 'none' }}>
+                        {chartDataByTier.arrTicks.map((_, i) => (
+                          <div key={i} style={{ position: 'absolute', left: 0, right: 0, bottom: (i / (chartDataByTier.arrTicks.length - 1)) * PLOT_HEIGHT, height: 1, background: 'var(--border)', opacity: 0.7 }} />
+                        ))}
+                      </div>
+                      <div style={{ height: '100%', display: 'flex', alignItems: 'flex-end', gap: '0.25rem', position: 'relative', zIndex: 1 }}>
+                        {chartDataByTier.months.map((month) => {
+                          const tierMap = chartDataByTier.arrMap.get(month)!
+                          const total = Array.from(tierMap.values()).reduce((a, b) => a + b, 0)
+                          const barHeight = total > 0 ? Math.min(PLOT_HEIGHT, (total / chartDataByTier.arrCeil) * PLOT_HEIGHT) : 0
+                          return (
+                            <div key={month} style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', minWidth: 0, justifyContent: 'flex-end', height: '100%' }}>
+                              <div style={{ flex: 1, minHeight: 0 }} />
+                              <div style={{ marginBottom: '0.2rem', fontWeight: 700, fontSize: '0.8rem', color: 'var(--text)', minHeight: '1.1em' }}>
+                                {total > 0 ? `$${(total / 1e6).toFixed(1)}M` : ''}
+                              </div>
+                              <div style={{ width: '100%', maxWidth: 36, height: barHeight, minHeight: 0, display: 'flex', flexDirection: 'column-reverse', overflow: 'hidden', borderRadius: '2px 2px 0 0' }}>
+                                {chartDataByTier.tiers.map((tier) => {
+                                  const arr = tierMap.get(tier) ?? 0
+                                  if (arr <= 0) return null
+                                  const pct = total > 0 ? (arr / total) * 100 : 0
+                                  const segH = total > 0 && barHeight > 0 ? (arr / total) * barHeight : 0
+                                  const sliceSelected = tierSliceFilter != null && tierSliceFilter.month === month && tierSliceFilter.tier === tier
+                                  return (
+                                    <div key={tier}
+                                      role="button" tabIndex={0}
+                                      onClick={(e) => { e.stopPropagation(); toggleTierSliceFilter(month, tier) }}
+                                      onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleTierSliceFilter(month, tier) } }}
+                                      style={{ flex: `${pct} 0 0`, minHeight: 0, background: TIER_COLORS[tier] ?? '#94a3b8', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#fff', fontWeight: 600, fontSize: '0.7rem', textShadow: '0 0 1px rgba(0,0,0,0.5)', cursor: 'pointer', outline: sliceSelected ? '2px solid var(--accent)' : 'none', outlineOffset: -1 }}
+                                      title={`${tier}: ${fmtMoney(arr)} — click to filter table`}>
+                                      {segH >= 14 ? `$${(arr / 1e6).toFixed(1)}M` : ''}
+                                    </div>
+                                  )
+                                })}
+                              </div>
+                            </div>
+                          )
+                        })}
+                      </div>
+                    </div>
+                    <div style={{ display: 'flex', gap: '0.25rem', marginTop: '0.35rem' }}>
+                      {chartDataByTier.months.map((month) => (
+                        <div key={month} style={{ flex: 1, color: 'var(--text-muted)', fontSize: '0.7rem', textAlign: 'center' }}>{formatMonthLabel(month)}</div>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.5rem 1rem', marginTop: '0.75rem', fontSize: '0.7rem', color: 'var(--text-muted)' }}>
+                  {chartDataByTier.tiers.map((tier) => {
+                    const legSel = tierSliceFilter != null && tierSliceFilter.month === null && tierSliceFilter.tier === tier
+                    return (
+                      <button key={tier} type="button" onClick={() => toggleTierSliceFilter(null, tier)}
+                        style={{ display: 'inline-flex', alignItems: 'center', gap: '0.35rem', padding: '2px 6px', margin: 0, border: legSel ? '1px solid var(--accent)' : '1px solid transparent', borderRadius: 4, background: legSel ? 'var(--surface)' : 'transparent', color: 'inherit', font: 'inherit', cursor: 'pointer' }}
+                        title="Filter table by this tier (all close months)">
+                        <span style={{ width: 8, height: 8, borderRadius: 2, background: TIER_COLORS[tier] ?? '#94a3b8', flexShrink: 0 }} />
+                        {tier}
+                      </button>
+                    )
+                  })}
+                </div>
+              </div>
+            </div>
+
+          {/* Tier Count chart — row 2, col 3 */}
+            <div style={{ gridColumn: '3', gridRow: '2', minWidth: 0, display: 'flex', flexDirection: 'column' }}>
+              <div style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text)', marginBottom: '0.5rem' }}>Open pipeline by close month and tier (# opportunities)</div>
+              <div style={{ flex: 1, background: 'var(--bg)', padding: '0.75rem 1rem', borderRadius: 6 }}>
+                <div style={{ display: 'flex', gap: 0, fontSize: '0.75rem' }}>
+                  <div style={{ width: 36, flexShrink: 0, height: PLOT_HEIGHT, position: 'relative', color: 'var(--text-muted)', fontSize: '0.7rem', paddingRight: 8 }}>
+                    {chartDataByTier.countTicks.slice().reverse().map((tick, i) => (
+                      <span key={tick} style={{ position: 'absolute', right: 8, top: (i / (chartDataByTier.countTicks.length - 1)) * PLOT_HEIGHT, transform: 'translateY(-50%)', lineHeight: 1, textAlign: 'right' }}>
+                        {tick}
+                      </span>
+                    ))}
+                  </div>
+                  <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', paddingLeft: 4 }}>
+                    <div style={{ height: PLOT_HEIGHT, position: 'relative', flexShrink: 0 }}>
+                      <div style={{ position: 'absolute', left: 0, right: 0, top: 0, bottom: 0, pointerEvents: 'none' }}>
+                        {chartDataByTier.countTicks.map((_, i) => (
+                          <div key={i} style={{ position: 'absolute', left: 0, right: 0, bottom: (i / (chartDataByTier.countTicks.length - 1)) * PLOT_HEIGHT, height: 1, background: 'var(--border)', opacity: 0.7 }} />
+                        ))}
+                      </div>
+                      <div style={{ height: '100%', display: 'flex', alignItems: 'flex-end', gap: '0.25rem', position: 'relative', zIndex: 1 }}>
+                        {chartDataByTier.months.map((month) => {
+                          const cMap = chartDataByTier.countMap.get(month)!
+                          const total = Array.from(cMap.values()).reduce((a, b) => a + b, 0)
+                          const barHeight = total > 0 ? Math.min(PLOT_HEIGHT, (total / chartDataByTier.countCeil) * PLOT_HEIGHT) : 0
+                          return (
+                            <div key={month} style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', minWidth: 0, justifyContent: 'flex-end', height: '100%' }}>
+                              <div style={{ flex: 1, minHeight: 0 }} />
+                              <div style={{ marginBottom: '0.2rem', fontWeight: 700, fontSize: '0.8rem', color: 'var(--text)', minHeight: '1.1em' }}>
+                                {total > 0 ? total : ''}
+                              </div>
+                              <div style={{ width: '100%', maxWidth: 36, height: barHeight, minHeight: 0, display: 'flex', flexDirection: 'column-reverse', overflow: 'hidden', borderRadius: '2px 2px 0 0' }}>
+                                {chartDataByTier.tiers.map((tier) => {
+                                  const count = cMap.get(tier) ?? 0
+                                  if (count <= 0) return null
+                                  const pct = total > 0 ? (count / total) * 100 : 0
+                                  const segH = total > 0 && barHeight > 0 ? (count / total) * barHeight : 0
+                                  const sliceSelected = tierSliceFilter != null && tierSliceFilter.month === month && tierSliceFilter.tier === tier
+                                  return (
+                                    <div key={tier}
+                                      role="button" tabIndex={0}
+                                      onClick={(e) => { e.stopPropagation(); toggleTierSliceFilter(month, tier) }}
+                                      onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleTierSliceFilter(month, tier) } }}
+                                      style={{ flex: `${pct} 0 0`, minHeight: 0, background: TIER_COLORS[tier] ?? '#94a3b8', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#fff', fontWeight: 600, fontSize: '0.7rem', textShadow: '0 0 1px rgba(0,0,0,0.5)', cursor: 'pointer', outline: sliceSelected ? '2px solid var(--accent)' : 'none', outlineOffset: -1 }}
+                                      title={`${tier}: ${count} opps — click to filter table`}>
+                                      {segH >= 14 ? count : ''}
+                                    </div>
+                                  )
+                                })}
+                              </div>
+                            </div>
+                          )
+                        })}
+                      </div>
+                    </div>
+                    <div style={{ display: 'flex', gap: '0.25rem', marginTop: '0.35rem' }}>
+                      {chartDataByTier.months.map((month) => (
+                        <div key={month} style={{ flex: 1, color: 'var(--text-muted)', fontSize: '0.7rem', textAlign: 'center' }}>{formatMonthLabel(month)}</div>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+          </div>
+        </>
       )}
       {(chartSliceFilter != null ||
+        tierSliceFilter != null ||
         filterStage.length > 0 ||
         filterRecordType.length > 0 ||
         filterCloseDate.length > 0 ||
-        filterForecast.length > 0 ||
         filterDealTier.length > 0) && (
         <p style={{ marginBottom: '1rem', display: 'flex', alignItems: 'center', gap: '0.75rem', flexWrap: 'wrap' }}>
           {chartSliceFilter != null && (
@@ -802,16 +1009,24 @@ export default function Pipeline() {
               <strong>{chartSliceFilter.stage}</strong>
             </span>
           )}
-          {(filterStage.length > 0 || filterRecordType.length > 0 || filterCloseDate.length > 0 || filterForecast.length > 0 || filterDealTier.length > 0 || chartSliceFilter != null) && (
+          {tierSliceFilter != null && (
+            <span style={{ fontSize: '0.85rem', color: 'var(--text)' }}>
+              Table:{' '}
+              <strong>{tierSliceFilter.month != null ? formatMonthLabel(tierSliceFilter.month) : 'All months'}</strong>
+              {' · '}
+              <strong>{tierSliceFilter.tier}</strong>
+            </span>
+          )}
+          {(filterStage.length > 0 || filterRecordType.length > 0 || filterCloseDate.length > 0 || filterDealTier.length > 0 || chartSliceFilter != null || tierSliceFilter != null) && (
             <button
               type="button"
               onClick={() => {
                 setFilterStage([])
                 setFilterRecordType([])
                 setFilterCloseDate([])
-                setFilterForecast([])
                 setFilterDealTier([])
                 setChartSliceFilter(null)
+                setTierSliceFilter(null)
                 setOpenFilter(null)
               }}
               style={{
@@ -837,7 +1052,7 @@ export default function Pipeline() {
               {th('opportunity_name', 'Opportunity', 'left')}
               {thFilter('stage', 'Stage', stageThRef, stagePopoverRef, data.stages ?? [], filterStage, setFilterStage)}
               {thFilter('deal_tier', 'Deal Tier', dealTierThRef, dealTierPopoverRef, dealTierOptions, filterDealTier, setFilterDealTier)}
-              {thFilter('forecast_category', 'Forecast', forecastThRef, forecastPopoverRef, forecastOptions, filterForecast, setFilterForecast)}
+              <th style={{ padding: '0.5rem 0.75rem', color: 'var(--text-muted)', fontWeight: 500, whiteSpace: 'nowrap' }}>Tier %</th>
               <th style={{ padding: '0.5rem 0.75rem', textAlign: 'right', color: 'var(--text-muted)', fontWeight: 500, whiteSpace: 'nowrap' }}>AI %</th>
               {thFilter('record_type', 'Record type', recordTypeThRef, recordTypePopoverRef, data.record_types ?? [], filterRecordType, setFilterRecordType)}
               {thFilter('close_date', 'Close date', closeDateThRef, closeDatePopoverRef, closeDateOptions, filterCloseDate, setFilterCloseDate, formatMonthLabel)}
@@ -892,7 +1107,7 @@ export default function Pipeline() {
                 </td>
                 <td style={{ padding: '0.5rem 0.75rem', whiteSpace: 'nowrap' }}>{row.stage_name}</td>
                 <td style={{ padding: '0.5rem 0.75rem', whiteSpace: 'nowrap' }}>{row.deal_tier ?? '—'}</td>
-                <td style={{ padding: '0.5rem 0.75rem', whiteSpace: 'nowrap' }}>{row.forecast_category ?? '—'}</td>
+                <td style={{ padding: '0.5rem 0.75rem', whiteSpace: 'nowrap' }}>{tierPct(row.deal_tier)}</td>
                 <td
                   style={{ textAlign: 'right', padding: '0.5rem 0.75rem', whiteSpace: 'nowrap', color: '#38bdf8', fontWeight: 600, cursor: row.ai_reasoning ? 'help' : 'default' }}
                   onMouseEnter={row.ai_reasoning ? (e) => {

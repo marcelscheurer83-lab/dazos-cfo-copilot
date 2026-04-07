@@ -1235,9 +1235,11 @@ export type ForecastMonthNB = {
   actuals: number
   pipeline_weighted: number
   pipeline_ai_weighted: number
+  pipeline_tier_weighted: number
   pipeline_raw: number
   forecast: number
   forecast_ai: number
+  forecast_tier: number
   in_quarter_est: number
   adjusted_forecast: number
   target: number | null
@@ -1249,9 +1251,11 @@ export type ForecastMonthExp = {
   actuals: number
   pipeline_weighted: number
   pipeline_ai_weighted: number
+  pipeline_tier_weighted: number
   pipeline_raw: number
   forecast: number
   forecast_ai: number
+  forecast_tier: number
   in_quarter_est: number
   adjusted_forecast: number
   target: number | null
@@ -1274,18 +1278,21 @@ export type ForecastQuarterTotals = {
   nb_actuals: number
   nb_forecast: number
   nb_forecast_ai: number
+  nb_forecast_tier: number
   nb_in_quarter_est: number
   nb_adjusted_forecast: number
   nb_target: number | null
   exp_actuals: number
   exp_forecast: number
   exp_forecast_ai: number
+  exp_forecast_tier: number
   exp_in_quarter_est: number
   exp_adjusted_forecast: number
   exp_target: number | null
   total_actuals: number
   total_forecast: number
   total_forecast_ai: number
+  total_forecast_tier: number
   total_in_quarter_est: number
   total_adjusted_forecast: number
   has_ai_scores: boolean
@@ -1388,6 +1395,7 @@ export type AIObservationsResponse = {
   scored_at: string | null
   quarter_label: string | null
   obs_type?: string
+  last_ai_run_at: string | null
 }
 
 export async function getAIObservations(type: 'forecast' | 'pipeline' = 'forecast'): Promise<AIObservationsResponse> {

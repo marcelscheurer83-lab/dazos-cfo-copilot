@@ -274,46 +274,18 @@ async def _migrate_db() -> None:
             await db.commit()
         except Exception:
             await db.rollback()
-        # Recreate ai_forecast_observations table to replace the old single-column UNIQUE(scored_at)
-        # with the composite UNIQUE(scored_at, obs_type) required for multiple observation types.
-        # Safe: copies existing data, only runs when old schema is detected.
-        try:
-            # Detect old schema: unique index on scored_at alone (no obs_type index)
-            idx_rows = (await db.execute(_text(
-                "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='ai_forecast_observations'"
-            ))).fetchall()
-            idx_names = [r[0] for r in idx_rows]
-            needs_rebuild = any("scored_at" in n and "obs_type" not in n for n in idx_names)
-            if needs_rebuild:
-                await db.execute(_text("""
-                    CREATE TABLE IF NOT EXISTS _ai_obs_new (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        scored_at DATETIME NOT NULL,
-                        obs_type VARCHAR(16) NOT NULL DEFAULT 'forecast',
-                        quarter_label VARCHAR(16),
-                        observations_json TEXT,
-                        created_at DATETIME DEFAULT (CURRENT_TIMESTAMP),
-                        UNIQUE (scored_at, obs_type)
-                    )
-                """))
-                await db.execute(_text("""
-                    INSERT OR IGNORE INTO _ai_obs_new
-                        (id, scored_at, obs_type, quarter_label, observations_json, created_at)
-                    SELECT id,
-                           scored_at,
-                           COALESCE(obs_type, 'forecast'),
-                           quarter_label,
-                           observations_json,
-                           created_at
-                    FROM ai_forecast_observations
-                """))
-                await db.execute(_text("DROP TABLE ai_forecast_observations"))
-                await db.execute(_text("ALTER TABLE _ai_obs_new RENAME TO ai_forecast_observations"))
+        # Drop the old single-column unique index on scored_at if it still exists.
+        # SQLAlchemy names it ix_ai_forecast_observations_scored_at.
+        # After dropping it, inserts of multiple obs_type rows with the same scored_at work fine.
+        for old_idx in (
+            "ix_ai_forecast_observations_scored_at",
+            "uq_ai_forecast_observations_scored_at",
+        ):
+            try:
+                await db.execute(_text(f"DROP INDEX IF EXISTS {old_idx}"))
                 await db.commit()
-        except Exception as rebuild_err:
-            await db.rollback()
-            import logging as _log_m
-            _log_m.getLogger(__name__).warning("ai_forecast_observations table rebuild skipped: %s", rebuild_err)
+            except Exception:
+                await db.rollback()
 
 
 @asynccontextmanager
@@ -3750,6 +3722,22 @@ async def get_forecast_current_quarter(db: AsyncSession = Depends(get_db)):
         fc = (o.forecast_category or "").strip()
         return _pipeline_arr(o) * weights.get(fc, 0.0)
 
+    _TIER_WEIGHTS: dict[str, float] = {
+        "tier 1": 0.90,
+        "tier 2": 0.50,
+        "tier 3": 0.25,
+        "tier 4": 0.10,
+    }
+
+    def _tier_weighted(o: Opportunity, fc_weights: dict[str, float]) -> float:
+        """ARR × tier floor probability; falls back to Forecast__c weight when no tier is set."""
+        tier = (o.deal_tier or "").lower()
+        for key, prob in _TIER_WEIGHTS.items():
+            if key in tier:
+                return _pipeline_arr(o) * prob
+        fc = (o.forecast_category or "").strip()
+        return _pipeline_arr(o) * fc_weights.get(fc, 0.0)
+
     # ── in-quarter pipeline estimate ─────────────────────────────────────────
     iq_rates = await _compute_in_quarter_rates(db)
     # month_pos: 0=first month of quarter, 1=second, 2=third
@@ -3787,21 +3775,25 @@ async def get_forecast_current_quarter(db: AsyncSession = Depends(get_db)):
             and not _is_excluded_from_bookings_nb_only(o, _eff_rt(o))
             and o.close_date and d_start <= o.close_date <= d_end
         ]
-        nb_pipe_weighted    = sum(_weighted(o, _FC_NB_EXP_WEIGHTS) for o in nb_open)
-        nb_pipe_ai_weighted = sum(_ai_weighted(o, _FC_NB_EXP_WEIGHTS) for o in nb_open)
-        nb_pipe_raw         = sum(_pipeline_arr(o) for o in nb_open)
+        nb_pipe_weighted      = sum(_weighted(o, _FC_NB_EXP_WEIGHTS) for o in nb_open)
+        nb_pipe_ai_weighted   = sum(_ai_weighted(o, _FC_NB_EXP_WEIGHTS) for o in nb_open)
+        nb_pipe_tier_weighted = sum(_tier_weighted(o, _FC_NB_EXP_WEIGHTS) for o in nb_open)
+        nb_pipe_raw           = sum(_pipeline_arr(o) for o in nb_open)
 
-        nb_forecast_val    = round(nb_actual + nb_pipe_weighted, 2)
-        nb_forecast_ai_val = round(nb_actual + nb_pipe_ai_weighted, 2)
+        nb_forecast_val      = round(nb_actual + nb_pipe_weighted, 2)
+        nb_forecast_ai_val   = round(nb_actual + nb_pipe_ai_weighted, 2)
         nb_iq = _iq_est(iq_rates["nb"], mk, nb_actual, nb_pipe_ai_weighted)
+        nb_forecast_tier_val = round(nb_actual + nb_pipe_tier_weighted + nb_iq, 2)
         nb_months.append({
             "month": mk,
             "actuals": round(nb_actual, 2),
             "pipeline_weighted": round(nb_pipe_weighted, 2),
             "pipeline_ai_weighted": round(nb_pipe_ai_weighted, 2),
+            "pipeline_tier_weighted": round(nb_pipe_tier_weighted, 2),
             "pipeline_raw": round(nb_pipe_raw, 2),
             "forecast": nb_forecast_val,
             "forecast_ai": nb_forecast_ai_val,
+            "forecast_tier": nb_forecast_tier_val,
             "in_quarter_est": nb_iq,
             "adjusted_forecast": round(nb_forecast_ai_val + nb_iq, 2),
             "target": _sheet_target(_FORECAST_ROW_NB, mk),
@@ -3822,21 +3814,25 @@ async def get_forecast_current_quarter(db: AsyncSession = Depends(get_db)):
             and _is_expansion_record_type(_eff_rt(o))
             and o.close_date and d_start <= o.close_date <= d_end
         ]
-        exp_pipe_weighted    = sum(_weighted(o, _FC_NB_EXP_WEIGHTS) for o in exp_open)
-        exp_pipe_ai_weighted = sum(_ai_weighted(o, _FC_NB_EXP_WEIGHTS) for o in exp_open)
-        exp_pipe_raw         = sum(_pipeline_arr(o) for o in exp_open)
+        exp_pipe_weighted      = sum(_weighted(o, _FC_NB_EXP_WEIGHTS) for o in exp_open)
+        exp_pipe_ai_weighted   = sum(_ai_weighted(o, _FC_NB_EXP_WEIGHTS) for o in exp_open)
+        exp_pipe_tier_weighted = sum(_tier_weighted(o, _FC_NB_EXP_WEIGHTS) for o in exp_open)
+        exp_pipe_raw           = sum(_pipeline_arr(o) for o in exp_open)
 
-        exp_forecast_val    = round(exp_actual + exp_pipe_weighted, 2)
-        exp_forecast_ai_val = round(exp_actual + exp_pipe_ai_weighted, 2)
+        exp_forecast_val      = round(exp_actual + exp_pipe_weighted, 2)
+        exp_forecast_ai_val   = round(exp_actual + exp_pipe_ai_weighted, 2)
         exp_iq = _iq_est(iq_rates["exp"], mk, exp_actual, exp_pipe_ai_weighted)
+        exp_forecast_tier_val = round(exp_actual + exp_pipe_tier_weighted + exp_iq, 2)
         exp_months.append({
             "month": mk,
             "actuals": round(exp_actual, 2),
             "pipeline_weighted": round(exp_pipe_weighted, 2),
             "pipeline_ai_weighted": round(exp_pipe_ai_weighted, 2),
+            "pipeline_tier_weighted": round(exp_pipe_tier_weighted, 2),
             "pipeline_raw": round(exp_pipe_raw, 2),
             "forecast": exp_forecast_val,
             "forecast_ai": exp_forecast_ai_val,
+            "forecast_tier": exp_forecast_tier_val,
             "in_quarter_est": exp_iq,
             "adjusted_forecast": round(exp_forecast_ai_val + exp_iq, 2),
             "target": _sheet_target(_FORECAST_ROW_EXP, mk),
@@ -3936,18 +3932,21 @@ async def get_forecast_current_quarter(db: AsyncSession = Depends(get_db)):
             "nb_actuals":              _sum(nb_months,  "actuals"),
             "nb_forecast":             _sum(nb_months,  "forecast"),
             "nb_forecast_ai":          _sum(nb_months,  "forecast_ai"),
+            "nb_forecast_tier":        _sum(nb_months,  "forecast_tier"),
             "nb_in_quarter_est":       _sum(nb_months,  "in_quarter_est"),
             "nb_adjusted_forecast":    _sum(nb_months,  "adjusted_forecast"),
             "nb_target":               _sum(nb_months,  "target") if all(m["target"] for m in nb_months) else None,
             "exp_actuals":             _sum(exp_months, "actuals"),
             "exp_forecast":            _sum(exp_months, "forecast"),
             "exp_forecast_ai":         _sum(exp_months, "forecast_ai"),
+            "exp_forecast_tier":       _sum(exp_months, "forecast_tier"),
             "exp_in_quarter_est":      _sum(exp_months, "in_quarter_est"),
             "exp_adjusted_forecast":   _sum(exp_months, "adjusted_forecast"),
             "exp_target":              _sum(exp_months, "target") if all(m["target"] for m in exp_months) else None,
             "total_actuals":           round(_sum(nb_months, "actuals") + _sum(exp_months, "actuals"), 2),
             "total_forecast":          round(_sum(nb_months, "forecast") + _sum(exp_months, "forecast"), 2),
             "total_forecast_ai":       round(_sum(nb_months, "forecast_ai") + _sum(exp_months, "forecast_ai"), 2),
+            "total_forecast_tier":     round(_sum(nb_months, "forecast_tier") + _sum(exp_months, "forecast_tier"), 2),
             "total_in_quarter_est":    round(_sum(nb_months, "in_quarter_est") + _sum(exp_months, "in_quarter_est"), 2),
             "total_adjusted_forecast": round(_sum(nb_months, "adjusted_forecast") + _sum(exp_months, "adjusted_forecast"), 2),
             "has_ai_scores":           len(ai_prob_map) > 0,
@@ -4129,6 +4128,13 @@ async def get_forecast_observations(
 ):
     """Return the most recent AI observations. type='forecast' (default) or 'pipeline'."""
     import json as _json_obs2
+
+    # Most recent scoring run timestamp (regardless of observation type)
+    last_score_row = (await db.execute(
+        select(DealAIScore.scored_at).order_by(DealAIScore.scored_at.desc()).limit(1)
+    )).scalar_one_or_none()
+    last_ai_run_at = last_score_row.isoformat() if last_score_row else None
+
     row = (await db.execute(
         select(AIForecastObservations)
         .where(AIForecastObservations.obs_type == type)
@@ -4136,8 +4142,13 @@ async def get_forecast_observations(
         .limit(1)
     )).scalars().first()
     if not row:
-        # fall back: if pipeline type not yet generated, return empty rather than wrong type
-        return {"observations": [], "scored_at": None, "quarter_label": None, "obs_type": type}
+        return {
+            "observations": [],
+            "scored_at": None,
+            "quarter_label": None,
+            "obs_type": type,
+            "last_ai_run_at": last_ai_run_at,
+        }
     obs = []
     if row.observations_json:
         try:
@@ -4149,6 +4160,7 @@ async def get_forecast_observations(
         "scored_at": row.scored_at.isoformat() if row.scored_at else None,
         "quarter_label": row.quarter_label,
         "obs_type": type,
+        "last_ai_run_at": last_ai_run_at,
     }
 
 
@@ -5392,17 +5404,17 @@ async def _run_ai_forecast_scoring(db: AsyncSession) -> dict:
             ))
             scored_total += 1
 
+    # ── Quarter label (shared by both observation blocks) ────────────────────
+    import json as _json2
+    _now_obs = datetime.now(EST)
+    _q_num_obs = (_now_obs.month - 1) // 3 + 1
+    _q_start_obs = (_q_num_obs - 1) * 3 + 1
+    months2 = [f"{_now_obs.year}-{(_q_start_obs + i):02d}" for i in range(3)]
+    q_label2 = f"Q{_q_num_obs} '{str(_now_obs.year)[2:]}"
+
     # ── Generate executive observations ──────────────────────────────────────
     observations: list[str] = []
     try:
-        import json as _json2
-
-        # Build a compact pipeline summary for the observations prompt
-        now_est2 = datetime.now(EST)
-        q_num2 = (now_est2.month - 1) // 3 + 1
-        q_start2 = (q_num2 - 1) * 3 + 1
-        months2 = [f"{now_est2.year}-{(q_start2 + i):02d}" for i in range(3)]
-        q_label2 = f"Q{q_num2} '{str(now_est2.year)[2:]}"
 
         # Load freshly written scores for this run
         scores_r2 = await db.execute(
@@ -5464,10 +5476,9 @@ async def _run_ai_forecast_scoring(db: AsyncSession) -> dict:
         obs_raw = obs_response.choices[0].message.content or "{}"
         observations = _json2.loads(obs_raw).get("observations", [])
 
-        # Upsert forecast observations for this run
+        # Replace forecast observations (keep only the latest run)
         await db.execute(
             delete(AIForecastObservations).where(
-                AIForecastObservations.scored_at == scored_at,
                 AIForecastObservations.obs_type == "forecast",
             )
         )
@@ -5484,10 +5495,14 @@ async def _run_ai_forecast_scoring(db: AsyncSession) -> dict:
     # Uses its own DB session so any failure cannot corrupt the main session (DealAIScore inserts).
     try:
         import json as _json3
-        import calendar as _cal3
-        from datetime import date as _date3
 
         today_est3 = datetime.now(EST).date()
+
+        def _pipe_arr(o: Opportunity) -> float:
+            """ARR for pipeline obs: MRR×12 when set, else Amount."""
+            if o.mrr is not None and o.mrr != 0:
+                return float(o.mrr) * 12
+            return float(o.amount or 0)
 
         # Build pipeline summary: per-tier and per-stage breakdown + velocity signals
         tier_bucket: dict[str, dict] = {}
@@ -5496,7 +5511,7 @@ async def _run_ai_forecast_scoring(db: AsyncSession) -> dict:
         tier_change_deals: list[str] = []  # deals where Deal_Tier changed recently
 
         for o in open_opps:
-            arr = _pipeline_arr(o)
+            arr = _pipe_arr(o)
             tier = o.deal_tier or "No Tier"
             stage = o.stage_name or "Unknown"
 
@@ -5556,7 +5571,7 @@ async def _run_ai_forecast_scoring(db: AsyncSession) -> dict:
         pipeline_summary = {
             "quarter": q_label2,
             "total_open_deals": len(open_opps),
-            "total_open_arr": round(sum(_pipeline_arr(o) for o in open_opps)),
+            "total_open_arr": round(sum(_pipe_arr(o) for o in open_opps)),
             "by_tier": tier_summary,
             "by_stage": stage_summary,
             "stale_deals_21d": stale_deals[:8],
@@ -5586,9 +5601,9 @@ async def _run_ai_forecast_scoring(db: AsyncSession) -> dict:
         pipeline_observations: list[str] = _json3.loads(pipe_obs_raw).get("observations", [])
 
         async with AsyncSessionLocal() as pipe_db:
+            # Replace pipeline observations (keep only the latest run)
             await pipe_db.execute(
                 delete(AIForecastObservations).where(
-                    AIForecastObservations.scored_at == scored_at,
                     AIForecastObservations.obs_type == "pipeline",
                 )
             )
@@ -5600,7 +5615,7 @@ async def _run_ai_forecast_scoring(db: AsyncSession) -> dict:
             ))
             await pipe_db.commit()
     except Exception as pipe_obs_err:
-        logger.warning("Failed to generate pipeline observations: %s", pipe_obs_err)
+        logger.exception("Failed to generate pipeline observations: %s", pipe_obs_err)
 
     return {"ok": True, "scored": scored_total, "scored_at": scored_at.isoformat()}
 

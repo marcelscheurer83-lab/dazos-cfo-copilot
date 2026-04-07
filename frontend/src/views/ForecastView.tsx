@@ -43,24 +43,22 @@ function fmtPct(n: number | null | undefined): string {
   return `${n.toFixed(1)}%`
 }
 
-function fmtFull(n: number | null | undefined): string {
-  if (n == null) return '–'
-  return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 }).format(n)
-}
 
 // ── colours ───────────────────────────────────────────────────────────────────
 const C_ACTUAL   = '#e2e8f0'
 const C_FORECAST = '#a78bfa'
 const C_TARGET   = '#f59e0b'
-const C_IQ       = '#7c3aed'
+const C_IQ       = '#64748b'
 const C_AI       = '#38bdf8'
+const C_TIER     = '#818cf8'   // indigo — tier-weighted pipeline
 
 // ── KPI card ─────────────────────────────────────────────────────────────────
-function KpiCard({ label, value, sub, highlight }: { label: string; value: string; sub?: string; highlight?: boolean }) {
+function KpiCard({ label, value, sub, highlight, accentColor }: { label: string; value: string; sub?: string; highlight?: boolean; accentColor?: string }) {
+  const accent = accentColor ?? C_FORECAST
   return (
     <div style={{
       background: 'var(--surface)',
-      border: `1px solid ${highlight ? C_FORECAST : 'var(--border)'}`,
+      border: `1px solid ${highlight ? accent : 'var(--border)'}`,
       borderRadius: 8,
       padding: '0.85rem 1rem',
       flex: '1 1 0',
@@ -76,7 +74,7 @@ function KpiCard({ label, value, sub, highlight }: { label: string; value: strin
       <span style={{ fontSize: '0.78rem', fontWeight: 600, color: 'var(--text-muted)', textAlign: 'center', lineHeight: 1.3 }}>
         {label}
       </span>
-      <span style={{ fontSize: '1.5rem', fontWeight: 700, color: highlight ? C_FORECAST : 'var(--text)', textAlign: 'center' }}>
+      <span style={{ fontSize: '1.5rem', fontWeight: 700, color: highlight ? accent : 'var(--text)', textAlign: 'center' }}>
         {value}
       </span>
       {sub && <span style={{ fontSize: '0.78rem', color: 'var(--text-muted)', textAlign: 'center' }}>{sub}</span>}
@@ -90,29 +88,76 @@ type BookingsChartEntry = {
   actuals: number
   pipeline_weighted: number
   pipeline_ai_weighted: number
+  pipeline_tier_weighted: number
   in_quarter_est: number
   adjusted_forecast: number
+  forecast_tier: number
   target: number | null
   has_ai_scores: boolean
 }
 
+function BookingsChartTooltip({ active, payload, label, hasAI, hasIQ }: {
+  active?: boolean; payload?: readonly any[]; label?: string | number; hasAI: boolean; hasIQ: boolean
+}) {
+  if (!active || !payload?.length) return null
+  const get = (key: string) => payload.find((p: any) => p.dataKey === key)?.value ?? 0
+  const actuals   = get('actuals')
+  const aiPipe    = get(hasAI ? 'pipeline_ai_weighted' : 'pipeline_weighted')
+  const tierPipe  = get('pipeline_tier_weighted')
+  const iq        = hasIQ ? get('in_quarter_est') : 0
+  const target    = get('target')
+  const totalAI   = actuals + aiPipe + iq
+  const totalTier = actuals + tierPipe + iq
+  const row = (label: string, value: number, color: string, bold?: boolean) => (
+    <div key={label} style={{ display: 'flex', justifyContent: 'space-between', gap: '1.5rem', fontWeight: bold ? 700 : 400 }}>
+      <span style={{ color: 'var(--text-muted)' }}>{label}</span>
+      <span style={{ color }}>{fmtK(value)}</span>
+    </div>
+  )
+  const divider = <div style={{ borderTop: '1px solid rgba(255,255,255,0.1)', margin: '0.35rem 0' }} />
+  return (
+    <div style={{ background: '#0f172a', border: '1px solid var(--border)', borderRadius: 8, padding: '0.65rem 0.85rem', fontSize: '0.78rem', lineHeight: 1.6, minWidth: 200, boxShadow: '0 4px 16px rgba(0,0,0,0.5)' }}>
+      <p style={{ margin: '0 0 0.45rem', fontWeight: 700, color: 'var(--text)', fontSize: '0.8rem' }}>{fmtMonth(String(label ?? ''))}</p>
+      {row('Actuals', actuals, 'var(--text)')}
+      {divider}
+      {row(hasAI ? 'Pipeline (AI)' : 'Pipeline (weighted)', aiPipe, C_AI)}
+      {hasIQ && row('In-quarter est.', iq, C_IQ)}
+      {row('Forecast (AI)', totalAI, C_AI, true)}
+      {divider}
+      {row('Pipeline (Tier)', tierPipe, C_TIER)}
+      {hasIQ && row('In-quarter est.', iq, C_IQ)}
+      {row('Forecast (Tier)', totalTier, C_TIER, true)}
+      {target > 0 && <>{divider}{row('Target', target, C_TARGET)}</>}
+    </div>
+  )
+}
+
 function BookingsChart({ data, title }: { data: BookingsChartEntry[]; title: string }) {
-  const hasAI = data.some(d => d.has_ai_scores)
+  const hasAI  = data.some(d => d.has_ai_scores)
+  const hasIQ  = data.some(d => (d.in_quarter_est ?? 0) > 0)
+  const chartData = data.map(d => ({
+    ...d,
+    actuals_t:        d.actuals,
+    in_quarter_est_t: d.in_quarter_est,
+  }))
   return (
     <div style={{ marginBottom: '1rem' }}>
       <p style={{ margin: '0 0 0.4rem', fontSize: '0.82rem', fontWeight: 600, color: 'var(--text)' }}>{title}</p>
-      <ResponsiveContainer width="100%" height={180}>
-        <ComposedChart data={data} barCategoryGap="30%">
+      <ResponsiveContainer width="100%" height={200}>
+        <ComposedChart data={chartData} barCategoryGap="25%" barGap={2}>
           <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
           <XAxis dataKey="month" tick={{ fontSize: 11 }} tickFormatter={fmtMonth} />
           <YAxis tickFormatter={v => fmtK(v)} tick={{ fontSize: 11 }} width={58} />
-          <Tooltip formatter={(v: any) => fmtFull(v)} labelFormatter={(lbl: any) => fmtMonth(lbl)} />
+          <Tooltip content={(props) => <BookingsChartTooltip {...props} hasAI={hasAI} hasIQ={hasIQ} />} wrapperStyle={{ background: 'none', border: 'none', boxShadow: 'none', padding: 0, zIndex: 9999 }} />
           <Legend iconType="square" wrapperStyle={{ fontSize: 11 }} />
+          {/* AI forecast stack */}
           <Bar dataKey="actuals" name="Actuals" fill={C_ACTUAL} stackId="a" />
           <Bar dataKey={hasAI ? 'pipeline_ai_weighted' : 'pipeline_weighted'} name={hasAI ? 'Pipeline (AI)' : 'Pipeline (weighted)'} fill={hasAI ? C_AI : C_FORECAST} stackId="a" />
-          {data.some(d => (d.in_quarter_est ?? 0) > 0) && (
-            <Bar dataKey="in_quarter_est" name="In-quarter est." fill={C_IQ} stackId="a" />
-          )}
+          {hasIQ && <Bar dataKey="in_quarter_est" name="In-quarter" fill={C_IQ} stackId="a" />}
+          {/* Tier forecast stack */}
+          <Bar dataKey="actuals_t" name="" fill={C_ACTUAL} stackId="b" legendType="none" />
+          <Bar dataKey="pipeline_tier_weighted" name="Pipeline (Tier)" fill={C_TIER} stackId="b" />
+          {hasIQ && <Bar dataKey="in_quarter_est_t" name="" fill={C_IQ} stackId="b" legendType="none" />}
           <Line dataKey="target" name="Target" stroke={C_TARGET} strokeWidth={2} dot={{ r: 3 }} strokeDasharray="4 3" />
         </ComposedChart>
       </ResponsiveContainer>
@@ -123,21 +168,47 @@ function BookingsChart({ data, title }: { data: BookingsChartEntry[]; title: str
 // ── renewals ARR bar chart ────────────────────────────────────────────────────
 type RenewalsChartEntry = { month: string; due_arr: number; won_arr: number; pipeline_weighted: number }
 
+function RenewalsChartTooltip({ active, payload, label }: { active?: boolean; payload?: readonly any[]; label?: string | number }) {
+  if (!active || !payload?.length) return null
+  const get = (key: string) => payload.find((p: any) => p.dataKey === key)?.value ?? 0
+  const due      = get('due_arr')
+  const renewed  = get('won_arr')
+  const pipeline = get('pipeline_weighted')
+  const forecast = renewed + pipeline
+  const row = (lbl: string, value: number, color: string, bold?: boolean) => (
+    <div key={lbl} style={{ display: 'flex', justifyContent: 'space-between', gap: '1.5rem', fontWeight: bold ? 700 : 400 }}>
+      <span style={{ color: 'var(--text-muted)' }}>{lbl}</span>
+      <span style={{ color }}>{fmtK(value)}</span>
+    </div>
+  )
+  const divider = <div style={{ borderTop: '1px solid rgba(255,255,255,0.1)', margin: '0.35rem 0' }} />
+  return (
+    <div style={{ background: '#0f172a', border: '1px solid var(--border)', borderRadius: 8, padding: '0.65rem 0.85rem', fontSize: '0.78rem', lineHeight: 1.6, minWidth: 190, boxShadow: '0 4px 16px rgba(0,0,0,0.5)' }}>
+      <p style={{ margin: '0 0 0.45rem', fontWeight: 700, color: 'var(--text)', fontSize: '0.8rem' }}>{fmtMonth(String(label ?? ''))}</p>
+      {row('Up for Renewal', due, C_IQ)}
+      {divider}
+      {row('Renewed', renewed, 'var(--text)')}
+      {row('Pipeline (CS)', pipeline, C_TIER)}
+      {row('Forecast Renewed', forecast, C_TIER, true)}
+    </div>
+  )
+}
+
 function RenewalsChart({ data }: { data: RenewalsChartEntry[] }) {
   return (
     <div style={{ marginBottom: '1rem' }}>
       <p style={{ margin: '0 0 0.4rem', fontSize: '0.82rem', fontWeight: 600, color: 'var(--text)' }}>Up for renewal vs. won + pipeline</p>
-      <ResponsiveContainer width="100%" height={180}>
+      <ResponsiveContainer width="100%" height={200}>
         <ComposedChart data={data} barCategoryGap="30%">
           <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
           <XAxis dataKey="month" tick={{ fontSize: 11 }} tickFormatter={fmtMonth} />
           <YAxis tickFormatter={v => fmtK(v)} tick={{ fontSize: 11 }} width={58} />
           <ReferenceLine y={0} stroke="#555" />
-          <Tooltip formatter={(v: any) => fmtFull(v)} labelFormatter={(lbl: any) => fmtMonth(lbl)} />
+          <Tooltip content={(props) => <RenewalsChartTooltip {...props} />} wrapperStyle={{ background: 'none', border: 'none', boxShadow: 'none', padding: 0, zIndex: 9999 }} />
           <Legend iconType="square" wrapperStyle={{ fontSize: 11 }} />
-          <Bar dataKey="due_arr" name="Up for Renewal" fill="#64748b" opacity={0.5} />
+          <Bar dataKey="due_arr" name="Up for Renewal" fill={C_IQ} />
           <Bar dataKey="won_arr" name="Renewed" fill={C_ACTUAL} stackId="b" />
-          <Bar dataKey="pipeline_weighted" name="Pipeline (weighted)" fill={C_AI} stackId="b" />
+          <Bar dataKey="pipeline_weighted" name="Pipeline (CS)" fill={C_TIER} stackId="b" />
         </ComposedChart>
       </ResponsiveContainer>
     </div>
@@ -147,19 +218,44 @@ function RenewalsChart({ data }: { data: RenewalsChartEntry[] }) {
 // ── renewal rate chart ────────────────────────────────────────────────────────
 type RenewalRateChartEntry = { month: string; rate_actual: number | null; rate_forecast: number | null; rate_target: number | null }
 
+function RenewalRateChartTooltip({ active, payload, label }: { active?: boolean; payload?: readonly any[]; label?: string | number }) {
+  if (!active || !payload?.length) return null
+  const get = (key: string) => payload.find((p: any) => p.dataKey === key)?.value
+  const actual   = get('rate_actual')
+  const forecast = get('rate_forecast')
+  const target   = get('rate_target')
+  const pct = (v: number | null | undefined) => v != null ? `${Number(v).toFixed(1)}%` : '–'
+  const row = (lbl: string, value: number | null | undefined, color: string, bold?: boolean) => (
+    <div key={lbl} style={{ display: 'flex', justifyContent: 'space-between', gap: '1.5rem', fontWeight: bold ? 700 : 400 }}>
+      <span style={{ color: 'var(--text-muted)' }}>{lbl}</span>
+      <span style={{ color }}>{pct(value)}</span>
+    </div>
+  )
+  const divider = <div style={{ borderTop: '1px solid rgba(255,255,255,0.1)', margin: '0.35rem 0' }} />
+  return (
+    <div style={{ background: '#0f172a', border: '1px solid var(--border)', borderRadius: 8, padding: '0.65rem 0.85rem', fontSize: '0.78rem', lineHeight: 1.6, minWidth: 190, boxShadow: '0 4px 16px rgba(0,0,0,0.5)' }}>
+      <p style={{ margin: '0 0 0.45rem', fontWeight: 700, color: 'var(--text)', fontSize: '0.8rem' }}>{fmtMonth(String(label ?? ''))}</p>
+      {row('Actual rate', actual, 'var(--text)')}
+      {divider}
+      {row('Forecast rate', forecast, C_TIER, true)}
+      {target != null && <>{divider}{row('Target rate', target, C_TARGET)}</>}
+    </div>
+  )
+}
+
 function RenewalRateChart({ data }: { data: RenewalRateChartEntry[] }) {
   return (
     <div style={{ marginBottom: '1rem' }}>
       <p style={{ margin: '0 0 0.4rem', fontSize: '0.82rem', fontWeight: 600, color: 'var(--text)' }}>Renewal rate: actual vs. forecast vs. target</p>
-      <ResponsiveContainer width="100%" height={180}>
+      <ResponsiveContainer width="100%" height={200}>
         <ComposedChart data={data} barCategoryGap="30%">
           <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
           <XAxis dataKey="month" tick={{ fontSize: 11 }} tickFormatter={fmtMonth} />
           <YAxis tickFormatter={v => `${v}%`} tick={{ fontSize: 11 }} width={46} domain={[0, 100]} />
-          <Tooltip formatter={(v: any) => `${Number(v).toFixed(1)}%`} labelFormatter={(lbl: any) => fmtMonth(lbl)} />
+          <Tooltip content={(props) => <RenewalRateChartTooltip {...props} />} wrapperStyle={{ background: 'none', border: 'none', boxShadow: 'none', padding: 0, zIndex: 9999 }} />
           <Legend iconType="square" wrapperStyle={{ fontSize: 11 }} />
           <Bar dataKey="rate_actual" name="Actual rate" fill={C_ACTUAL} />
-          <Bar dataKey="rate_forecast" name="Forecast rate" fill={C_AI} />
+          <Bar dataKey="rate_forecast" name="Forecast rate" fill={C_TIER} />
           <Line dataKey="rate_target" name="Target rate" stroke={C_TARGET} strokeWidth={2} dot={{ r: 3 }} strokeDasharray="4 3" />
         </ComposedChart>
       </ResponsiveContainer>
@@ -172,7 +268,7 @@ const TH: React.CSSProperties = {
   padding: '0.45rem 0.6rem',
   fontWeight: 600,
   fontSize: '0.75rem',
-  color: 'var(--text-muted)',
+  color: 'var(--text)',
   textTransform: 'uppercase',
   textAlign: 'right',
   borderBottom: '2px solid var(--border)',
@@ -206,7 +302,7 @@ function BookingsCard({ title, months, rows }: { title: string; months: string[]
   return (
     <div style={{ background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 8, overflow: 'hidden', marginBottom: '0.75rem' }}>
       <div style={{ padding: '0.5rem 0.6rem', borderBottom: '2px solid var(--border)' }}>
-        <span style={{ fontSize: '0.72rem', fontWeight: 700, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.05em' }}>{title}</span>
+        <span style={{ fontSize: '0.72rem', fontWeight: 700, color: 'var(--text)', textTransform: 'uppercase', letterSpacing: '0.05em' }}>{title}</span>
       </div>
       <table style={{ width: '100%', borderCollapse: 'collapse' }}>
         <thead>
@@ -219,7 +315,7 @@ function BookingsCard({ title, months, rows }: { title: string; months: string[]
         <tbody>
           {rows.map((row, i) => (
             <tr key={i} style={row.isTopBorder ? { borderTop: '2px solid var(--border)' } : {}}>
-              <td style={{ ...TD_LABEL, ...(row.bold ? { fontWeight: 700 } : {}), color: row.isDelta ? 'var(--text-muted)' : (row.color ?? 'var(--text)') }}>
+              <td style={{ ...TD_LABEL, ...(row.bold ? { fontWeight: 700 } : {}), color: row.color ?? 'var(--text)' }}>
                 {row.label}
               </td>
               {row.monthValues.map((v, j) => {
@@ -247,9 +343,9 @@ interface BookingsCardsProps {
   nb: ForecastMonthNB[]
   exp: ForecastMonthExp[]
   qt: {
-    nb_actuals: number; nb_forecast: number; nb_forecast_ai: number; nb_in_quarter_est: number; nb_adjusted_forecast: number; nb_target: number | null
-    exp_actuals: number; exp_forecast: number; exp_forecast_ai: number; exp_in_quarter_est: number; exp_adjusted_forecast: number; exp_target: number | null
-    total_actuals: number; total_forecast: number; total_forecast_ai: number; total_in_quarter_est: number; total_adjusted_forecast: number
+    nb_actuals: number; nb_forecast: number; nb_forecast_ai: number; nb_forecast_tier: number; nb_in_quarter_est: number; nb_adjusted_forecast: number; nb_target: number | null
+    exp_actuals: number; exp_forecast: number; exp_forecast_ai: number; exp_forecast_tier: number; exp_in_quarter_est: number; exp_adjusted_forecast: number; exp_target: number | null
+    total_actuals: number; total_forecast: number; total_forecast_ai: number; total_forecast_tier: number; total_in_quarter_est: number; total_adjusted_forecast: number
     has_ai_scores: boolean
   }
   quartersUsed: number
@@ -258,35 +354,46 @@ interface BookingsCardsProps {
 function BookingsCards({ months, nb, exp, qt, quartersUsed }: BookingsCardsProps) {
   const iqLabel = quartersUsed > 0 ? `In-quarter (hist. est., ${quartersUsed}Q avg)` : 'In-quarter (hist. est.)'
   const hasAI = qt.has_ai_scores
-  const C = C_AI
 
   function makeRows(
-    actuals: number[], pipeline: number[], inQ: number[],
-    qActuals: number, qPipeline: number, qInQ: number,
+    actuals: number[],
+    aiPipeline: number[], tierPipeline: number[],
+    inQ: number[],
+    qActuals: number, qAiPipeline: number, qTierPipeline: number, qInQ: number,
     targets: (number | null)[], qTarget: number | null,
   ): BookingsCardRow[] {
-    const forecasts = actuals.map((a, i) => a + pipeline[i] + inQ[i])
-    const qForecast = qActuals + qPipeline + qInQ
+    const forecastsAI   = actuals.map((a, i) => a + aiPipeline[i]   + inQ[i])
+    const forecastsTier = actuals.map((a, i) => a + tierPipeline[i] + inQ[i])
+    const qForecastAI   = qActuals + qAiPipeline   + qInQ
+    const qForecastTier = qActuals + qTierPipeline + qInQ
     return [
-      { label: 'Actuals',                                                           color: 'var(--text)', monthValues: actuals,   quarterValue: qActuals },
-      { label: hasAI ? 'Pipeline (AI weighted)' : 'Pipeline (weighted)',            color: C,             monthValues: pipeline,  quarterValue: qPipeline },
+      { label: 'Actuals',                                                                    color: 'var(--text)', monthValues: actuals,       quarterValue: qActuals },
+      { label: hasAI ? 'Pipeline (AI weighted)' : 'Pipeline (weighted)',                     color: C_AI,          monthValues: aiPipeline,     quarterValue: qAiPipeline },
+      { label: 'Pipeline (Tier weighted)',                                                    color: C_TIER,        monthValues: tierPipeline,   quarterValue: qTierPipeline },
       ...(inQ.some(v => v > 0) ? [{ label: iqLabel, color: C_IQ, monthValues: inQ.map(v => v > 0 ? v : null), quarterValue: qInQ > 0 ? qInQ : null } as BookingsCardRow] : []),
-      { label: 'Forecast', bold: true, color: C, isTopBorder: true,                                      monthValues: forecasts, quarterValue: qForecast },
-      { label: 'Target',                                                             color: C_TARGET,      monthValues: targets,   quarterValue: qTarget },
-      { label: 'Delta to Target', isDelta: true,                                                          monthValues: forecasts.map((f, i) => targets[i] != null ? f - targets[i]! : null), quarterValue: qTarget != null ? qForecast - qTarget : null },
+      { label: hasAI ? 'Forecast (AI)'   : 'Forecast',          bold: true, color: C_AI,   isTopBorder: true, monthValues: forecastsAI,   quarterValue: qForecastAI },
+      { label: 'Forecast (Tier)',                                bold: true, color: C_TIER,                    monthValues: forecastsTier, quarterValue: qForecastTier },
+      { label: 'Target',                                                     color: C_TARGET,                   monthValues: targets,       quarterValue: qTarget },
+      { label: hasAI ? 'Delta to Target (AI)'   : 'Delta to Target', isDelta: true, monthValues: forecastsAI.map((f, i)   => targets[i] != null ? f - targets[i]! : null), quarterValue: qTarget != null ? qForecastAI   - qTarget : null },
+      { label: 'Delta to Target (Tier)',                                isDelta: true, monthValues: forecastsTier.map((f, i) => targets[i] != null ? f - targets[i]! : null), quarterValue: qTarget != null ? qForecastTier - qTarget : null },
     ]
   }
 
-  const nbPipe  = nb.map(m => hasAI ? m.pipeline_ai_weighted : m.pipeline_weighted)
-  const expPipe = exp.map(m => hasAI ? m.pipeline_ai_weighted : m.pipeline_weighted)
+  const nbAiPipe   = nb.map(m => hasAI ? m.pipeline_ai_weighted   : m.pipeline_weighted)
+  const nbTierPipe = nb.map(m => m.pipeline_tier_weighted)
+  const expAiPipe   = exp.map(m => hasAI ? m.pipeline_ai_weighted  : m.pipeline_weighted)
+  const expTierPipe = exp.map(m => m.pipeline_tier_weighted)
   const nbInQ   = nb.map(m => m.in_quarter_est > 0 ? m.in_quarter_est : 0)
   const expInQ  = exp.map(m => m.in_quarter_est > 0 ? m.in_quarter_est : 0)
 
-  const qNbPipe  = hasAI ? qt.nb_forecast_ai  - qt.nb_actuals  : qt.nb_forecast  - qt.nb_actuals
-  const qExpPipe = hasAI ? qt.exp_forecast_ai - qt.exp_actuals : qt.exp_forecast - qt.exp_actuals
+  const qNbAiPipe   = hasAI ? qt.nb_forecast_ai   - qt.nb_actuals  : qt.nb_forecast  - qt.nb_actuals
+  const qNbTierPipe = qt.nb_forecast_tier  - qt.nb_actuals  - qt.nb_in_quarter_est
+  const qExpAiPipe   = hasAI ? qt.exp_forecast_ai  - qt.exp_actuals : qt.exp_forecast - qt.exp_actuals
+  const qExpTierPipe = qt.exp_forecast_tier - qt.exp_actuals - qt.exp_in_quarter_est
 
   const totalTarget = (qt.nb_target != null && qt.exp_target != null) ? qt.nb_target + qt.exp_target : null
-  const totPipe    = nb.map((_m, i) => nbPipe[i] + expPipe[i])
+  const totAiPipe   = nb.map((_m, i) => nbAiPipe[i]   + expAiPipe[i])
+  const totTierPipe = nb.map((_m, i) => nbTierPipe[i] + expTierPipe[i])
   const totInQ     = nb.map((_, i) => nbInQ[i] + expInQ[i])
   const totActuals = nb.map((m, i) => m.actuals + (exp[i]?.actuals ?? 0))
   const totTargets = nb.map((_m, i) => nb[i]?.target != null && exp[i]?.target != null ? nb[i].target! + exp[i].target! : null)
@@ -294,18 +401,18 @@ function BookingsCards({ months, nb, exp, qt, quartersUsed }: BookingsCardsProps
   return (
     <>
       <BookingsCard title="New Business" months={months} rows={makeRows(
-        nb.map(m => m.actuals), nbPipe, nbInQ,
-        qt.nb_actuals, qNbPipe, qt.nb_in_quarter_est,
+        nb.map(m => m.actuals), nbAiPipe, nbTierPipe, nbInQ,
+        qt.nb_actuals, qNbAiPipe, qNbTierPipe, qt.nb_in_quarter_est,
         nb.map(m => m.target), qt.nb_target,
       )} />
       <BookingsCard title="Expansion" months={months} rows={makeRows(
-        exp.map(m => m.actuals), expPipe, expInQ,
-        qt.exp_actuals, qExpPipe, qt.exp_in_quarter_est,
+        exp.map(m => m.actuals), expAiPipe, expTierPipe, expInQ,
+        qt.exp_actuals, qExpAiPipe, qExpTierPipe, qt.exp_in_quarter_est,
         exp.map(m => m.target), qt.exp_target,
       )} />
       <BookingsCard title="Total Bookings" months={months} rows={makeRows(
-        totActuals, totPipe, totInQ,
-        qt.total_actuals, qNbPipe + qExpPipe, qt.total_in_quarter_est,
+        totActuals, totAiPipe, totTierPipe, totInQ,
+        qt.total_actuals, qNbAiPipe + qExpAiPipe, qNbTierPipe + qExpTierPipe, qt.total_in_quarter_est,
         totTargets, totalTarget,
       )} />
     </>
@@ -341,7 +448,7 @@ function RenewalsCard({ months, renewals, quarter }: RenewalsCardProps) {
   return (
     <div style={{ background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 8, overflow: 'hidden', marginBottom: '0.75rem' }}>
       <div style={{ padding: '0.5rem 0.6rem', borderBottom: '2px solid var(--border)' }}>
-        <span style={{ fontSize: '0.72rem', fontWeight: 700, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Renewals</span>
+        <span style={{ fontSize: '0.72rem', fontWeight: 700, color: 'var(--text)', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Renewals</span>
       </div>
       <table style={{ width: '100%', borderCollapse: 'collapse' }}>
         <thead>
@@ -364,14 +471,14 @@ function RenewalsCard({ months, renewals, quarter }: RenewalsCardProps) {
             <td style={{ ...TD, borderLeft: '2px solid var(--border)' }}>{fmtK(quarter.renewal_won)}</td>
           </tr>
           <tr>
-            <td style={{ ...TD_LABEL, color: C_AI }}>Pipeline (weighted)</td>
-            {renewals.map(m => <td key={m.month} style={{ ...TD, color: C_AI }}>{fmtK(m.pipeline_weighted)}</td>)}
-            <td style={{ ...TD, color: C_AI, borderLeft: '2px solid var(--border)' }}>{fmtK(pipelineQ)}</td>
+            <td style={{ ...TD_LABEL, color: C_TIER }}>Pipeline (CS)</td>
+            {renewals.map(m => <td key={m.month} style={{ ...TD, color: C_TIER }}>{fmtK(m.pipeline_weighted)}</td>)}
+            <td style={{ ...TD, color: C_TIER, borderLeft: '2px solid var(--border)' }}>{fmtK(pipelineQ)}</td>
           </tr>
           <tr style={{ borderTop: '2px solid var(--border)' }}>
-            <td style={{ ...TD_LABEL_BOLD, color: C_AI }}>Forecast Renewed</td>
-            {renewals.map(m => <td key={m.month} style={{ ...TD_BOLD, color: C_AI }}>{fmtK(m.forecast_arr)}</td>)}
-            <td style={{ ...TD_BOLD, color: C_AI, borderLeft: '2px solid var(--border)' }}>{fmtK(quarter.renewal_forecast)}</td>
+            <td style={{ ...TD_LABEL_BOLD, color: C_TIER }}>Forecast Renewed</td>
+            {renewals.map(m => <td key={m.month} style={{ ...TD_BOLD, color: C_TIER }}>{fmtK(m.forecast_arr)}</td>)}
+            <td style={{ ...TD_BOLD, color: C_TIER, borderLeft: '2px solid var(--border)' }}>{fmtK(quarter.renewal_forecast)}</td>
           </tr>
 
           {/* Rate rows — visually separated */}
@@ -380,10 +487,10 @@ function RenewalsCard({ months, renewals, quarter }: RenewalsCardProps) {
             {renewals.map(m => <td key={m.month} style={TD}>{fmtPct(m.rate_actual)}</td>)}
             <td style={{ ...TD, borderLeft: '2px solid var(--border)' }}>{fmtPct(quarter.rate_actual)}</td>
           </tr>
-          {rateRow('Renewal Rate Forecast', 'rate_forecast', C_AI, true)}
+          {rateRow('Renewal Rate Forecast', 'rate_forecast', C_TIER, true)}
           {rateRow('Renewal Rate Target',   'rate_target',   C_TARGET)}
           <tr>
-            <td style={{ ...TD_LABEL, color: 'var(--text-muted)' }}>Delta to Target (rate)</td>
+            <td style={{ ...TD_LABEL }}>Delta to Target (rate)</td>
             {renewals.map(m => {
               const d = m.rate_forecast != null && m.rate_target != null ? m.rate_forecast - m.rate_target : null
               const color = d == null ? 'var(--text-muted)' : d >= 0 ? '#22c55e' : '#ef4444'
@@ -440,7 +547,7 @@ function AIForecastPanel({ aiData, onRescore }: { aiData: AIForecastResponse | n
         </p>
         {aiData?.last_scored_at && (
           <span style={{ fontSize: '0.78rem', color: 'var(--text-muted)' }}>
-            Last scored: {new Date(aiData.last_scored_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: '2-digit' })}
+            Last scored: {new Date(aiData.last_scored_at).toLocaleString('en-US', { month: 'short', day: 'numeric', year: '2-digit', hour: '2-digit', minute: '2-digit' })}
             {' · '}{aiData.total_scored_deals} deals
           </span>
         )}
@@ -598,23 +705,33 @@ export default function ForecastView() {
   const { quarter, months, new_business: nb, expansion: exp, renewals, quarter_totals: qt, in_quarter_quarters_used: iqQtrs } = data
 
   // ── KPI values ─────────────────────────────────────────────────────────────
-  const totalBookingsForecast = qt.total_adjusted_forecast
-  const totalBookingsTarget   = (qt.nb_target != null && qt.exp_target != null) ? qt.nb_target + qt.exp_target : null
+  const totalBookingsForecast     = qt.total_adjusted_forecast
+  const totalBookingsForecastTier = qt.total_forecast_tier
+  const totalBookingsTarget       = (qt.nb_target != null && qt.exp_target != null) ? qt.nb_target + qt.exp_target : null
   const pctOfTarget = (totalBookingsTarget && totalBookingsForecast)
     ? `${((totalBookingsForecast / totalBookingsTarget) * 100).toFixed(0)}% of target`
+    : undefined
+  const pctOfTargetTier = (totalBookingsTarget && totalBookingsForecastTier)
+    ? `${((totalBookingsForecastTier / totalBookingsTarget) * 100).toFixed(0)}% of target`
     : undefined
 
   // ── chart data ─────────────────────────────────────────────────────────────
   const nbChartData: BookingsChartEntry[] = nb.map(m => ({
     month: m.month, actuals: m.actuals,
-    pipeline_weighted: m.pipeline_weighted, pipeline_ai_weighted: m.pipeline_ai_weighted,
+    pipeline_weighted: m.pipeline_weighted,
+    pipeline_ai_weighted: m.pipeline_ai_weighted,
+    pipeline_tier_weighted: m.pipeline_tier_weighted,
     in_quarter_est: m.in_quarter_est, adjusted_forecast: m.adjusted_forecast,
+    forecast_tier: m.forecast_tier,
     target: m.target, has_ai_scores: m.has_ai_scores,
   }))
   const expChartData: BookingsChartEntry[] = exp.map(m => ({
     month: m.month, actuals: m.actuals,
-    pipeline_weighted: m.pipeline_weighted, pipeline_ai_weighted: m.pipeline_ai_weighted,
+    pipeline_weighted: m.pipeline_weighted,
+    pipeline_ai_weighted: m.pipeline_ai_weighted,
+    pipeline_tier_weighted: m.pipeline_tier_weighted,
     in_quarter_est: m.in_quarter_est, adjusted_forecast: m.adjusted_forecast,
+    forecast_tier: m.forecast_tier,
     target: m.target, has_ai_scores: m.has_ai_scores,
   }))
   const renewChartData: RenewalsChartEntry[] = renewals.map(m => ({
@@ -637,8 +754,9 @@ export default function ForecastView() {
         <div style={{ minWidth: 0 }}>
           {/* Bookings KPI row */}
           <div style={{ display: 'flex', gap: '0.6rem', marginBottom: '1.25rem' }}>
-            <KpiCard label="Bookings Actuals"  value={fmtK(qt.total_actuals)}        sub={`${quarter} QTD`} />
-            <KpiCard label="Bookings Forecast" value={fmtK(totalBookingsForecast)}   sub={pctOfTarget} highlight />
+            <KpiCard label="Bookings Actuals"          value={fmtK(qt.total_actuals)}            sub={`${quarter} QTD`} />
+            <KpiCard label="Forecast (AI)"    value={fmtK(totalBookingsForecast)}     sub={pctOfTarget}     highlight accentColor={C_AI} />
+            <KpiCard label="Forecast (Tier)"  value={fmtK(totalBookingsForecastTier)} sub={pctOfTargetTier} highlight accentColor={C_TIER} />
             {totalBookingsTarget != null && <KpiCard label="Bookings Target" value={fmtK(totalBookingsTarget)} sub={quarter} />}
           </div>
 
@@ -657,7 +775,7 @@ export default function ForecastView() {
           {/* Renewals KPI row */}
           <div style={{ display: 'flex', gap: '0.6rem', marginBottom: '1.25rem' }}>
             <KpiCard label="Renewal Rate Actual"   value={fmtPct(qt.rate_actual)}   sub={`${quarter} QTD`} />
-            <KpiCard label="Renewal Rate Forecast"  value={fmtPct(qt.rate_forecast)} sub={quarter} highlight />
+            <KpiCard label="Forecast (CS)"  value={fmtPct(qt.rate_forecast)} sub={qt.rate_target != null && qt.rate_forecast != null ? `${((qt.rate_forecast / qt.rate_target) * 100).toFixed(0)}% of target` : quarter} highlight accentColor={C_TIER} />
             {qt.rate_target != null && <KpiCard label="Renewal Rate Target" value={fmtPct(qt.rate_target)} sub={quarter} />}
           </div>
 

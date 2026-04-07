@@ -95,21 +95,10 @@ function isLegacyQuickBooksBanner(msg: string | null | undefined): boolean {
   )
 }
 
-/** Fallback when API omits updated_at_utc: parse UTC `Z` ISO and format in UTC. */
-function formatDatasetUpdatedUtc(iso: string): string {
+function formatDatasetUpdated(iso: string): string {
   const d = new Date(iso)
   if (Number.isNaN(d.getTime())) return iso
-  return (
-    new Intl.DateTimeFormat('en-US', {
-      timeZone: 'UTC',
-      month: 'short',
-      day: 'numeric',
-      year: 'numeric',
-      hour: 'numeric',
-      minute: '2-digit',
-      hour12: true,
-    }).format(d) + ' UTC'
-  )
+  return new Date(iso).toLocaleString('en-US', { month: 'short', day: 'numeric', year: 'numeric', hour: '2-digit', minute: '2-digit' })
 }
 
 const blockStyle: React.CSSProperties = {
@@ -315,7 +304,7 @@ export default function DashboardCurrentSummary({ title = 'Current Performance' 
         </button>
         <span style={{ fontSize: '0.85rem', color: 'var(--text-muted)' }}>
           {datasetStatus?.updated_at
-            ? `Last updated: ${datasetStatus.updated_at_utc ?? formatDatasetUpdatedUtc(datasetStatus.updated_at)}`
+            ? `Last updated: ${formatDatasetUpdated(datasetStatus.updated_at)}`
             : 'No refresh yet — click Refresh app data to load Salesforce, Sheets, and Chargebee (if configured).'}
           {datasetStatus?.last_refresh_ok === false &&
             datasetStatus?.last_error &&

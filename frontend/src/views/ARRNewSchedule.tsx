@@ -24,17 +24,7 @@ function isLegacyQuickBooksBanner(msg: string | null | undefined): boolean {
 function formatDatasetUpdatedUtc(iso: string): string {
   const d = new Date(iso)
   if (Number.isNaN(d.getTime())) return iso
-  return (
-    new Intl.DateTimeFormat('en-US', {
-      timeZone: 'UTC',
-      month: 'short',
-      day: 'numeric',
-      year: 'numeric',
-      hour: 'numeric',
-      minute: '2-digit',
-      hour12: true,
-    }).format(d) + ' UTC'
-  )
+  return new Date(iso).toLocaleString('en-US', { month: 'short', day: 'numeric', year: 'numeric', hour: '2-digit', minute: '2-digit' })
 }
 
 function fmtMoney(n: number) {
@@ -499,7 +489,7 @@ export default function ARRNewSchedule() {
         </button>
         <span style={{ fontSize: '0.85rem', color: 'var(--text-muted)' }}>
           {datasetStatus?.updated_at
-            ? `Last updated: ${datasetStatus.updated_at_utc ?? formatDatasetUpdatedUtc(datasetStatus.updated_at)}`
+            ? `Last updated: ${formatDatasetUpdatedUtc(datasetStatus.updated_at)}`
             : 'No refresh yet'}
           {datasetStatus?.last_refresh_ok === false &&
             datasetStatus?.last_error &&

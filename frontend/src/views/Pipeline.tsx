@@ -1109,7 +1109,12 @@ export default function Pipeline() {
                   style={{ textAlign: 'right', padding: '0.5rem 0.75rem', whiteSpace: 'nowrap', color: '#38bdf8', fontWeight: 600, cursor: row.ai_reasoning ? 'help' : 'default' }}
                   onMouseEnter={row.ai_reasoning ? (e) => {
                     const rect = (e.target as HTMLElement).getBoundingClientRect()
-                    setAiTooltip({ text: row.ai_reasoning!, x: rect.left, y: rect.bottom + 6 })
+                    const TOOLTIP_HEIGHT = 120 // generous estimate
+                    const spaceBelow = window.innerHeight - rect.bottom
+                    const y = spaceBelow < TOOLTIP_HEIGHT + 16
+                      ? rect.top - TOOLTIP_HEIGHT - 6  // flip above
+                      : rect.bottom + 6
+                    setAiTooltip({ text: row.ai_reasoning!, x: rect.left, y })
                   } : undefined}
                   onMouseLeave={() => setAiTooltip(null)}
                 >
@@ -1147,7 +1152,7 @@ export default function Pipeline() {
             top: aiTooltip.y,
             left: Math.min(aiTooltip.x, window.innerWidth - 340),
             zIndex: 9999,
-            background: 'var(--surface)',
+            background: '#0f172a',
             border: '1px solid var(--border)',
             borderRadius: 8,
             padding: '0.65rem 0.9rem',
@@ -1155,7 +1160,7 @@ export default function Pipeline() {
             fontSize: '0.82rem',
             color: 'var(--text)',
             lineHeight: 1.55,
-            boxShadow: '0 4px 16px rgba(0,0,0,0.25)',
+            boxShadow: '0 4px 16px rgba(0,0,0,0.4)',
             pointerEvents: 'none',
           }}
         >

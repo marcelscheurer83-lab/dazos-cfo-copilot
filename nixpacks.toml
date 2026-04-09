@@ -1,0 +1,15 @@
+# Railway/Nixpacks build config — single service: builds frontend then serves via FastAPI
+[phases.setup]
+nixPkgs = ["nodejs_20"]
+
+[phases.install]
+cmds = [
+  "pip install -r backend/requirements.txt",
+  "cd frontend && npm install"
+]
+
+[phases.build]
+cmds = ["cd frontend && npm run build"]
+
+[start]
+cmd = "cd backend && uvicorn main:app --host 0.0.0.0 --port $PORT --app-dir ."

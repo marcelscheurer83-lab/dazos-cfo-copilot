@@ -18,3 +18,5 @@ tzdata>=2024.1
 openai>=1.12.0
 # FP&A agent and AI analysis
 anthropic>=0.92.0
+# Serve frontend static files (production single-service Railway deploy)
+aiofiles>=23.0.0

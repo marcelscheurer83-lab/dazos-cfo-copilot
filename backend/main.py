@@ -12974,3 +12974,27 @@ async def post_dataset_refresh():
     except Exception as e:
         await _persist_app_dataset_state(False, [{"step": "fatal", "ok": False, "detail": str(e)}], str(e))
         return JSONResponse(status_code=200, content={"ok": False, "error": str(e), "steps": []})
+
+
+# ── Frontend static file serving (production single-service Railway deploy) ──────────────────
+# When the frontend is built (`npm run build`), Vite outputs to frontend/dist/.
+# We serve those files from FastAPI so the app works on a single Railway service
+# without needing VITE_API_URL. All /api/* routes above take priority.
+_FRONTEND_DIST = Path(__file__).parent.parent / "frontend" / "dist"
+
+if _FRONTEND_DIST.exists():
+    from fastapi.staticfiles import StaticFiles as _StaticFiles
+    from fastapi.responses import FileResponse as _FileResponse
+
+    _assets_dir = _FRONTEND_DIST / "assets"
+    if _assets_dir.exists():
+        app.mount("/assets", _StaticFiles(directory=str(_assets_dir)), name="frontend-assets")
+
+    @app.get("/{full_path:path}", include_in_schema=False)
+    async def _serve_frontend(full_path: str):
+        """Catch-all: serve React SPA for any non-API route."""
+        # Serve specific files if they exist (favicons, manifest, etc.)
+        requested = _FRONTEND_DIST / full_path
+        if requested.exists() and requested.is_file():
+            return _FileResponse(str(requested))
+        return _FileResponse(str(_FRONTEND_DIST / "index.html"))

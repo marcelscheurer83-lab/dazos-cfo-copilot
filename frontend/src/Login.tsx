@@ -3,8 +3,10 @@ import { checkAppPassword, checkBackendHealthDetailed } from './api'
 
 type Props = { onSuccess: () => void }
 
-const SERVER_UNREACHABLE_INTRO =
-  'Backend not reachable. Open this app from http://localhost:5173 (same URL as the dev server). Ensure exactly one backend is running on port 8008 (see backend/start-backend.ps1).'
+const IS_DEV = import.meta.env.DEV
+const SERVER_UNREACHABLE_INTRO = IS_DEV
+  ? 'Backend not reachable. Open this app from http://localhost:5173 (same URL as the dev server). Ensure exactly one backend is running on port 8008 (see backend/start-backend.ps1).'
+  : 'Backend not reachable. In Railway, set the VITE_API_URL environment variable on the frontend service to the backend service URL (e.g. https://your-backend.railway.app).'
 
 export default function Login({ onSuccess }: Props) {
   const [password, setPassword] = useState('')

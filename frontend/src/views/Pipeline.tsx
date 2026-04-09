@@ -8,10 +8,12 @@ type FilterColumn = 'stage' | 'record_type' | 'close_date' | 'deal_tier'
 function tierPct(tier: string | null | undefined): string {
   if (!tier) return '—'
   const t = tier.toLowerCase()
-  if (t.includes('commit')) return '90%'
-  if (t.includes('strong')) return '50%'
+  // Check tier number first to avoid keyword collisions (e.g. "Tier 4 - Weak Upside" contains "weak")
+  if (/\btier\s*1\b/.test(t) || t.includes('commit')) return '90%'
+  if (/\btier\s*2\b/.test(t) || t.includes('strong')) return '50%'
+  if (/\btier\s*3\b/.test(t)) return '25%'
+  if (/\btier\s*4\b/.test(t) || t.includes('hail') || t.includes('mary')) return '10%'
   if (t.includes('weak')) return '25%'
-    if (t.includes('hail') || t.includes('mary')) return '10%'
   return '—'
 }
 
@@ -246,6 +248,20 @@ export default function Pipeline() {
     'Tier 4 - Hail Mary':     '#ef4444', // red
   }
 
+  /** Normalize any variant of a tier name to the canonical TIER_ORDER label.
+   *  Checks tier number (regex) first to avoid keyword collisions
+   *  (e.g. "Tier 4 - Weak Upside" must not match Tier 3 via "weak"). */
+  function normalizeTierLabel(raw: string | null | undefined): string | null {
+    if (!raw) return null
+    const t = raw.toLowerCase()
+    if (/\btier\s*1\b/.test(t) || t.includes('commit')) return 'Tier 1 - Commit'
+    if (/\btier\s*2\b/.test(t) || t.includes('strong')) return 'Tier 2 - Strong Upside'
+    if (/\btier\s*3\b/.test(t)) return 'Tier 3 - Weak Upside'
+    if (/\btier\s*4\b/.test(t) || t.includes('hail') || t.includes('mary')) return 'Tier 4 - Hail Mary'
+    if (t.includes('weak')) return 'Tier 3 - Weak Upside'
+    return null
+  }
+
   const chartDataByTier = useMemo(() => {
     const now = new Date()
     const currentMonth = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`
@@ -256,7 +272,7 @@ export default function Pipeline() {
       const month = toMonthKey(r.close_date ?? null)
       if (!month || month < currentMonth) continue
       if (!arrMap.has(month)) { arrMap.set(month, new Map()); countMap.set(month, new Map()) }
-      const tier = r.deal_tier
+      const tier = normalizeTierLabel(r.deal_tier) ?? r.deal_tier
       const am = arrMap.get(month)!; const cm = countMap.get(month)!
       am.set(tier, (am.get(tier) ?? 0) + r.arr)
       cm.set(tier, (cm.get(tier) ?? 0) + 1)
@@ -356,7 +372,7 @@ export default function Pipeline() {
     }
     if (tierSliceFilter != null) {
       out = out.filter((r) => {
-        if ((r.deal_tier ?? '') !== tierSliceFilter.tier) return false
+        if ((normalizeTierLabel(r.deal_tier) ?? r.deal_tier ?? '') !== tierSliceFilter.tier) return false
         if (tierSliceFilter.month != null) {
           const m = toMonthKey(r.close_date ?? null)
           if (m !== tierSliceFilter.month) return false

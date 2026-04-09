@@ -28,6 +28,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import get_db, AsyncSessionLocal
 
+try:
+    import anthropic as _anthropic_mod
+    _ANTHROPIC_AVAILABLE = True
+except ImportError:
+    _anthropic_mod = None  # type: ignore
+    _ANTHROPIC_AVAILABLE = False
+
 # Serialize unified dataset refresh (Salesforce + Sheets + Chargebee); commit inside lock to avoid overlapping SQLite writes.
 _dataset_refresh_lock = asyncio.Lock()
 # Backwards-compatible alias (scheduled job / comments)
@@ -1080,8 +1087,9 @@ Any important structural notes: named ranges, helper tabs, how actuals vs budget
 Be specific — include tab names, row numbers, and column letters where you can infer them from the sample."""
 
     try:
-        import anthropic as _anthropic
-        client = _anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+        if not _ANTHROPIC_AVAILABLE:
+            raise HTTPException(status_code=503, detail="anthropic package not installed on server")
+        client = _anthropic_mod.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
         response = await client.messages.create(
             model="claude-opus-4-5",
             max_tokens=8192,
@@ -1343,8 +1351,9 @@ async def sync_financials_from_sheet(
     if not connector.is_configured():
         raise HTTPException(status_code=503, detail="Google Sheets not configured.")
 
-    import anthropic as _anthropic
-    client = _anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+    if not _ANTHROPIC_AVAILABLE:
+        raise HTTPException(status_code=503, detail="anthropic package not installed on server")
+    client = _anthropic_mod.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
 
     statements = ["pnl", "bs", "cf"] if statement == "all" else [statement]
     if any(s not in _SHEET_TAB_MAP for s in statements):
@@ -1515,8 +1524,9 @@ async def trigger_monthly_close(
     await db.refresh(analysis)
 
     try:
-        import anthropic as _anthropic
-        client = _anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+        if not _ANTHROPIC_AVAILABLE:
+            raise HTTPException(status_code=503, detail="anthropic package not installed on server")
+        client = _anthropic_mod.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
 
         # Gather P&L data for the period and YTD
         fiscal_year_start = date(period.year, 1, 1)
@@ -1682,10 +1692,9 @@ async def fpa_chat(body: FPAChatRequest, db: AsyncSession = Depends(get_db)):
         raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY not configured — add it to backend/.env")
 
     try:
-        import anthropic as _anthropic
-        client = _anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
-    except ImportError:
-        raise HTTPException(status_code=503, detail="anthropic package not installed")
+        if not _ANTHROPIC_AVAILABLE:
+            raise HTTPException(status_code=503, detail="anthropic package not installed on server")
+        client = _anthropic_mod.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
 
     context = await _build_fpa_context(db)
     system = _FPA_SYSTEM_PROMPT + "\n\n" + context
@@ -6409,8 +6418,9 @@ Based on the patterns, what are the 3–5 leading indicators that predict churn 
 Be specific with numbers throughout. If data is limited or patterns are unclear, say so explicitly."""
 
     try:
-        import anthropic as _anthropic
-        client = _anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+        if not _ANTHROPIC_AVAILABLE:
+            raise HTTPException(status_code=503, detail="anthropic package not installed on server")
+        client = _anthropic_mod.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
         response = await client.messages.create(
             model="claude-opus-4-5",
             max_tokens=4096,

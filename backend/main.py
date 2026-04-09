@@ -1691,11 +1691,10 @@ async def fpa_chat(body: FPAChatRequest, db: AsyncSession = Depends(get_db)):
     if not ANTHROPIC_API_KEY:
         raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY not configured — add it to backend/.env")
 
-    try:
-        if not _ANTHROPIC_AVAILABLE:
-            raise HTTPException(status_code=503, detail="anthropic package not installed on server")
-        client = _anthropic_mod.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+    if not _ANTHROPIC_AVAILABLE:
+        raise HTTPException(status_code=503, detail="anthropic package not installed on server")
 
+    client = _anthropic_mod.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
     context = await _build_fpa_context(db)
     system = _FPA_SYSTEM_PROMPT + "\n\n" + context
 

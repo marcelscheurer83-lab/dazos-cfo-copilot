@@ -640,15 +640,23 @@ You are a sharp, numbers-first financial analyst: precise, candid, and efficient
 You have access to the following primary data sources in this cockpit. Always reference the most current available data before answering; flag if data may be stale.
 
 **Google Sheets (primary financial model)**
-- Source of truth for P&L, ARR, headcount, and operational metrics
+- Source of truth for P&L, headcount, and operational metrics
 - Populated via QuickBooks export (actuals) and manual inputs (budget/forecast)
 
 **QuickBooks (accounting system)**
-- Actuals: revenue, COGS, opex by category, cash, AP/AR
+- Actuals: revenue, COGS, opex by category, AP/AR
 
-**Salesforce (CRM)**
+**Salesforce (CRM) — source of truth for ARR and subscriptions**
+- ARR, CARR, subscription counts, NRR, churn, contraction, expansion
 - Pipeline: stages, ACV, close dates, rep ownership, source
-- New logo and expansion bookings, churn and contraction data
+- New logo and expansion bookings — all revenue metrics are derived from Salesforce Opportunities
+
+**Chargebee (billing engine) — source of truth for cash and invoicing ONLY**
+- Invoices, payments, collections, billing status
+- Use for cash-in, overdue invoices, payment failures, billing reconciliation
+- Do NOT use Chargebee for ARR, MRR, NRR, subscription metrics, or customer counts — always use Salesforce for those
+
+**Data source routing rule:** ARR questions → Salesforce. Cash/billing questions → Chargebee. P&L/budget questions → Google Sheets / QuickBooks.
 
 When sources conflict, flag the discrepancy and identify which is more likely current. Do not silently average or blend conflicting numbers.
 
@@ -1693,9 +1701,11 @@ Format as a markdown bullet list. No headers, no preamble."""
 _CHARGEBEE_TOOL: dict = {
     "name": "chargebee_query",
     "description": (
-        "Fetch live data from Chargebee (billing engine). Use this when you need current "
-        "subscription, invoice, customer, or payment/transaction data not already in the context. "
-        "Amounts in invoices/transactions are in cents — divide by 100 for dollars."
+        "Fetch live billing data from Chargebee. Use ONLY for cash and billing questions: "
+        "invoices, payments, collections, overdue balances, payment failures, billing status. "
+        "Do NOT use for ARR, MRR, NRR, subscription counts, churn, expansion, or any revenue metric — "
+        "those always come from Salesforce. "
+        "Amounts are in cents — divide by 100 for dollars."
     ),
     "input_schema": {
         "type": "object",
@@ -1807,9 +1817,10 @@ async def fpa_chat(body: FPAChatRequest, db: AsyncSession = Depends(get_db)):
         + context
         + (
             "\n\n---\n\n## Live Chargebee Data\n\n"
-            "You have access to a `chargebee_query` tool for live billing data. "
-            "Use it when the pre-loaded context doesn't have the specific subscription, "
-            "invoice, or payment detail needed. Always try context first."
+            "You have access to a `chargebee_query` tool for live billing data (invoices, payments, collections). "
+            "IMPORTANT routing rule: ARR, MRR, NRR, subscription counts, churn, and all revenue metrics "
+            "always come from Salesforce data in the pre-loaded context above — never from Chargebee. "
+            "Use Chargebee only for cash and billing questions."
         )
     )
 
@@ -5647,13 +5658,13 @@ async def post_agent_chat(body: AgentChatRequest, db: AsyncSession = Depends(get
         + revops_ctx
         + (
             "\n\n---\n\n## Live Data Tools\n\n"
-            "You have two live-data tools available:\n"
-            "1. `salesforce_query` — run a SOQL SELECT against Salesforce for opportunity, account, or activity data.\n"
-            "2. `chargebee_query` — fetch subscriptions, invoices, customers, or transactions from Chargebee.\n"
-            "Always answer from the pre-loaded context first. "
-            "Use tools only when the context doesn't have what you need. "
-            "For Salesforce, prefer targeted queries with a LIMIT clause. "
-            "For Chargebee, note that amounts are in cents (÷100 for dollars)."
+            "You have two live-data tools:\n"
+            "1. `salesforce_query` — SOQL SELECT for ARR, subscriptions, opportunities, accounts, activity, pipeline. "
+            "Use for ALL revenue metrics: ARR, MRR, NRR, churn, expansion, bookings, subscription counts.\n"
+            "2. `chargebee_query` — live billing data: invoices, payments, collections, overdue balances, payment failures. "
+            "Use ONLY for cash and billing questions — never for ARR or subscription metrics.\n\n"
+            "Always answer from the pre-loaded context first; only call a tool when the context lacks the data. "
+            "Salesforce: include a LIMIT clause. Chargebee: amounts are in cents (÷100 for dollars)."
         )
     )
 

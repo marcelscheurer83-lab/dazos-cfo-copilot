@@ -5483,8 +5483,9 @@ async def post_generate_weekly_briefing(db: AsyncSession = Depends(get_db)):
 
 @app.post("/api/agent/chat")
 async def post_agent_chat(body: AgentChatRequest, db: AsyncSession = Depends(get_db)):
-    """Unified executive assistant chat. Draws on FP&A + RevOps context.
-    Accepts conversation history; returns the assistant reply."""
+    """Unified executive assistant chat with live Salesforce query capability.
+    Uses Anthropic tool use so the agent can run SOQL SELECT queries when the
+    pre-loaded context doesn't have the data needed to answer the question."""
     if not _ANTHROPIC_AVAILABLE or _anthropic_mod is None:
         raise HTTPException(status_code=503, detail="anthropic package not available")
     anthropic_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
@@ -5508,10 +5509,63 @@ async def post_agent_chat(body: AgentChatRequest, db: AsyncSession = Depends(get
         + fpa_ctx
         + "\n\n---\n\n"
         + revops_ctx
+        + (
+            "\n\n---\n\n## Live Salesforce Queries\n\n"
+            "You have access to a `salesforce_query` tool that executes live SOQL SELECT queries. "
+            "Always try to answer from the pre-loaded context first. "
+            "Use the tool only when you need data that isn't already provided above, "
+            "such as specific opportunity details, account fields, activity history, or custom fields. "
+            "Prefer targeted queries with a LIMIT clause."
+        )
     )
 
+    # Tool: live SOQL query against Salesforce
+    sf_tools = [
+        {
+            "name": "salesforce_query",
+            "description": (
+                "Run a live SOQL SELECT query against Salesforce. Only SELECT statements are allowed. "
+                "Results are capped at 200 records. Include a LIMIT clause for large objects."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "soql": {
+                        "type": "string",
+                        "description": "A SOQL SELECT query. Must start with SELECT.",
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Brief explanation of what data this fetches and why it's needed.",
+                    },
+                },
+                "required": ["soql"],
+            },
+        }
+    ]
+
+    async def _execute_sf_query(soql: str) -> str:
+        """Run a SOQL query with safety guardrails; return a compact text result."""
+        soql = soql.strip()
+        if not soql.upper().startswith("SELECT"):
+            return "ERROR: Only SELECT queries are permitted."
+        if "LIMIT" not in soql.upper():
+            soql += " LIMIT 200"
+        try:
+            from connectors.salesforce import SalesforceConnector
+            connector = SalesforceConnector()
+            records = await asyncio.to_thread(connector.query, soql)
+            if not records:
+                return "Query returned 0 records."
+            result_json = json.dumps(records[:200], default=str, indent=2)
+            if len(result_json) > 20000:
+                result_json = result_json[:20000] + "\n...(truncated)"
+            return f"{len(records)} record(s):\n{result_json}"
+        except Exception as exc:
+            return f"ERROR: {exc}"
+
     # Build message history + new user message
-    messages: list[dict] = []
+    messages: list = []
     for h in body.history:
         role = h.get("role", "user")
         content = h.get("content", "")
@@ -5521,13 +5575,41 @@ async def post_agent_chat(body: AgentChatRequest, db: AsyncSession = Depends(get
 
     try:
         client = _anthropic_mod.AsyncAnthropic(api_key=anthropic_key)
-        response = await client.messages.create(
-            model="claude-sonnet-4-5",
-            max_tokens=2048,
-            system=full_system,
-            messages=messages,
-        )
-        answer = response.content[0].text if response.content else "No response from agent."
+        answer = "No response from agent."
+
+        # Agentic loop — up to 5 rounds to allow multi-step tool use
+        for _round in range(5):
+            response = await client.messages.create(
+                model="claude-sonnet-4-5",
+                max_tokens=4096,
+                system=full_system,
+                tools=sf_tools,
+                messages=messages,
+            )
+
+            tool_use_blocks = [b for b in response.content if b.type == "tool_use"]
+
+            if not tool_use_blocks or response.stop_reason == "end_turn":
+                # Final answer — extract first text block
+                text_blocks = [b for b in response.content if b.type == "text"]
+                answer = text_blocks[0].text if text_blocks else answer
+                break
+
+            # Append assistant turn (may include text + tool_use blocks)
+            messages.append({"role": "assistant", "content": response.content})
+
+            # Execute each tool call and collect results
+            tool_results = []
+            for block in tool_use_blocks:
+                soql = block.input.get("soql", "")
+                logger.info("Agent SF query [round %d]: %s", _round + 1, soql[:200])
+                result = await _execute_sf_query(soql)
+                tool_results.append(
+                    {"type": "tool_result", "tool_use_id": block.id, "content": result}
+                )
+
+            messages.append({"role": "user", "content": tool_results})
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Agent error: {e}")
 

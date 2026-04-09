@@ -543,7 +543,7 @@ function AIForecastPanel({ aiData, onRescore }: { aiData: AIForecastResponse | n
     <div style={{ borderTop: '1px solid var(--border)', paddingTop: '1.25rem', marginTop: '1rem' }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: '1rem', marginBottom: '0.75rem', flexWrap: 'wrap' }}>
         <p style={{ margin: 0, fontSize: '0.78rem', color: 'var(--text-muted)', textTransform: 'uppercase', fontWeight: 600 }}>
-          Dazos Forecast Agent
+          Dazos RevOps Agent
         </p>
         {aiData?.last_scored_at && (
           <span style={{ fontSize: '0.78rem', color: 'var(--text-muted)' }}>

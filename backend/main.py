@@ -1091,7 +1091,7 @@ Be specific — include tab names, row numbers, and column letters where you can
             raise HTTPException(status_code=503, detail="anthropic package not installed on server")
         client = _anthropic_mod.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
         response = await client.messages.create(
-            model="claude-opus-4-5",
+            model="claude-sonnet-4-5",
             max_tokens=8192,
             system=_FPA_SYSTEM_PROMPT,
             messages=[{"role": "user", "content": prompt}],
@@ -1214,7 +1214,7 @@ Rules:
 Return ONLY the JSON array, no commentary."""
 
     response = await client.messages.create(
-        model="claude-opus-4-5",
+        model="claude-sonnet-4-5",
         max_tokens=8192,
         messages=[{"role": "user", "content": prompt}],
     )
@@ -1259,7 +1259,7 @@ Rules:
 Return ONLY the JSON array."""
 
     response = await client.messages.create(
-        model="claude-opus-4-5",
+        model="claude-sonnet-4-5",
         max_tokens=8192,
         messages=[{"role": "user", "content": prompt}],
     )
@@ -1302,7 +1302,7 @@ Rules:
 Return ONLY the JSON array."""
 
     response = await client.messages.create(
-        model="claude-opus-4-5",
+        model="claude-sonnet-4-5",
         max_tokens=8192,
         messages=[{"role": "user", "content": prompt}],
     )
@@ -1656,7 +1656,7 @@ Format as a markdown bullet list. No headers, no preamble."""
 
         async def ask_claude(prompt: str) -> str:
             msg = await client.messages.create(
-                model="claude-opus-4-5",
+                model="claude-sonnet-4-5",
                 max_tokens=1024,
                 system=_FPA_SYSTEM_PROMPT,
                 messages=[{"role": "user", "content": prompt}],
@@ -1703,7 +1703,7 @@ async def fpa_chat(body: FPAChatRequest, db: AsyncSession = Depends(get_db)):
         raise HTTPException(status_code=400, detail="messages required")
 
     response = await client.messages.create(
-        model="claude-opus-4-5",
+        model="claude-sonnet-4-5",
         max_tokens=2048,
         system=system,
         messages=messages,
@@ -5443,7 +5443,7 @@ async def get_forecast_accuracy(db: AsyncSession = Depends(get_db)):
 async def post_ai_rescore(db: AsyncSession = Depends(get_db)):
     """
     On-demand trigger for AI forecast scoring. Runs _run_ai_forecast_scoring immediately.
-    Requires OPENAI_API_KEY in .env. Does NOT require ENABLE_AI_FORECAST_SCORING.
+    Requires ANTHROPIC_API_KEY in .env. Does NOT require ENABLE_AI_FORECAST_SCORING.
     """
     result = await _run_ai_forecast_scoring(db)
     if result.get("ok"):
@@ -6421,7 +6421,7 @@ Be specific with numbers throughout. If data is limited or patterns are unclear,
             raise HTTPException(status_code=503, detail="anthropic package not installed on server")
         client = _anthropic_mod.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
         response = await client.messages.create(
-            model="claude-opus-4-5",
+            model="claude-sonnet-4-5",
             max_tokens=4096,
             system=_FPA_SYSTEM_PROMPT,
             messages=[{"role": "user", "content": prompt}],
@@ -6765,23 +6765,42 @@ async def _take_forecast_snapshot(db: AsyncSession) -> int:
     return saved
 
 
-_AI_SCORING_MODEL = os.getenv("AI_FORECAST_MODEL", "gpt-4o-mini")
+_REVOPS_AGENT_MODEL = os.getenv("REVOPS_AGENT_MODEL", "claude-sonnet-4-5")
 _AI_SCORING_MAX_BATCH = 10  # max deals per LLM call — reduced from 20 to fit richer context (notes, activity)
+
+_REVOPS_AGENT_SYSTEM_PROMPT = os.getenv(
+    "REVOPS_AGENT_SYSTEM_PROMPT",
+    """You are Dazos's RevOps agent, embedded in the executive cockpit. Dazos is a ~$7M ARR, VC/PE-backed behavioral health CRM SaaS company. Your primary users are the CEO and exec team (CFO, VP Sales, VP Marketing, VP CS). You are the connective tissue across the revenue organization — you see the full funnel from first marketing touch through renewal and expansion.
+
+You are process-oriented, metric-driven, and direct. Your job is to give executives a clear, unified view of revenue performance, identify where the funnel is leaking, and surface actionable fixes. You do not editorialize; you diagnose and recommend.""",
+)
 
 
 async def _run_ai_forecast_scoring(db: AsyncSession) -> dict:
     """Score all open NB + Expansion opportunities with an LLM using field history as context.
     Upserts results into DealAIScore. Returns a summary dict. Non-fatal on LLM errors."""
-    openai_key = os.getenv("OPENAI_API_KEY", "").strip()
-    if not openai_key:
-        return {"ok": False, "error": "OPENAI_API_KEY not set — AI scoring skipped."}
+    anthropic_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
+    if not anthropic_key:
+        return {"ok": False, "error": "ANTHROPIC_API_KEY not set — AI scoring skipped."}
+    if not _ANTHROPIC_AVAILABLE or _anthropic_mod is None:
+        return {"ok": False, "error": "anthropic package not installed — run: pip install anthropic"}
 
-    try:
-        import openai as _openai
-    except ImportError:
-        return {"ok": False, "error": "openai package not installed — run: pip install openai"}
+    anth_client = _anthropic_mod.AsyncAnthropic(api_key=anthropic_key)
 
-    client = _openai.AsyncOpenAI(api_key=openai_key)
+    async def _anth_json(system_task: str, user_content: str, max_tokens: int = 2000, temperature: float = 0.1) -> str:
+        """Make an Anthropic call that returns JSON. Uses assistant prefill to force valid JSON output."""
+        full_system = _REVOPS_AGENT_SYSTEM_PROMPT + "\n\n" + system_task
+        resp = await anth_client.messages.create(
+            model=_REVOPS_AGENT_MODEL,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            system=full_system,
+            messages=[
+                {"role": "user", "content": user_content},
+                {"role": "assistant", "content": "{"},
+            ],
+        )
+        return "{" + (resp.content[0].text if resp.content else "}")
 
     # ── Load open NB + Expansion opportunities ────────────────────────────────
     result = await db.execute(select(Opportunity))
@@ -6950,8 +6969,8 @@ async def _run_ai_forecast_scoring(db: AsyncSession) -> dict:
         contexts = [_build_deal_context(o) for o in batch]
         import json as _json
 
-        system_prompt = (
-            "You are a SaaS sales analyst. You will receive a list of open sales opportunities "
+        scoring_task = (
+            "You will receive a list of open sales opportunities "
             "with stage history, close-date changes, deal size, next steps, recent activity, and notes. "
             "For each deal, assign a win probability (0.0 to 1.0) representing the likelihood "
             "the deal closes as Closed Won within 90 days of its current close date. "
@@ -6960,23 +6979,13 @@ async def _run_ai_forecast_scoring(db: AsyncSession) -> dict:
             "next step clarity (specific action = higher), and note content (positive signals like pricing "
             "discussions or scheduled demos = higher; concerns or silence = lower). "
             "Return ONLY valid JSON in this exact schema with no extra text:\n"
-            '{"scores": [{"sf_opp_id": "<id>", "probability": <float 0-1>, "reasoning": "<1-2 sentences>"}]}'
+            '"scores": [{"sf_opp_id": "<id>", "probability": <float 0-1>, "reasoning": "<1-2 sentences>"}]}'
         )
 
         user_content = _json.dumps({"opportunities": contexts}, default=str)
 
         try:
-            response = await client.chat.completions.create(
-                model=_AI_SCORING_MODEL,
-                response_format={"type": "json_object"},
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_content},
-                ],
-                temperature=0.1,
-                max_tokens=6000,
-            )
-            raw = response.choices[0].message.content or "{}"
+            raw = await _anth_json(scoring_task, user_content, max_tokens=6000, temperature=0.1)
             parsed = _json.loads(raw)
             scores_list: list[dict] = parsed.get("scores", [])
         except Exception as llm_err:
@@ -7009,7 +7018,7 @@ async def _run_ai_forecast_scoring(db: AsyncSession) -> dict:
                 scored_at=scored_at,
                 probability=prob,
                 reasoning=reasoning,
-                model_used=_AI_SCORING_MODEL,
+                model_used=_REVOPS_AGENT_MODEL,
                 input_snapshot_json=_json.dumps(ctx, default=str)[:8000],
             ))
             scored_total += 1
@@ -7066,25 +7075,15 @@ async def _run_ai_forecast_scoring(db: AsyncSession) -> dict:
                 "total_close_date_pushes": close_pushes,
             })
 
-        obs_prompt = (
-            f"You are a SaaS CFO advisor generating a pipeline health briefing for the executive team for {q_label2}. "
+        obs_task = (
+            f"Generate a forecast health briefing for the executive team for {q_label2}. "
             "Based on the AI-scored pipeline data below, write 4-6 concise bullet-point observations. "
             "Cover: overall forecast confidence, month-by-month risk, concentration risk (few large deals), "
             "deal velocity signals, and any notable patterns from high/at-risk deals. "
             "Be specific with numbers. Write for a CFO/CEO audience — direct, no fluff. "
-            "Return ONLY valid JSON: {\"observations\": [\"bullet 1\", \"bullet 2\", ...]}"
+            "Return ONLY valid JSON: \"observations\": [\"bullet 1\", \"bullet 2\", ...]}"
         )
-        obs_response = await client.chat.completions.create(
-            model=_AI_SCORING_MODEL,
-            response_format={"type": "json_object"},
-            messages=[
-                {"role": "system", "content": obs_prompt},
-                {"role": "user", "content": _json2.dumps({"quarter": q_label2, "months": month_summaries}, default=str)},
-            ],
-            temperature=0.3,
-            max_tokens=1000,
-        )
-        obs_raw = obs_response.choices[0].message.content or "{}"
+        obs_raw = await _anth_json(obs_task, _json2.dumps({"quarter": q_label2, "months": month_summaries}, default=str), max_tokens=1000, temperature=0.3)
         observations = _json2.loads(obs_raw).get("observations", [])
 
         # Replace forecast observations (keep only the latest run)
@@ -7196,26 +7195,16 @@ async def _run_ai_forecast_scoring(db: AsyncSession) -> dict:
             "tier_changed_recently": tier_change_deals[:6],
         }
 
-        pipe_prompt = (
-            f"You are a SaaS VP of Sales advisor generating a pipeline health briefing for {q_label2}. "
+        pipe_task = (
+            f"Generate a pipeline health briefing for {q_label2}. "
             "Analyze the open pipeline data below and write 4-6 concise bullet-point observations. "
             "Focus on: deal tier distribution and concentration risk, stage velocity and bottlenecks, "
             "close-date push frequency by tier, stale deals (no recent activity) that are material ARR risks, "
             "tier changes as a signal of deal momentum, and any patterns that suggest pipeline quality issues. "
             "Be specific with deal counts and ARR amounts. Write for a CFO/CEO/VP Sales audience — direct, no fluff. "
-            "Return ONLY valid JSON: {\"observations\": [\"bullet 1\", \"bullet 2\", ...]}"
+            "Return ONLY valid JSON: \"observations\": [\"bullet 1\", \"bullet 2\", ...]}"
         )
-        pipe_obs_response = await client.chat.completions.create(
-            model=_AI_SCORING_MODEL,
-            response_format={"type": "json_object"},
-            messages=[
-                {"role": "system", "content": pipe_prompt},
-                {"role": "user", "content": _json3.dumps(pipeline_summary, default=str)},
-            ],
-            temperature=0.3,
-            max_tokens=900,
-        )
-        pipe_obs_raw = pipe_obs_response.choices[0].message.content or "{}"
+        pipe_obs_raw = await _anth_json(pipe_task, _json3.dumps(pipeline_summary, default=str), max_tokens=900, temperature=0.3)
         pipeline_observations: list[str] = _json3.loads(pipe_obs_raw).get("observations", [])
 
         await db.execute(
@@ -7348,8 +7337,8 @@ async def _run_ai_forecast_scoring(db: AsyncSession) -> dict:
             "deals": ren_deal_contexts[:20],  # cap to 20 for token budget
         }
 
-        ren_prompt = (
-            f"You are a SaaS CS/CFO advisor generating a renewal risk briefing for {q_label_ren}. "
+        ren_task = (
+            f"Generate a renewal risk briefing for {q_label_ren}. "
             "Analyze the open renewal opportunities below (including account health scores, risk flags, "
             "product usage, financial standing, and recent activity) and write 4-6 concise bullet-point observations. "
             "Focus on: high-risk accounts (low health/high risk scores), accounts with engagement or product usage concerns, "
@@ -7357,19 +7346,9 @@ async def _run_ai_forecast_scoring(db: AsyncSession) -> dict:
             "close-date push history as a churn signal, and any patterns that need CS or executive attention. "
             "Be specific with ARR amounts and account names where relevant. "
             "Write for a CFO/CEO/VP CS audience — direct, no fluff. "
-            "Return ONLY valid JSON: {\"observations\": [\"bullet 1\", \"bullet 2\", ...]}"
+            "Return ONLY valid JSON: \"observations\": [\"bullet 1\", \"bullet 2\", ...]}"
         )
-        ren_obs_response = await client.chat.completions.create(
-            model=_AI_SCORING_MODEL,
-            response_format={"type": "json_object"},
-            messages=[
-                {"role": "system", "content": ren_prompt},
-                {"role": "user", "content": _json4.dumps(ren_payload, default=str)},
-            ],
-            temperature=0.3,
-            max_tokens=900,
-        )
-        ren_obs_raw = ren_obs_response.choices[0].message.content or "{}"
+        ren_obs_raw = await _anth_json(ren_task, _json4.dumps(ren_payload, default=str), max_tokens=900, temperature=0.3)
         renewals_observations: list[str] = _json4.loads(ren_obs_raw).get("observations", [])
 
         await db.execute(

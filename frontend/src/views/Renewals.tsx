@@ -841,7 +841,7 @@ export default function Renewals() {
     <>
       <h1 style={{ margin: '0 0 1.5rem', fontSize: '1.5rem', fontWeight: 600, color: 'var(--text)' }}>Renewals</h1>
 
-      {/* Dazos Forecast Agent — Renewals Observations */}
+      {/* Dazos RevOps Agent — Renewals Observations */}
       <div style={{
         background: 'var(--surface)',
         border: '1px solid var(--border)',
@@ -850,7 +850,7 @@ export default function Renewals() {
         marginBottom: '1.5rem',
       }}>
         <p style={{ margin: '0 0 0.15rem', fontSize: '0.65rem', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.07em', color: '#38bdf8' }}>
-          Dazos Forecast Agent
+          Dazos RevOps Agent
         </p>
         <p style={{ margin: '0 0 0.6rem', fontSize: '0.72rem', fontWeight: 600, color: 'var(--text)', letterSpacing: '0.02em' }}>
           Observations

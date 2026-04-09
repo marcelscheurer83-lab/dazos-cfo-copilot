@@ -562,7 +562,7 @@ export default function Pipeline() {
         marginBottom: '1.5rem',
       }}>
         <p style={{ margin: '0 0 0.15rem', fontSize: '0.65rem', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.07em', color: '#38bdf8' }}>
-          Dazos Forecast Agent
+          Dazos RevOps Agent
         </p>
         <p style={{ margin: '0 0 0.6rem', fontSize: '0.72rem', fontWeight: 600, color: 'var(--text)', letterSpacing: '0.02em' }}>
           Observations

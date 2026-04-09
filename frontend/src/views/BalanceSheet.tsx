@@ -39,7 +39,8 @@ export default function BalanceSheet() {
   const displayPeriods = [...new Set(lines.map((l) => l.period_end))].sort().slice(-3).reverse()
 
   // Build section → category map preserving sort_order
-  type CatData = Record<string, Record<string, { actual: number; plan: number | null; is_subtotal: boolean }>>
+  type PeriodCell = { actual: number; plan: number | null; is_subtotal: boolean }
+  type CatData = Record<string, Record<string, Record<string, PeriodCell>>>
   const data: CatData = {}
   const catOrderBySec: Record<string, string[]> = {}
   const catMeta: Record<string, { is_subtotal: boolean }> = {}

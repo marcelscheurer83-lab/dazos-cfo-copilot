@@ -14,8 +14,6 @@ function varColor(v: number) {
 }
 
 const SECTIONS = ['operating', 'investing', 'financing'] as const
-type Section = (typeof SECTIONS)[number]
-
 type PeriodData = { actual: number; plan: number | null }
 
 export default function CashFlow() {

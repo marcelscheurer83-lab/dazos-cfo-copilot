@@ -159,7 +159,9 @@ export type PnLLine = {
   line_type: string
   category: string
   amount: number
+  plan_amount: number | null
   is_subtotal: boolean
+  sort_order: number
 }
 
 export type CashFlowLine = {
@@ -167,6 +169,29 @@ export type CashFlowLine = {
   section: string
   category: string
   amount: number
+  plan_amount: number | null
+  sort_order: number
+}
+
+export type BalanceSheetLine = {
+  period_end: string
+  section: string
+  category: string
+  amount: number
+  plan_amount: number | null
+  is_subtotal: boolean
+  sort_order: number
+}
+
+export type FinancialAnalysis = {
+  id: number
+  period_end: string
+  generated_at: string | null
+  pnl_analysis: string | null
+  cashflow_analysis: string | null
+  balance_sheet_analysis: string | null
+  executive_summary: string | null
+  status: string
 }
 
 export type BudgetVsActual = {
@@ -179,6 +204,8 @@ export type BudgetVsActual = {
 }
 
 export type CopilotResponse = { answer: string; sources?: string[] }
+export type FPAChatMessage = { role: 'user' | 'assistant'; content: string }
+export type FPAChatResponse = { answer: string }
 
 /** Latest snapshot of a Google Sheet range (Phase 1a). */
 export type SheetSnapshotResponse = {
@@ -1417,5 +1444,170 @@ export async function askCopilot(question: string): Promise<CopilotResponse> {
     body: JSON.stringify({ question }),
   })
   if (!r.ok) throw new Error('Copilot request failed')
+  return r.json()
+}
+
+export async function getBalanceSheet(periodEnd?: string, months = 3): Promise<BalanceSheetLine[]> {
+  let path = `/financials/balance-sheet?months=${months}`
+  if (periodEnd) path += `&period_end=${periodEnd}`
+  const r = await apiFetch(path)
+  if (!r.ok) throw new Error('Failed to fetch balance sheet')
+  return r.json()
+}
+
+export async function getFinancialAnalyses(): Promise<FinancialAnalysis[]> {
+  const r = await apiFetch('/financials/analyses')
+  if (!r.ok) throw new Error('Failed to fetch analyses')
+  return r.json()
+}
+
+export async function triggerMonthlyClose(periodEnd: string): Promise<{ ok: boolean }> {
+  const r = await apiFetch('/financials/monthly-close', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ period_end: periodEnd }),
+  })
+  if (!r.ok) {
+    const err = await r.json().catch(() => ({}))
+    throw new Error((err as { detail?: string }).detail || `HTTP ${r.status}`)
+  }
+  return r.json()
+}
+
+export async function fpaChat(messages: FPAChatMessage[]): Promise<FPAChatResponse> {
+  const r = await apiFetch('/financials/fpa-chat', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ messages }),
+  })
+  if (!r.ok) {
+    const err = await r.json().catch(() => ({}))
+    throw new Error((err as { detail?: string }).detail || `HTTP ${r.status}`)
+  }
+  return r.json()
+}
+
+export type SyncStatementResult = { ok: boolean; rows_synced?: number; periods_synced?: number; error?: string }
+export type SyncStatus = {
+  synced_at: string | null
+  rows_synced?: number
+  periods_synced?: number
+  actuals_tab?: string
+  plan_tab?: string
+} | null
+
+export async function getSyncStatus(): Promise<Record<'pnl' | 'bs' | 'cf', SyncStatus>> {
+  const r = await apiFetch('/financials/sync-status')
+  if (!r.ok) throw new Error('Failed to fetch sync status')
+  return r.json()
+}
+
+export async function syncFromSheet(statement: 'pnl' | 'bs' | 'cf' | 'all'): Promise<{ results: Record<string, SyncStatementResult> }> {
+  const r = await apiFetch(`/financials/sync-from-sheet?statement=${statement}`, { method: 'POST' })
+  if (!r.ok) {
+    const err = await r.json().catch(() => ({}))
+    throw new Error((err as { detail?: string }).detail || `HTTP ${r.status}`)
+  }
+  return r.json()
+}
+
+// ── Churn Analysis ────────────────────────────────────────────────────────
+export type ChurnRecord = {
+  id: number
+  account_name: string
+  sf_account_id: string | null
+  churn_month: string
+  churn_arr: number
+  tenure_months: number | null
+  first_arr_month: string | null
+  industry: string | null
+  segment: string | null
+  region: string | null
+  account_type: string | null
+  churn_reason: string | null
+  health_score: number | null
+  synced_at: string | null
+  sf_attributes: Record<string, string | number | null>
+}
+
+export type ChurnBucket = { count: number; arr: number }
+export type ChurnSummary = {
+  total: number
+  total_arr: number
+  synced_at: string | null
+  by_industry: Record<string, ChurnBucket>
+  by_segment: Record<string, ChurnBucket>
+  by_tenure_bucket: Record<string, ChurnBucket>
+  by_arr_bucket: Record<string, ChurnBucket>
+  by_month: Record<string, ChurnBucket>
+}
+
+export type ChurnObservations = {
+  observations: string[]
+  summary: string | null
+  patterns: Record<string, Record<string, number>>
+  total_churned: number
+  total_churn_arr: number
+  generated_at: string | null
+}
+
+export async function getChurnRecords(): Promise<ChurnRecord[]> {
+  const r = await apiFetch('/churn/records')
+  if (!r.ok) throw new Error('Failed to fetch churn records')
+  return r.json()
+}
+
+export async function getChurnSummary(): Promise<ChurnSummary> {
+  const r = await apiFetch('/churn/summary')
+  if (!r.ok) throw new Error('Failed to fetch churn summary')
+  return r.json()
+}
+
+export async function getChurnObservations(): Promise<ChurnObservations> {
+  const r = await apiFetch('/churn/observations')
+  if (!r.ok) throw new Error('Failed to fetch churn observations')
+  return r.json()
+}
+
+export async function syncChurnData(): Promise<{ ok: boolean; churned_found: number; sf_rows: number; message: string }> {
+  const r = await apiFetch('/churn/sync', { method: 'POST' })
+  if (!r.ok) {
+    const err = await r.json().catch(() => ({}))
+    throw new Error((err as { detail?: string }).detail || `HTTP ${r.status}`)
+  }
+  return r.json()
+}
+
+export async function runChurnAIAnalysis(): Promise<{ ok: boolean; observations: number }> {
+  const r = await apiFetch('/churn/ai-analyze', { method: 'POST' })
+  if (!r.ok) {
+    const err = await r.json().catch(() => ({}))
+    throw new Error((err as { detail?: string }).detail || `HTTP ${r.status}`)
+  }
+  return r.json()
+}
+
+export type TabSnapshot = { title: string; synced_at: string | null; non_empty_rows: number; priority: number }
+
+export async function getTabSnapshots(): Promise<TabSnapshot[]> {
+  const r = await apiFetch('/financials/tab-snapshots')
+  if (!r.ok) throw new Error('Failed to fetch tab snapshots')
+  return r.json()
+}
+
+export type ModelMap = { map: { text: string; tabs: string[] } | null; as_of: string | null; message?: string }
+
+export async function getModelMap(): Promise<ModelMap> {
+  const r = await apiFetch('/financials/model-map')
+  if (!r.ok) throw new Error('Failed to fetch model map')
+  return r.json()
+}
+
+export async function scanFinancialModel(): Promise<{ ok: boolean; tabs_scanned: number; map_preview: string }> {
+  const r = await apiFetch('/financials/scan-model', { method: 'POST' })
+  if (!r.ok) {
+    const err = await r.json().catch(() => ({}))
+    throw new Error((err as { detail?: string }).detail || `HTTP ${r.status}`)
+  }
   return r.json()
 }

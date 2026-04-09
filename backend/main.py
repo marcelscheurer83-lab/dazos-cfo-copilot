@@ -38,6 +38,8 @@ from models import (
     PnLLine,
     CashFlowLine,
     BudgetLine,
+    BalanceSheetLine,
+    FinancialAnalysis,
     SheetSnapshot,
     Account,
     Opportunity,
@@ -57,12 +59,18 @@ from models import (
     AIForecastObservations,
     DealAIScore,
     ForecastSnapshot,
+    ChurnRecord,
+    ChurnObservations,
 )
 from schemas import (
     KPISummary,
     PnLLineOut,
     CashFlowLineOut,
+    BalanceSheetLineOut,
     BudgetVsActualOut,
+    FinancialAnalysisOut,
+    FPAChatRequest,
+    FPAChatResponse,
     CopilotRequest,
     CopilotResponse,
     DashboardKPI,
@@ -142,6 +150,8 @@ _env_path = Path(__file__).resolve().parent / ".env"
 _env_dict = dotenv_values(str(_env_path)) if _env_path.exists() else {}
 _app_password_raw = _env_dict.get("APP_PASSWORD") or os.getenv("APP_PASSWORD")
 APP_PASSWORD = (_app_password_raw or "").strip().strip('"').strip("'") or None
+
+ANTHROPIC_API_KEY = (os.getenv("ANTHROPIC_API_KEY") or "").strip() or None
 
 EST = ZoneInfo("America/New_York")
 
@@ -602,6 +612,1096 @@ async def get_budget_vs_actual(
         pct = round(var / row.budget_amount * 100, 1) if row.budget_amount else None
         out.append(BudgetVsActualOut(period_end=row.period_end, category=row.category, budget_amount=row.budget_amount, actual_amount=row.actual_amount, variance=var, variance_pct=pct))
     return out
+
+
+_FPA_SYSTEM_PROMPT = """You are Dazos's FP&A agent, embedded in the CFO cockpit. Dazos is a ~$7M ARR, VC/PE-backed behavioral health CRM SaaS company. You serve the CFO as your primary user, with occasional access by other executives (CEO, VP Sales, VP CS, etc.) — calibrate depth and framing to the role when it's known.
+
+You are a sharp, numbers-first financial analyst: precise, candid, and efficient. You never pad responses with filler. Lead with the answer or the number, then support it.
+
+## Company context
+- Stage: Series A/B range, investor-backed, growth-oriented
+- ARR: ~$7M with an active growth mandate from investors
+- Business model: SaaS subscription, behavioral health vertical (mental health, substance use disorder, counseling providers)
+- Revenue drivers: seat-based or patient-volume licensing, expansion ARR, new logo acquisition
+- Key cost centers: R&D/engineering, sales & marketing, customer success, G&A
+- Compliance: customers are HIPAA covered entities — relevant to vendor costs, data handling, and customer success intensity, which affects gross margin and CAC
+
+## Data sources
+You have access to the following primary data sources in this cockpit. Always reference the most current available data before answering; flag if data may be stale.
+
+**Google Sheets (primary financial model)**
+- Source of truth for P&L, ARR, headcount, and operational metrics
+- Populated via QuickBooks export (actuals) and manual inputs (budget/forecast)
+
+**QuickBooks (accounting system)**
+- Actuals: revenue, COGS, opex by category, cash, AP/AR
+
+**Salesforce (CRM)**
+- Pipeline: stages, ACV, close dates, rep ownership, source
+- New logo and expansion bookings, churn and contraction data
+
+When sources conflict, flag the discrepancy and identify which is more likely current. Do not silently average or blend conflicting numbers.
+
+## Core metrics you track and compute
+**ARR & revenue**
+- ARR = annualized committed recurring revenue
+- ARR bridge: new logo + expansion − churn − contraction = net new ARR
+- NRR (Net Revenue Retention) = (starting ARR + expansion − churn − contraction) / starting ARR × 100
+
+**Unit economics**
+- ACV (Average Contract Value): total ARR / logo count
+- LTV = ACV × gross margin % / churn rate
+- CAC = total S&M spend / new logos acquired (period-matched)
+- LTV:CAC ratio: target ≥ 3x; best-in-class ≥ 5x
+- CAC Payback Period = CAC / (ACV × gross margin %); target <18 months
+
+**Efficiency**
+- Gross margin = (revenue − COGS) / revenue; SaaS target 70–80%
+- Magic number = net new ARR (quarter) / prior quarter S&M spend
+- Burn multiple = net cash burned / net new ARR; <1.5x efficient
+- Rule of 40 = ARR growth rate % + FCF margin %
+
+**Cash & runway**
+- Ending cash balance, monthly burn rate
+- Runway in months = cash / avg monthly net burn; board expectation 18–24 months minimum
+
+## Benchmarks (VC-backed SaaS, $5–15M ARR peer group)
+| Metric | Concerning | Acceptable | Strong |
+|---|---|---|---|
+| NRR | <100% | 100–110% | >110% |
+| Gross margin | <65% | 65–75% | >75% |
+| CAC payback | >24 mo | 12–18 mo | <12 mo |
+| LTV:CAC | <2x | 2–4x | >4x |
+| Magic number | <0.5 | 0.5–1.0 | >1.0 |
+| Burn multiple | >2x | 1.5–2x | <1.5x |
+| Rule of 40 | <20 | 20–40 | >40 |
+| Pipeline coverage | <2.5x | 2.5–3.5x | >3.5x |
+
+## How you work
+- Lead with the number or the answer — not the setup
+- Name the driver behind every variance; don't just describe the gap
+- Flag risks and opportunities explicitly; never bury them
+- If data is missing or ambiguous, ask the single most important clarifying question
+- Present tables for comparative or multi-period data; use prose for narratives and commentary
+- Always include a "so what" and recommended action when the analysis warrants it
+- When asked to build a model or output, produce it — don't ask for permission
+
+## Guardrails
+- Never fabricate numbers; if estimating, label it clearly as an estimate
+- Do not present a single scenario as certain — offer ranges or sensitivities for forward-looking figures
+- Omit disclaimers and caveats unless they are materially important to the decision at hand
+- If a request is outside finance (e.g., HR policy, legal), redirect to the appropriate owner"""
+
+
+_FPA_MODEL_MAP_KEY = "__fpa_model_map__"
+_FPA_TAB_SNAPSHOT_PREFIX = "__tab__"
+
+# Priority order for tab inclusion in agent context (higher = included first / more rows)
+_TAB_PRIORITY: dict[str, int] = {
+    "OVERVIEW": 200,
+    "OVERVIEW_2026P": 200,
+    "ASSUMPTIONS": 200,
+    "P&L": 150,
+    "P&L_2026P": 150,
+    "ARR_Calculations": 150,
+    "ARR_Calculations_2026P": 150,
+    "ARR_Actuals": 120,
+    "BS": 120,
+    "BS_2026P": 120,
+    "CF": 120,
+    "CF_2026P": 120,
+    "Headcount": 120,
+    "Headcount_2026P": 120,
+    "Hiring plan_2026P": 100,
+    "CoGS": 100,
+    "CoGS_2026P": 100,
+    "Sales & Marketing": 100,
+    "Sales & Marketing_2026P": 100,
+    "Product & Engineering": 100,
+    "Product & Engineering_2026P": 100,
+    "General & Administrative": 100,
+    "General & Administrative_2026P": 100,
+    "Sales and CS capacity": 80,
+    "Sales and CS capacity_2026P": 80,
+    "ARR_Schedule": 80,
+}
+_TAB_DEFAULT_PRIORITY = 60
+_CONTEXT_TOKEN_BUDGET = 120_000   # ~120K chars ≈ ~30K tokens — well within Claude's window
+
+
+def _compact_tab(raw_rows: list[list], max_rows: int = 200, max_cols: int = 180) -> str:
+    """Convert raw sheet rows to compact text, skipping empty rows, trimming trailing empties."""
+    out = []
+    for i, row in enumerate(raw_rows[:max_rows]):
+        cells = [str(c) if c != "" else "" for c in row[:max_cols]]
+        if not any(c.strip() for c in cells):
+            continue
+        while cells and not cells[-1].strip():
+            cells.pop()
+        out.append(f"R{i+1}: {cells}")
+    return "\n".join(out)
+
+
+async def _build_fpa_context(db: AsyncSession) -> str:
+    """Build a comprehensive financial data context for the FP&A agent.
+
+    Priority order:
+    1. Model map (structural understanding of the spreadsheet)
+    2. All stored tab snapshots (actual data from every sheet tab), ordered by priority
+    3. Structured DB data (P&L, CF, BS already parsed into tables)
+    4. Live ARR from Salesforce
+    5. Latest stored monthly close analysis
+    """
+    sections: list[tuple[int, str, str]] = []  # (priority, heading, content)
+
+    # ── 1. Model map ─────────────────────────────────────────────────────────
+    try:
+        map_r = await db.execute(
+            select(SheetSnapshot)
+            .where(SheetSnapshot.range_name == _FPA_MODEL_MAP_KEY)
+            .order_by(SheetSnapshot.as_of.desc()).limit(1)
+        )
+        map_row = map_r.scalar_one_or_none()
+        if map_row and map_row.data_json:
+            map_data = json.loads(map_row.data_json)
+            map_text = map_data.get("text", "")
+            if map_text:
+                sections.append((1000, "## Financial Model Map", map_text))
+    except Exception:
+        pass
+
+    # ── 2. All stored tab snapshots ──────────────────────────────────────────
+    try:
+        snaps_r = await db.execute(
+            select(SheetSnapshot)
+            .where(SheetSnapshot.range_name.like(f"{_FPA_TAB_SNAPSHOT_PREFIX}%"))
+            .order_by(SheetSnapshot.as_of.desc())
+        )
+        all_snaps = snaps_r.scalars().all()
+        # Deduplicate: keep most recent per tab title
+        seen_tabs: dict[str, SheetSnapshot] = {}
+        for snap in all_snaps:
+            title = snap.range_name[len(_FPA_TAB_SNAPSHOT_PREFIX):]
+            if title not in seen_tabs:
+                seen_tabs[title] = snap
+
+        for title, snap in seen_tabs.items():
+            if not snap.data_json:
+                continue
+            priority = _TAB_PRIORITY.get(title, _TAB_DEFAULT_PRIORITY)
+            max_rows = priority  # reuse priority as row budget
+            try:
+                raw = json.loads(snap.data_json)
+                compact = _compact_tab(raw, max_rows=max_rows)
+                if compact.strip():
+                    as_of = snap.as_of.strftime("%Y-%m-%d") if snap.as_of else "unknown"
+                    sections.append((
+                        priority,
+                        f"### Sheet tab: {title} (synced {as_of})",
+                        compact,
+                    ))
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # ── 3. Structured DB data (P&L, CF, BS) ─────────────────────────────────
+    try:
+        pnl_r = await db.execute(
+            select(PnLLine).order_by(PnLLine.period_end.desc(), PnLLine.sort_order).limit(500)
+        )
+        pnl_rows = pnl_r.scalars().all()
+        if pnl_rows:
+            periods = sorted(set(r.period_end for r in pnl_rows), reverse=True)[:6]
+            header = f"{'Category':<40} " + " | ".join(
+                f"{str(p):>12} actual  {str(p):>12} plan" for p in periods
+            )
+            lines = [header, "-" * len(header)]
+            cats: list[str] = []
+            seen_c: set = set()
+            for r in pnl_rows:
+                if r.category not in seen_c:
+                    seen_c.add(r.category)
+                    cats.append(r.category)
+            by_cat: dict = {}
+            for r in pnl_rows:
+                by_cat.setdefault(r.category, {})[r.period_end] = r
+            for cat in cats:
+                cells = []
+                for p in periods:
+                    row = by_cat[cat].get(p)
+                    cells.append(f"${row.amount:>12,.0f}  {('$'+f'{row.plan_amount:,.0f}') if row and row.plan_amount is not None else '—':>12}" if row else f"{'—':>14}  {'—':>12}")
+                lines.append(f"{cat:<40} " + " | ".join(cells))
+            sections.append((500, "## P&L — structured (last 6 months, actual vs plan)", "\n".join(lines)))
+    except Exception:
+        pass
+
+    try:
+        cf_r = await db.execute(
+            select(CashFlowLine).order_by(CashFlowLine.period_end.desc(), CashFlowLine.sort_order).limit(200)
+        )
+        cf_rows = cf_r.scalars().all()
+        if cf_rows:
+            periods = sorted(set(r.period_end for r in cf_rows), reverse=True)[:3]
+            lines = []
+            for r in cf_rows:
+                if r.period_end in periods:
+                    plan_str = f" | plan ${r.plan_amount:,.0f}" if r.plan_amount is not None else ""
+                    lines.append(f"[{r.period_end}] {r.section} / {r.category}: ${r.amount:,.0f}{plan_str}")
+            sections.append((490, "## Cash Flow — structured (last 3 months)", "\n".join(lines)))
+    except Exception:
+        pass
+
+    try:
+        bs_r = await db.execute(
+            select(BalanceSheetLine).order_by(BalanceSheetLine.period_end.desc(), BalanceSheetLine.sort_order).limit(200)
+        )
+        bs_rows = bs_r.scalars().all()
+        if bs_rows:
+            periods = sorted(set(r.period_end for r in bs_rows), reverse=True)[:2]
+            lines = []
+            for r in bs_rows:
+                if r.period_end in periods:
+                    plan_str = f" | plan ${r.plan_amount:,.0f}" if r.plan_amount is not None else ""
+                    lines.append(f"[{r.period_end}] {r.section} / {r.category}: ${r.amount:,.0f}{plan_str}")
+            sections.append((480, "## Balance Sheet — structured (last 2 periods)", "\n".join(lines)))
+    except Exception:
+        pass
+
+    # ── 4. Live ARR from Salesforce ──────────────────────────────────────────
+    try:
+        arr_data, _ = await _get_arr_data_for_date(db, None)
+        if arr_data:
+            grand_total = arr_data.get("grand_total") or 0
+            sections.append((470, "## Live ARR (Salesforce)", f"CARR: ${grand_total:,.0f}"))
+    except Exception:
+        pass
+
+    # ── 5. Latest monthly close analysis ─────────────────────────────────────
+    try:
+        analyses_r = await db.execute(
+            select(FinancialAnalysis).where(FinancialAnalysis.status == "done")
+            .order_by(FinancialAnalysis.period_end.desc()).limit(1)
+        )
+        la = analyses_r.scalar_one_or_none()
+        if la and la.executive_summary:
+            sections.append((460, f"## Monthly close analysis ({la.period_end})", la.executive_summary))
+    except Exception:
+        pass
+
+    # ── Assemble: sort by priority desc, respect token budget ────────────────
+    sections.sort(key=lambda x: x[0], reverse=True)
+    parts = []
+    budget = _CONTEXT_TOKEN_BUDGET
+    for _, heading, content in sections:
+        block = f"{heading}\n\n{content}\n"
+        if len(block) > budget:
+            # Truncate this block to fit
+            block = block[:budget] + "\n[…truncated to fit context budget]"
+            parts.append(block)
+            break
+        parts.append(block)
+        budget -= len(block)
+        if budget <= 0:
+            break
+
+    return "\n---\n".join(parts)
+
+
+@app.get("/api/financials/balance-sheet", response_model=list[BalanceSheetLineOut])
+async def get_balance_sheet(
+    period_end: Optional[date] = Query(None),
+    months: int = Query(3, ge=1, le=12),
+    db: AsyncSession = Depends(get_db),
+):
+    q = select(BalanceSheetLine).order_by(BalanceSheetLine.period_end.desc(), BalanceSheetLine.sort_order)
+    if period_end:
+        q = q.where(BalanceSheetLine.period_end <= period_end)
+    r = await db.execute(q.limit(500))
+    rows = r.scalars().all()
+    periods = sorted(set(row.period_end for row in rows), reverse=True)[:months]
+    out = [
+        BalanceSheetLineOut(
+            period_end=row.period_end,
+            section=row.section,
+            category=row.category,
+            amount=row.amount,
+            plan_amount=row.plan_amount,
+            is_subtotal=bool(row.is_subtotal),
+            sort_order=row.sort_order,
+        )
+        for row in rows if row.period_end in periods
+    ]
+    return out
+
+
+@app.get("/api/financials/analyses", response_model=list[FinancialAnalysisOut])
+async def get_financial_analyses(db: AsyncSession = Depends(get_db)):
+    r = await db.execute(
+        select(FinancialAnalysis).order_by(FinancialAnalysis.period_end.desc()).limit(24)
+    )
+    return r.scalars().all()
+
+
+@app.get("/api/financials/tab-snapshots")
+async def get_tab_snapshots(db: AsyncSession = Depends(get_db)):
+    """Return list of all stored tab snapshots with metadata (not the raw data)."""
+    r = await db.execute(
+        select(SheetSnapshot)
+        .where(SheetSnapshot.range_name.like(f"{_FPA_TAB_SNAPSHOT_PREFIX}%"))
+        .order_by(SheetSnapshot.as_of.desc())
+    )
+    all_snaps = r.scalars().all()
+    seen: dict[str, dict] = {}
+    for snap in all_snaps:
+        title = snap.range_name[len(_FPA_TAB_SNAPSHOT_PREFIX):]
+        if title in seen:
+            continue
+        try:
+            rows = json.loads(snap.data_json) if snap.data_json else []
+            non_empty = sum(1 for row in rows if any(str(c).strip() for c in row))
+        except Exception:
+            non_empty = 0
+        seen[title] = {
+            "title": title,
+            "synced_at": snap.as_of.isoformat() if snap.as_of else None,
+            "non_empty_rows": non_empty,
+            "priority": _TAB_PRIORITY.get(title, _TAB_DEFAULT_PRIORITY),
+        }
+    return sorted(seen.values(), key=lambda x: -x["priority"])
+
+
+@app.get("/api/financials/model-map")
+async def get_model_map(db: AsyncSession = Depends(get_db)):
+    """Return the stored FP&A model map (Claude's understanding of the Google Sheet structure)."""
+    r = await db.execute(
+        select(SheetSnapshot)
+        .where(SheetSnapshot.range_name == _FPA_MODEL_MAP_KEY)
+        .order_by(SheetSnapshot.as_of.desc())
+        .limit(1)
+    )
+    row = r.scalar_one_or_none()
+    if not row:
+        return {"map": None, "as_of": None, "message": "No model map yet. Run POST /api/financials/scan-model first."}
+    return {"map": json.loads(row.data_json) if row.data_json else None, "as_of": row.as_of.isoformat() if row.as_of else None}
+
+
+@app.post("/api/financials/scan-model")
+async def scan_financial_model(db: AsyncSession = Depends(get_db)):
+    """
+    Ask Claude to explore the Google Sheet financial model and produce a structured map
+    of what lives on each tab (row labels, columns, key data locations).
+    Stores result as a SheetSnapshot with range_name='__fpa_model_map__'.
+    """
+    if not ANTHROPIC_API_KEY:
+        raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY not configured")
+
+    from connectors.google_sheets import GoogleSheetsConnector
+    connector = GoogleSheetsConnector()
+    connector.set_base_path(Path(__file__).resolve().parent)
+
+    if not connector.is_configured():
+        raise HTTPException(status_code=503, detail="Google Sheets not configured. Set GOOGLE_SHEET_ID and credentials in backend/.env.")
+
+    try:
+        sheets = await asyncio.to_thread(connector.list_sheets)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not list sheets: {e}")
+
+    # Sample the first ~40 rows of each tab (skip huge raw-data tabs > 5000 rows to stay within token budget)
+    tab_samples: list[dict] = []
+    for sh in sheets:
+        title = sh["title"]
+        row_count = sh.get("rowCount", 0)
+        col_count = sh.get("columnCount", 0)
+        # Skip only truly massive raw-data tabs that would blow the token budget
+        if row_count > 20000 and col_count > 300:
+            tab_samples.append({"title": title, "rows": row_count, "cols": col_count, "sample": None, "skipped": "too large"})
+            continue
+        try:
+            sample_rows = min(720, row_count or 720)
+            # Column 180 = GH in A1 notation
+            raw = await asyncio.to_thread(connector.read_range, f"'{title}'!A1:GH{sample_rows}")
+            # Truncate each row to first 180 cols and stringify
+            sample = [[str(cell) if cell != "" else "" for cell in row[:180]] for row in (raw or [])[:sample_rows]]
+            tab_samples.append({"title": title, "rows": row_count, "cols": col_count, "sample": sample, "skipped": None})
+        except Exception as e:
+            tab_samples.append({"title": title, "rows": row_count, "cols": col_count, "sample": None, "skipped": str(e)})
+
+    # Build the prompt
+    tab_descriptions = []
+    for tab in tab_samples:
+        block = f"\n### Tab: \"{tab['title']}\" ({tab['rows']} rows × {tab['cols']} cols)"
+        if tab["skipped"]:
+            block += f"\n[Skipped: {tab['skipped']}]"
+        elif tab["sample"]:
+            lines = []
+            for i, row in enumerate(tab["sample"]):
+                if any(cell for cell in row):
+                    lines.append(f"  Row {i+1}: {row}")
+            block += "\n" + "\n".join(lines[:720])
+        tab_descriptions.append(block)
+
+    prompt = f"""You are mapping a Google Sheet financial model for Dazos, a ~$7M ARR SaaS company.
+The spreadsheet has {len(sheets)} tabs. Below is a sample of the first ~40 rows of each tab (up to 30 columns wide).
+
+{chr(10).join(tab_descriptions)}
+
+Produce a structured **Financial Model Map** with these sections:
+
+## Tab Index
+List every tab with a one-line description of what it contains.
+
+## Key Data Locations
+For each financially important tab, describe:
+- What rows contain headers vs data
+- What columns contain what (e.g. "Column A = line item label, columns B–M = Jan–Dec actuals")
+- What the key metrics / KPIs are and which rows/cells they live in
+- Any plan vs actual structure (which columns are actuals, which are budget/plan)
+
+## P&L Location
+Exactly which tab and rows contain the P&L (income statement). Which columns are months, which are YTD, which are plan vs actual.
+
+## Cash Flow Location
+Same for cash flow statement.
+
+## Balance Sheet Location
+Same for balance sheet.
+
+## ARR / Revenue Schedule Location
+Where ARR or recurring revenue data lives.
+
+## Headcount / Opex Detail
+Where headcount plan or detailed opex breakdown lives.
+
+## Notes for the FP&A Agent
+Any important structural notes: named ranges, helper tabs, how actuals vs budget are distinguished, fiscal year conventions, etc.
+
+Be specific — include tab names, row numbers, and column letters where you can infer them from the sample."""
+
+    try:
+        import anthropic as _anthropic
+        client = _anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+        response = await client.messages.create(
+            model="claude-opus-4-5",
+            max_tokens=8192,
+            system=_FPA_SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        model_map_text = response.content[0].text if response.content else ""
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Claude error: {e}")
+
+    # Store the model map
+    stored = SheetSnapshot(
+        source="fpa_model_scan",
+        range_name=_FPA_MODEL_MAP_KEY,
+        data_json=json.dumps({"text": model_map_text, "tabs": [s["title"] for s in tab_samples]}),
+    )
+    db.add(stored)
+
+    # Store each tab's raw data as an individual snapshot for agent context
+    tabs_stored = 0
+    for tab in tab_samples:
+        if tab.get("sample") is None:
+            continue
+        snap_key = f"{_FPA_TAB_SNAPSHOT_PREFIX}{tab['title']}"
+        # Delete old snapshots for this tab (keep only latest)
+        await db.execute(
+            delete(SheetSnapshot).where(SheetSnapshot.range_name == snap_key)
+        )
+        db.add(SheetSnapshot(
+            source="fpa_tab_scan",
+            range_name=snap_key,
+            data_json=json.dumps(tab["sample"]),
+        ))
+        tabs_stored += 1
+
+    await db.commit()
+
+    return {"ok": True, "tabs_scanned": len(tab_samples), "tabs_stored": tabs_stored, "map_preview": model_map_text[:500] + "…"}
+
+
+# ── Financial model sync (Google Sheets → DB) ────────────────────────────────
+
+_SHEET_TAB_MAP = {
+    "pnl": {"actuals": "P&L", "plan": "P&L_2026P"},
+    "bs":  {"actuals": "BS",  "plan": "BS_2026P"},
+    "cf":  {"actuals": "CF",  "plan": "CF_2026P"},
+}
+
+_SYNC_STATUS_KEY_PREFIX = "__sync_status__"
+
+
+def _col_letter(n: int) -> str:
+    """Convert 1-based column index to A1 letter (1=A, 26=Z, 27=AA, …)."""
+    result = ""
+    while n > 0:
+        n, rem = divmod(n - 1, 26)
+        result = chr(65 + rem) + result
+    return result
+
+
+def _sheet_to_compact_text(rows: list[list], max_rows: int = 300, max_cols: int = 180) -> str:
+    """Convert raw sheet rows to a compact text block, skipping fully-empty rows."""
+    lines = []
+    for i, row in enumerate(rows[:max_rows]):
+        cells = [str(c) if c != "" else "" for c in row[:max_cols]]
+        # Skip rows where every cell is empty
+        if not any(c.strip() for c in cells):
+            continue
+        # Trim trailing empty cells
+        while cells and not cells[-1].strip():
+            cells.pop()
+        lines.append(f"R{i+1}: {cells}")
+    return "\n".join(lines)
+
+
+async def _read_tab(connector, title: str, max_rows: int = 300, max_cols: int = 180) -> list[list]:
+    """Read a sheet tab, returning raw rows. Returns [] if tab not found."""
+    last_col = _col_letter(max_cols)
+    try:
+        raw = await asyncio.to_thread(connector.read_range, f"'{title}'!A1:{last_col}{max_rows}")
+        return raw or []
+    except Exception:
+        return []
+
+
+async def _claude_extract_pnl(client, actuals_text: str, plan_text: str, period: str) -> list[dict]:
+    """Ask Claude to extract P&L line items from raw sheet text, returning structured JSON."""
+    prompt = f"""Below are two raw Google Sheet tabs for Dazos's P&L.
+TAB 1 = ACTUALS (QuickBooks export). TAB 2 = PLAN (2026 budget model).
+
+Each tab has:
+- Row labels in column A (line item names)
+- Monthly amounts across columns (headers in row 1 or nearby, likely Jan–Dec or similar)
+- Some rows are subtotals/totals (bold in the model, identifiable by label like "Total Revenue", "Gross Profit", etc.)
+
+ACTUALS:
+{actuals_text}
+
+PLAN:
+{plan_text}
+
+Extract ALL financial line items. For each, return a JSON array of objects:
+{{
+  "line_type": "revenue" | "cogs" | "opex" | "other",
+  "category": "<exact row label>",
+  "is_subtotal": true | false,
+  "sort_order": <integer, preserving original row order>,
+  "periods": [
+    {{"period_end": "YYYY-MM-DD", "actual": <number or null>, "plan": <number or null>}}
+  ]
+}}
+
+Rules:
+- period_end must be the last day of the month (e.g. Jan 2026 → "2026-01-31")
+- Costs/expenses should be NEGATIVE numbers (as they appear in a P&L)
+- If a column is a total/YTD column rather than a monthly column, skip it
+- Match plan amounts to the same period_end as actuals; if plan has no corresponding month, set plan to null
+- Skip rows that are purely formatting (blank, separator lines, repeating headers)
+- line_type: revenue = top-line revenue; cogs = cost of goods sold / cost of revenue; opex = operating expenses (S&M, R&D, G&A, etc.); other = EBITDA, net income, interest, etc.
+- is_subtotal = true for any row that summarizes other rows (Total Revenue, Gross Profit, Total Opex, EBITDA, Net Income, etc.)
+
+Return ONLY the JSON array, no commentary."""
+
+    response = await client.messages.create(
+        model="claude-opus-4-5",
+        max_tokens=8192,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    text = response.content[0].text if response.content else "[]"
+    # Strip markdown code fences if present
+    text = text.strip()
+    if text.startswith("```"):
+        text = "\n".join(text.split("\n")[1:])
+    if text.endswith("```"):
+        text = "\n".join(text.split("\n")[:-1])
+    return json.loads(text.strip())
+
+
+async def _claude_extract_cf(client, actuals_text: str, plan_text: str) -> list[dict]:
+    """Ask Claude to extract Cash Flow line items."""
+    prompt = f"""Below are two raw Google Sheet tabs for Dazos's Cash Flow Statement.
+TAB 1 = ACTUALS. TAB 2 = PLAN.
+
+ACTUALS:
+{actuals_text}
+
+PLAN:
+{plan_text}
+
+Extract ALL cash flow line items. Return a JSON array:
+{{
+  "section": "operating" | "investing" | "financing",
+  "category": "<exact row label>",
+  "sort_order": <integer>,
+  "periods": [
+    {{"period_end": "YYYY-MM-DD", "actual": <number or null>, "plan": <number or null>}}
+  ]
+}}
+
+Rules:
+- period_end = last day of month (e.g. "2026-01-31")
+- Cash outflows should be NEGATIVE
+- Skip YTD/total columns — monthly periods only
+- Skip blank/separator/header-only rows
+- Assign section based on standard cash flow statement sections
+
+Return ONLY the JSON array."""
+
+    response = await client.messages.create(
+        model="claude-opus-4-5",
+        max_tokens=8192,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    text = (response.content[0].text if response.content else "[]").strip()
+    if text.startswith("```"):
+        text = "\n".join(text.split("\n")[1:])
+    if text.endswith("```"):
+        text = "\n".join(text.split("\n")[:-1])
+    return json.loads(text.strip())
+
+
+async def _claude_extract_bs(client, actuals_text: str, plan_text: str) -> list[dict]:
+    """Ask Claude to extract Balance Sheet line items."""
+    prompt = f"""Below are two raw Google Sheet tabs for Dazos's Balance Sheet.
+TAB 1 = ACTUALS. TAB 2 = PLAN.
+
+ACTUALS:
+{actuals_text}
+
+PLAN:
+{plan_text}
+
+Extract ALL balance sheet line items. Return a JSON array:
+{{
+  "section": "asset" | "liability" | "equity",
+  "category": "<exact row label>",
+  "is_subtotal": true | false,
+  "sort_order": <integer>,
+  "periods": [
+    {{"period_end": "YYYY-MM-DD", "actual": <number or null>, "plan": <number or null>}}
+  ]
+}}
+
+Rules:
+- period_end = last day of month (e.g. "2026-01-31")
+- Assets are positive; liabilities and equity are typically positive in a balance sheet
+- is_subtotal = true for Total Assets, Total Current Liabilities, Total Equity, etc.
+- Skip blank/separator/header-only rows
+
+Return ONLY the JSON array."""
+
+    response = await client.messages.create(
+        model="claude-opus-4-5",
+        max_tokens=8192,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    text = (response.content[0].text if response.content else "[]").strip()
+    if text.startswith("```"):
+        text = "\n".join(text.split("\n")[1:])
+    if text.endswith("```"):
+        text = "\n".join(text.split("\n")[:-1])
+    return json.loads(text.strip())
+
+
+@app.get("/api/financials/sync-status")
+async def get_sync_status(db: AsyncSession = Depends(get_db)):
+    """Return last sync timestamps for each financial statement."""
+    result = {}
+    for stmt in ["pnl", "bs", "cf"]:
+        key = f"{_SYNC_STATUS_KEY_PREFIX}{stmt}"
+        r = await db.execute(
+            select(SheetSnapshot).where(SheetSnapshot.range_name == key)
+            .order_by(SheetSnapshot.as_of.desc()).limit(1)
+        )
+        row = r.scalar_one_or_none()
+        if row and row.data_json:
+            d = json.loads(row.data_json)
+            result[stmt] = {"synced_at": row.as_of.isoformat() if row.as_of else None, **d}
+        else:
+            result[stmt] = None
+    return result
+
+
+@app.post("/api/financials/sync-from-sheet")
+async def sync_financials_from_sheet(
+    statement: str = Query("all", description="pnl | bs | cf | all"),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Read actuals + plan tabs from Google Sheets, use Claude to parse them,
+    and upsert structured data into the financial DB tables.
+    """
+    if not ANTHROPIC_API_KEY:
+        raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY not configured")
+
+    from connectors.google_sheets import GoogleSheetsConnector
+    connector = GoogleSheetsConnector()
+    connector.set_base_path(Path(__file__).resolve().parent)
+    if not connector.is_configured():
+        raise HTTPException(status_code=503, detail="Google Sheets not configured.")
+
+    import anthropic as _anthropic
+    client = _anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+
+    statements = ["pnl", "bs", "cf"] if statement == "all" else [statement]
+    if any(s not in _SHEET_TAB_MAP for s in statements):
+        raise HTTPException(status_code=400, detail=f"Unknown statement. Use: pnl, bs, cf, all")
+
+    results = {}
+
+    for stmt in statements:
+        tabs = _SHEET_TAB_MAP[stmt]
+        try:
+            # Read both tabs in parallel
+            actuals_raw, plan_raw = await asyncio.gather(
+                _read_tab(connector, tabs["actuals"]),
+                _read_tab(connector, tabs["plan"]),
+            )
+
+            if not actuals_raw:
+                results[stmt] = {"ok": False, "error": f"Tab '{tabs['actuals']}' not found or empty"}
+                continue
+
+            actuals_text = _sheet_to_compact_text(actuals_raw)
+            plan_text = _sheet_to_compact_text(plan_raw) if plan_raw else "(no plan data)"
+
+            # Claude extraction
+            if stmt == "pnl":
+                items = await _claude_extract_pnl(client, actuals_text, plan_text, "")
+            elif stmt == "cf":
+                items = await _claude_extract_cf(client, actuals_text, plan_text)
+            else:
+                items = await _claude_extract_bs(client, actuals_text, plan_text)
+
+            if not items:
+                results[stmt] = {"ok": False, "error": "Claude returned no line items — check tab names and data"}
+                continue
+
+            # Collect all period_end dates returned
+            all_periods: set[date] = set()
+            for item in items:
+                for p in item.get("periods", []):
+                    try:
+                        all_periods.add(date.fromisoformat(p["period_end"]))
+                    except Exception:
+                        pass
+
+            # Delete existing rows for those periods then re-insert
+            if stmt == "pnl":
+                for pd_ in all_periods:
+                    await db.execute(delete(PnLLine).where(PnLLine.period_end == pd_))
+                await db.flush()
+                for item in items:
+                    for p in item.get("periods", []):
+                        try:
+                            pd_ = date.fromisoformat(p["period_end"])
+                        except Exception:
+                            continue
+                        db.add(PnLLine(
+                            period_end=pd_,
+                            line_type=item.get("line_type", "other"),
+                            category=item.get("category", ""),
+                            amount=float(p.get("actual") or 0),
+                            plan_amount=float(p["plan"]) if p.get("plan") is not None else None,
+                            is_subtotal=1 if item.get("is_subtotal") else 0,
+                            sort_order=item.get("sort_order", 0),
+                        ))
+
+            elif stmt == "cf":
+                for pd_ in all_periods:
+                    await db.execute(delete(CashFlowLine).where(CashFlowLine.period_end == pd_))
+                await db.flush()
+                for item in items:
+                    for p in item.get("periods", []):
+                        try:
+                            pd_ = date.fromisoformat(p["period_end"])
+                        except Exception:
+                            continue
+                        db.add(CashFlowLine(
+                            period_end=pd_,
+                            section=item.get("section", "operating"),
+                            category=item.get("category", ""),
+                            amount=float(p.get("actual") or 0),
+                            plan_amount=float(p["plan"]) if p.get("plan") is not None else None,
+                            sort_order=item.get("sort_order", 0),
+                        ))
+
+            elif stmt == "bs":
+                for pd_ in all_periods:
+                    await db.execute(delete(BalanceSheetLine).where(BalanceSheetLine.period_end == pd_))
+                await db.flush()
+                for item in items:
+                    for p in item.get("periods", []):
+                        try:
+                            pd_ = date.fromisoformat(p["period_end"])
+                        except Exception:
+                            continue
+                        db.add(BalanceSheetLine(
+                            period_end=pd_,
+                            section=item.get("section", "asset"),
+                            category=item.get("category", ""),
+                            amount=float(p.get("actual") or 0),
+                            plan_amount=float(p["plan"]) if p.get("plan") is not None else None,
+                            is_subtotal=1 if item.get("is_subtotal") else 0,
+                            sort_order=item.get("sort_order", 0),
+                        ))
+
+            await db.commit()
+
+            # Save sync status
+            status_key = f"{_SYNC_STATUS_KEY_PREFIX}{stmt}"
+            existing_status = await db.execute(
+                select(SheetSnapshot).where(SheetSnapshot.range_name == status_key).limit(1)
+            )
+            status_row = existing_status.scalar_one_or_none()
+            status_data = json.dumps({
+                "rows_synced": len(items),
+                "periods_synced": len(all_periods),
+                "actuals_tab": tabs["actuals"],
+                "plan_tab": tabs["plan"],
+            })
+            if status_row:
+                status_row.data_json = status_data
+            else:
+                db.add(SheetSnapshot(source="financials_sync", range_name=status_key, data_json=status_data))
+            await db.commit()
+
+            results[stmt] = {"ok": True, "rows_synced": len(items), "periods_synced": len(all_periods)}
+
+        except json.JSONDecodeError as e:
+            results[stmt] = {"ok": False, "error": f"Claude returned invalid JSON: {e}"}
+        except Exception as e:
+            results[stmt] = {"ok": False, "error": str(e)}
+            try:
+                await db.rollback()
+            except Exception:
+                pass
+
+    return {"results": results}
+
+
+@app.post("/api/financials/monthly-close")
+async def trigger_monthly_close(
+    body: dict,
+    db: AsyncSession = Depends(get_db),
+):
+    """Trigger Claude to generate a monthly close variance analysis for a given period."""
+    if not ANTHROPIC_API_KEY:
+        raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY not configured")
+
+    period_str = body.get("period_end")
+    if not period_str:
+        raise HTTPException(status_code=400, detail="period_end required (YYYY-MM-DD)")
+    try:
+        period = date.fromisoformat(period_str)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid period_end format")
+
+    # Upsert FinancialAnalysis row
+    existing_r = await db.execute(
+        select(FinancialAnalysis).where(FinancialAnalysis.period_end == period)
+    )
+    analysis = existing_r.scalar_one_or_none()
+    if analysis is None:
+        analysis = FinancialAnalysis(period_end=period, status="running")
+        db.add(analysis)
+    else:
+        analysis.status = "running"
+        analysis.error_msg = None
+    await db.commit()
+    await db.refresh(analysis)
+
+    try:
+        import anthropic as _anthropic
+        client = _anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+
+        # Gather P&L data for the period and YTD
+        fiscal_year_start = date(period.year, 1, 1)
+        pnl_r = await db.execute(
+            select(PnLLine)
+            .where(PnLLine.period_end >= fiscal_year_start)
+            .where(PnLLine.period_end <= period)
+            .order_by(PnLLine.period_end, PnLLine.sort_order)
+        )
+        pnl_rows = pnl_r.scalars().all()
+
+        cf_r = await db.execute(
+            select(CashFlowLine)
+            .where(CashFlowLine.period_end >= fiscal_year_start)
+            .where(CashFlowLine.period_end <= period)
+            .order_by(CashFlowLine.period_end, CashFlowLine.sort_order)
+        )
+        cf_rows = cf_r.scalars().all()
+
+        bs_r = await db.execute(
+            select(BalanceSheetLine).where(BalanceSheetLine.period_end == period)
+            .order_by(BalanceSheetLine.sort_order)
+        )
+        bs_rows = bs_r.scalars().all()
+
+        # Format data for Claude
+        def fmt_pnl(rows, label="P&L"):
+            periods = sorted(set(r.period_end for r in rows))
+            month_period = period
+            ytd_categories: dict = {}
+            month_categories: dict = {}
+            all_cats = []
+            seen: set = set()
+            for r in rows:
+                if r.category not in seen:
+                    seen.add(r.category)
+                    all_cats.append(r.category)
+                ytd_categories.setdefault(r.category, {"actual": 0, "plan": 0})
+                ytd_categories[r.category]["actual"] += r.amount
+                if r.plan_amount is not None:
+                    ytd_categories[r.category]["plan"] += r.plan_amount
+                if r.period_end == month_period:
+                    month_categories[r.category] = {"actual": r.amount, "plan": r.plan_amount, "line_type": r.line_type, "is_subtotal": r.is_subtotal}
+
+            out = [f"\n### {label} — {month_period.strftime('%B %Y')}\n"]
+            out.append(f"{'Category':<35} {'Month Actual':>14} {'Month Plan':>12} {'Month Var':>12} {'YTD Actual':>12} {'YTD Plan':>10} {'YTD Var':>10}")
+            out.append("-" * 110)
+            for cat in all_cats:
+                m = month_categories.get(cat, {})
+                m_actual = m.get("actual")
+                m_plan = m.get("plan")
+                ytd = ytd_categories.get(cat, {})
+                y_actual = ytd.get("actual")
+                y_plan = ytd.get("plan") if ytd.get("plan") else None
+                m_var = (m_actual - m_plan) if m_actual is not None and m_plan is not None else None
+                y_var = (y_actual - y_plan) if y_actual is not None and y_plan is not None else None
+                out.append(
+                    f"{cat:<35} "
+                    f"{('$' + f'{m_actual:,.0f}') if m_actual is not None else '—':>14} "
+                    f"{('$' + f'{m_plan:,.0f}') if m_plan is not None else '—':>12} "
+                    f"{('$' + f'{m_var:,.0f}') if m_var is not None else '—':>12} "
+                    f"{('$' + f'{y_actual:,.0f}') if y_actual is not None else '—':>12} "
+                    f"{('$' + f'{y_plan:,.0f}') if y_plan is not None else '—':>10} "
+                    f"{('$' + f'{y_var:,.0f}') if y_var is not None else '—':>10}"
+                )
+            return "\n".join(out)
+
+        def fmt_cf(rows):
+            out = [f"\n### Cash Flow — {period.strftime('%B %Y')}\n"]
+            month_rows = [r for r in rows if r.period_end == period]
+            for r in month_rows:
+                var = (r.amount - r.plan_amount) if r.plan_amount is not None else None
+                out.append(f"- [{r.section}] {r.category}: actual ${r.amount:,.0f}" +
+                           (f" | plan ${r.plan_amount:,.0f} | var ${var:,.0f}" if var is not None else ""))
+            return "\n".join(out)
+
+        def fmt_bs(rows):
+            out = [f"\n### Balance Sheet — {period.strftime('%B %Y')}\n"]
+            for r in rows:
+                var = (r.amount - r.plan_amount) if r.plan_amount is not None else None
+                out.append(f"- [{r.section}] {r.category}: actual ${r.amount:,.0f}" +
+                           (f" | plan ${r.plan_amount:,.0f} | var ${var:,.0f}" if var is not None else ""))
+            return "\n".join(out)
+
+        data_block = fmt_pnl(pnl_rows) + "\n" + fmt_cf(cf_rows) + "\n" + fmt_bs(bs_rows)
+
+        pnl_prompt = f"""You are generating the P&L variance analysis section for the {period.strftime('%B %Y')} monthly close report.
+
+{data_block}
+
+Write a concise P&L variance analysis (3–5 paragraphs) covering:
+1. Revenue: month and YTD performance vs plan, key drivers
+2. Gross margin: trend and drivers
+3. Opex: major variances by category, flag anything >5% from plan
+4. Net/EBITDA: month and YTD position vs plan
+Lead with the headline number. Be specific about amounts. Include a "So what" with one recommended action."""
+
+        cf_prompt = f"""You are generating the Cash Flow variance analysis for the {period.strftime('%B %Y')} monthly close.
+
+{data_block}
+
+Write a concise cash flow analysis (2–3 paragraphs) covering:
+1. Operating cash flow: actual vs plan, working capital movements
+2. Investing and financing activities
+3. Net cash change and ending position
+Flag anything materially off-plan. Include a "So what" with one recommended action."""
+
+        bs_prompt = f"""You are generating the Balance Sheet commentary for the {period.strftime('%B %Y')} monthly close.
+
+{data_block}
+
+Write a concise balance sheet analysis (2–3 paragraphs) covering:
+1. Key asset movements (cash, AR, other)
+2. Liabilities and working capital position
+3. Any items materially different from plan
+Be precise with numbers."""
+
+        exec_prompt = f"""You are generating the executive summary for the {period.strftime('%B %Y')} monthly close.
+
+{data_block}
+
+Write 5–7 concise bullet points (executive-ready) covering the most important financial developments this month:
+- Lead each bullet with the number
+- Flag risks and opportunities explicitly
+- Include one forward-looking action item
+Format as a markdown bullet list. No headers, no preamble."""
+
+        async def ask_claude(prompt: str) -> str:
+            msg = await client.messages.create(
+                model="claude-opus-4-5",
+                max_tokens=1024,
+                system=_FPA_SYSTEM_PROMPT,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            return msg.content[0].text if msg.content else ""
+
+        pnl_analysis, cf_analysis, bs_analysis, exec_summary = await asyncio.gather(
+            ask_claude(pnl_prompt),
+            ask_claude(cf_prompt),
+            ask_claude(bs_prompt),
+            ask_claude(exec_prompt),
+        )
+
+        analysis.pnl_analysis = pnl_analysis
+        analysis.cashflow_analysis = cf_analysis
+        analysis.balance_sheet_analysis = bs_analysis
+        analysis.executive_summary = exec_summary
+        analysis.status = "done"
+        await db.commit()
+        return {"ok": True, "period_end": str(period)}
+
+    except Exception as e:
+        analysis.status = "error"
+        analysis.error_msg = str(e)
+        await db.commit()
+        raise HTTPException(status_code=500, detail=f"Analysis failed: {e}")
+
+
+@app.post("/api/financials/fpa-chat", response_model=FPAChatResponse)
+async def fpa_chat(body: FPAChatRequest, db: AsyncSession = Depends(get_db)):
+    """Chat with the FP&A analyst agent (Claude)."""
+    if not ANTHROPIC_API_KEY:
+        raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY not configured — add it to backend/.env")
+
+    try:
+        import anthropic as _anthropic
+        client = _anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+    except ImportError:
+        raise HTTPException(status_code=503, detail="anthropic package not installed")
+
+    context = await _build_fpa_context(db)
+    system = _FPA_SYSTEM_PROMPT + "\n\n" + context
+
+    messages = [{"role": m["role"], "content": m["content"]} for m in body.messages]
+    if not messages:
+        raise HTTPException(status_code=400, detail="messages required")
+
+    response = await client.messages.create(
+        model="claude-opus-4-5",
+        max_tokens=2048,
+        system=system,
+        messages=messages,
+    )
+    answer = response.content[0].text if response.content else ""
+    return FPAChatResponse(answer=answer)
 
 
 @app.post("/api/copilot", response_model=CopilotResponse)
@@ -4961,6 +6061,401 @@ def _fmt_money_export(n: float):
     except (TypeError, ValueError):
         val = 0.0
     return f"${val:,.2f}"
+
+
+# ── Churn Analysis ────────────────────────────────────────────────────────────
+
+_CHURN_REPORT_ID = "00OVq00000Bg05JMAR"
+
+
+def _month_key_to_period(month_key: str) -> Optional[date]:
+    """Convert 'YYYY-MM' to last day of that month as a date."""
+    try:
+        y, m = int(month_key[:4]), int(month_key[5:7])
+        last_day = calendar.monthrange(y, m)[1]
+        return date(y, m, last_day)
+    except Exception:
+        return None
+
+
+@app.get("/api/churn/records")
+async def get_churn_records(db: AsyncSession = Depends(get_db)):
+    """Return all churned account records with SF attributes."""
+    r = await db.execute(
+        select(ChurnRecord).order_by(ChurnRecord.churn_month.desc(), ChurnRecord.churn_arr.desc())
+    )
+    records = r.scalars().all()
+    out = []
+    for rec in records:
+        attrs = json.loads(rec.sf_attributes_json) if rec.sf_attributes_json else {}
+        out.append({
+            "id": rec.id,
+            "account_name": rec.account_name,
+            "sf_account_id": rec.sf_account_id,
+            "churn_month": rec.churn_month,
+            "churn_arr": rec.churn_arr,
+            "tenure_months": rec.tenure_months,
+            "first_arr_month": rec.first_arr_month,
+            "industry": rec.industry,
+            "segment": rec.segment,
+            "region": rec.region,
+            "account_type": rec.account_type,
+            "churn_reason": rec.churn_reason,
+            "health_score": rec.health_score,
+            "synced_at": rec.synced_at.isoformat() if rec.synced_at else None,
+            "sf_attributes": attrs,
+        })
+    return out
+
+
+@app.get("/api/churn/observations")
+async def get_churn_observations(db: AsyncSession = Depends(get_db)):
+    """Return the latest AI-generated churn observations."""
+    r = await db.execute(
+        select(ChurnObservations).order_by(ChurnObservations.generated_at.desc()).limit(1)
+    )
+    obs = r.scalar_one_or_none()
+    if not obs:
+        return {"observations": [], "summary": None, "patterns": {}, "total_churned": 0, "total_churn_arr": 0, "generated_at": None}
+    return {
+        "observations": json.loads(obs.observations_json) if obs.observations_json else [],
+        "summary": obs.summary,
+        "patterns": json.loads(obs.patterns_json) if obs.patterns_json else {},
+        "total_churned": obs.total_churned,
+        "total_churn_arr": obs.total_churn_arr,
+        "generated_at": obs.generated_at.isoformat() if obs.generated_at else None,
+    }
+
+
+@app.get("/api/churn/summary")
+async def get_churn_summary(db: AsyncSession = Depends(get_db)):
+    """Return churn summary stats and pattern breakdowns from the stored records."""
+    r = await db.execute(select(ChurnRecord).order_by(ChurnRecord.churn_month.desc()))
+    records = r.scalars().all()
+    if not records:
+        return {"total": 0, "total_arr": 0, "synced_at": None, "by_industry": {}, "by_segment": {}, "by_tenure_bucket": {}, "by_arr_bucket": {}, "by_month": {}}
+
+    synced_at = max((rec.synced_at for rec in records if rec.synced_at), default=None)
+
+    by_industry: dict[str, dict] = {}
+    by_segment: dict[str, dict] = {}
+    by_tenure: dict[str, dict] = {}
+    by_arr: dict[str, dict] = {}
+    by_month: dict[str, dict] = {}
+
+    def _add(bucket: dict, key: str, arr: float):
+        key = key or "Unknown"
+        if key not in bucket:
+            bucket[key] = {"count": 0, "arr": 0.0}
+        bucket[key]["count"] += 1
+        bucket[key]["arr"] = round(bucket[key]["arr"] + arr, 2)
+
+    for rec in records:
+        arr = rec.churn_arr or 0
+        _add(by_industry, rec.industry or "Unknown", arr)
+        _add(by_segment, rec.segment or "Unknown", arr)
+        _add(by_month, rec.churn_month or "Unknown", arr)
+
+        # Tenure buckets
+        t = rec.tenure_months
+        if t is None:
+            tbkt = "Unknown"
+        elif t < 6:
+            tbkt = "<6 months"
+        elif t < 12:
+            tbkt = "6–12 months"
+        elif t < 24:
+            tbkt = "1–2 years"
+        else:
+            tbkt = "2+ years"
+        _add(by_tenure, tbkt, arr)
+
+        # ARR size buckets
+        if arr < 10_000:
+            abkt = "<$10K"
+        elif arr < 25_000:
+            abkt = "$10–25K"
+        elif arr < 50_000:
+            abkt = "$25–50K"
+        elif arr < 100_000:
+            abkt = "$50–100K"
+        else:
+            abkt = "$100K+"
+        _add(by_arr, abkt, arr)
+
+    total_arr = sum(rec.churn_arr or 0 for rec in records)
+    return {
+        "total": len(records),
+        "total_arr": round(total_arr, 2),
+        "synced_at": synced_at.isoformat() if synced_at else None,
+        "by_industry": dict(sorted(by_industry.items(), key=lambda x: -x[1]["arr"])),
+        "by_segment": dict(sorted(by_segment.items(), key=lambda x: -x[1]["arr"])),
+        "by_tenure_bucket": by_tenure,
+        "by_arr_bucket": by_arr,
+        "by_month": dict(sorted(by_month.items())),
+    }
+
+
+@app.post("/api/churn/sync")
+async def sync_churn_data(db: AsyncSession = Depends(get_db)):
+    """
+    1. Identify churned accounts from MonthlyArrSnapshot (ARR → 0).
+    2. Fetch the Salesforce churn report for account attributes.
+    3. Join by account name, upsert ChurnRecord rows.
+    """
+    from connectors.salesforce import SalesforceConnector
+
+    connector = SalesforceConnector()
+    if not connector.is_configured():
+        raise HTTPException(status_code=503, detail="Salesforce not configured.")
+
+    # ── Step 1: build full ARR history and identify churned accounts ──────────
+    # Use _build_arr_history_data directly — it merges Google Sheet + Salesforce
+    # and includes all months (with zeros) so we can detect when ARR dropped to 0.
+    try:
+        history = await _build_arr_history_data(db)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not build ARR history: {e}")
+
+    history_rows = history.get("rows", [])
+    all_months = history.get("month_columns", [])
+
+    if not history_rows:
+        return {
+            "ok": False,
+            "churned_found": 0,
+            "sf_rows": 0,
+            "message": (
+                "No ARR history data found. "
+                "Please sync your Google Sheet (ARR_Schedule tab) and/or Salesforce data first, "
+                "then try again. You can do this from the Admin page → Refresh app data."
+            ),
+        }
+
+    # Note: arr_by_month only contains non-zero months (zeros are stripped when stored).
+    # Churn is detected by: account had ARR > 0 in the past but their last active month
+    # is before the current month, meaning they are no longer an active customer.
+    today_mk = datetime.now(EST).strftime("%Y-%m")
+    # Use the most recent month in the history as the "data as-of" marker
+    data_as_of = max(all_months) if all_months else today_mk
+    churned: list[dict] = []
+
+    for row in history_rows:
+        account_name = row.get("account_name", "")
+        if not account_name:
+            continue
+        arr_by_month: dict[str, float] = row.get("arr_by_month", {})
+        active_months = sorted(m for m, v in arr_by_month.items() if (v or 0) > 0)
+        if not active_months:
+            continue
+
+        first_arr_month = active_months[0]
+        last_arr_month = active_months[-1]
+
+        # An account has churned if its last ARR month is before the latest data period.
+        # We allow a 1-month lag (since ARR schedule may not be 100% up to date).
+        if last_arr_month >= _mk_offset(data_as_of, -1):
+            continue  # still active
+
+        churn_month = _mk_offset(last_arr_month, 1)  # first month with $0 ARR
+        churn_arr = arr_by_month.get(last_arr_month, 0.0)
+
+        tenure = None
+        try:
+            fy, fm = int(first_arr_month[:4]), int(first_arr_month[5:7])
+            cy, cm = int(churn_month[:4]), int(churn_month[5:7])
+            tenure = (cy - fy) * 12 + (cm - fm)
+        except Exception:
+            pass
+
+        churned.append({
+            "account_name": account_name,
+            "churn_month": churn_month,
+            "churn_arr": churn_arr,
+            "first_arr_month": first_arr_month,
+            "tenure_months": tenure,
+        })
+
+    if not churned:
+        return {
+            "ok": True,
+            "churned_found": 0,
+            "sf_rows": 0,
+            "message": (
+                f"No churned accounts identified from {len(history_rows)} accounts in ARR history "
+                f"({len(all_months)} months). All accounts appear to still be active."
+            ),
+        }
+
+    # ── Step 2: fetch Salesforce report ──────────────────────────────────────
+    sf_rows_by_name: dict[str, dict] = {}
+    sf_error = None
+    try:
+        report_result = await asyncio.to_thread(connector.run_report, _CHURN_REPORT_ID)
+        sf_rows = connector.extract_report_rows(report_result)
+        # Index by Account Name (try several common column names)
+        for row in sf_rows:
+            name_key = next((k for k in row if "account" in k.lower() and "name" in k.lower()), None) or next((k for k in row if "name" in k.lower()), None)
+            if name_key and row.get(name_key):
+                sf_rows_by_name[str(row[name_key]).strip().lower()] = row
+    except Exception as e:
+        sf_error = str(e)
+
+    # ── Step 3: upsert ChurnRecord rows ──────────────────────────────────────
+    # Clear existing records
+    await db.execute(delete(ChurnRecord))
+    await db.flush()
+
+    def _extract(row: dict, *keys: str) -> Optional[str]:
+        for k in keys:
+            for col, val in row.items():
+                if col.lower().replace(" ", "_") == k.lower().replace(" ", "_") or k.lower() in col.lower():
+                    return str(val).strip() if val else None
+        return None
+
+    inserted = 0
+    for c in churned:
+        sf_row = sf_rows_by_name.get(c["account_name"].strip().lower(), {})
+        db.add(ChurnRecord(
+            account_name=c["account_name"],
+            churn_month=c["churn_month"],
+            churn_arr=c["churn_arr"],
+            first_arr_month=c["first_arr_month"],
+            tenure_months=c["tenure_months"],
+            sf_attributes_json=json.dumps(sf_row) if sf_row else None,
+            industry=_extract(sf_row, "industry", "vertical"),
+            segment=_extract(sf_row, "segment", "tier", "account_tier"),
+            region=_extract(sf_row, "region", "territory", "state"),
+            account_type=_extract(sf_row, "type", "account_type"),
+            churn_reason=_extract(sf_row, "churn_reason", "lost_reason", "cancellation_reason", "reason"),
+            health_score=None,
+        ))
+        inserted += 1
+
+    await db.commit()
+
+    return {
+        "ok": True,
+        "churned_found": inserted,
+        "sf_rows": len(sf_rows_by_name),
+        "sf_error": sf_error,
+        "message": f"Synced {inserted} churned accounts." + (f" SF report error: {sf_error}" if sf_error else ""),
+    }
+
+
+@app.post("/api/churn/ai-analyze")
+async def churn_ai_analyze(db: AsyncSession = Depends(get_db)):
+    """Use Claude to analyze churn patterns and generate observations."""
+    if not ANTHROPIC_API_KEY:
+        raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY not configured")
+
+    r = await db.execute(
+        select(ChurnRecord).order_by(ChurnRecord.churn_month.desc())
+    )
+    records = r.scalars().all()
+    if not records:
+        raise HTTPException(status_code=400, detail="No churn records. Run sync first.")
+
+    # Build a rich context block for Claude
+    total_arr = sum(rec.churn_arr or 0 for rec in records)
+    context_lines = [
+        f"Total churned accounts: {len(records)}",
+        f"Total churn ARR: ${total_arr:,.0f}",
+        "",
+        "Churned account details (sorted by ARR lost, most recent first):",
+        "Account | Churn Month | ARR Lost | Tenure (mo) | Industry | Segment | Region | Type | Reason | SF Attributes",
+        "---",
+    ]
+    for rec in sorted(records, key=lambda r: (r.churn_month or "", -(r.churn_arr or 0)), reverse=True)[:80]:
+        attrs = json.loads(rec.sf_attributes_json) if rec.sf_attributes_json else {}
+        # Include all SF attributes as key=value pairs
+        attr_str = " | ".join(f"{k}: {v}" for k, v in attrs.items() if v and str(v).strip() and v != "None")
+        context_lines.append(
+            f"{rec.account_name} | {rec.churn_month} | ${rec.churn_arr:,.0f} | "
+            f"{rec.tenure_months or '?'} | {rec.industry or '?'} | {rec.segment or '?'} | "
+            f"{rec.region or '?'} | {rec.account_type or '?'} | {rec.churn_reason or '?'} | {attr_str}"
+        )
+
+    prompt = f"""You are analyzing churn data for Dazos, a ~$7M ARR behavioral health CRM SaaS company.
+Below is the full list of churned/cancelled accounts from the ARR schedule, enriched with Salesforce attributes.
+
+{chr(10).join(context_lines)}
+
+Produce a comprehensive churn analysis with these sections:
+
+## Executive Summary
+2–3 sentences: headline churn picture, most important driver, what it means for the business.
+
+## Key Patterns
+Identify the 4–6 most statistically significant patterns in this churn data. For each pattern:
+- Lead with the data point (e.g. "67% of churn ARR came from accounts with < 12 months tenure")
+- Explain the likely root cause
+- Assign a risk level: High / Medium / Low
+
+## Breakdown by Dimension
+For each dimension where you see a meaningful signal, provide a ranked table:
+- By industry/vertical
+- By segment or account size
+- By tenure cohort
+- By churn reason (if available)
+- By time period (any acceleration or deceleration?)
+
+## Early Warning Indicators
+Based on the patterns, what are the 3–5 leading indicators that predict churn risk? Frame as: "Accounts that [characteristic] are X× more likely to churn."
+
+## Recommended Actions
+3–5 specific, prioritized actions for the CS and leadership team. Be concrete — name the segment, the intervention, and the expected impact.
+
+Be specific with numbers throughout. If data is limited or patterns are unclear, say so explicitly."""
+
+    try:
+        import anthropic as _anthropic
+        client = _anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+        response = await client.messages.create(
+            model="claude-opus-4-5",
+            max_tokens=4096,
+            system=_FPA_SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        analysis_text = response.content[0].text if response.content else ""
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Claude error: {e}")
+
+    # Parse into bullet observations (extract bullet lines for the observations list)
+    obs_bullets = [
+        line.lstrip("•-– ").strip()
+        for line in analysis_text.split("\n")
+        if line.strip().startswith(("-", "•", "–")) and len(line.strip()) > 10
+    ][:15]
+
+    # Build pattern summary for quick stats
+    summary_r = await db.execute(select(ChurnRecord))
+    all_recs = summary_r.scalars().all()
+    by_industry: dict[str, float] = {}
+    by_segment: dict[str, float] = {}
+    for rec in all_recs:
+        k = rec.industry or "Unknown"
+        by_industry[k] = by_industry.get(k, 0) + (rec.churn_arr or 0)
+        k2 = rec.segment or "Unknown"
+        by_segment[k2] = by_segment.get(k2, 0) + (rec.churn_arr or 0)
+
+    patterns = {
+        "by_industry": dict(sorted(by_industry.items(), key=lambda x: -x[1])[:8]),
+        "by_segment": dict(sorted(by_segment.items(), key=lambda x: -x[1])[:6]),
+    }
+
+    # Save
+    await db.execute(delete(ChurnObservations))
+    db.add(ChurnObservations(
+        observations_json=json.dumps(obs_bullets),
+        summary=analysis_text[:600],  # first ~600 chars as preview
+        patterns_json=json.dumps(patterns),
+        total_churned=len(records),
+        total_churn_arr=total_arr,
+    ))
+    await db.commit()
+
+    return {"ok": True, "observations": len(obs_bullets), "analysis_length": len(analysis_text)}
 
 
 @app.get("/api/salesforce/eod-snapshots/{snapshot_date}")

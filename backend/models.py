@@ -32,7 +32,9 @@ class PnLLine(Base):
     line_type = Column(String(32), nullable=False)  # revenue, cogs, opex, other
     category = Column(String(128), nullable=False)
     amount = Column(Float, default=0)
+    plan_amount = Column(Float, default=None)  # budget/plan amount for variance analysis
     is_subtotal = Column(Integer, default=0)
+    sort_order = Column(Integer, default=0)
 
 
 class CashFlowLine(Base):
@@ -42,6 +44,34 @@ class CashFlowLine(Base):
     section = Column(String(32), nullable=False)  # operating, investing, financing
     category = Column(String(128), nullable=False)
     amount = Column(Float, default=0)
+    plan_amount = Column(Float, default=None)
+    sort_order = Column(Integer, default=0)
+
+
+class BalanceSheetLine(Base):
+    __tablename__ = "balance_sheet_lines"
+    id = Column(Integer, primary_key=True)
+    period_end = Column(Date, nullable=False)
+    section = Column(String(32), nullable=False)  # asset, liability, equity
+    category = Column(String(128), nullable=False)
+    amount = Column(Float, default=0)
+    plan_amount = Column(Float, default=None)
+    is_subtotal = Column(Integer, default=0)
+    sort_order = Column(Integer, default=0)
+
+
+class FinancialAnalysis(Base):
+    """Claude-generated monthly close variance analysis."""
+    __tablename__ = "financial_analyses"
+    id = Column(Integer, primary_key=True)
+    period_end = Column(Date, nullable=False, unique=True)
+    generated_at = Column(DateTime, server_default=func.now())
+    pnl_analysis = Column(Text)       # markdown from Claude
+    cashflow_analysis = Column(Text)
+    balance_sheet_analysis = Column(Text)
+    executive_summary = Column(Text)  # short bullets for the exec team
+    status = Column(String(32), default="pending")  # pending, running, done, error
+    error_msg = Column(Text)
 
 
 class BudgetLine(Base):
@@ -355,6 +385,39 @@ class DealAIScore(Base):
     reasoning = Column(Text, nullable=True)                       # 1–2 sentence explanation from LLM
     model_used = Column(String(64), nullable=True)                # e.g. gpt-4o-mini
     input_snapshot_json = Column(Text, nullable=True)            # Context sent to LLM (auditability)
+
+
+class ChurnRecord(Base):
+    """One churned/cancelled account — identified from ARR schedule, enriched with Salesforce report attributes."""
+    __tablename__ = "churn_records"
+    id = Column(Integer, primary_key=True)
+    account_name = Column(String(255), nullable=False, index=True)
+    sf_account_id = Column(String(18), nullable=True, index=True)
+    churn_month = Column(String(7), nullable=False)          # YYYY-MM of the first month ARR hit 0
+    churn_arr = Column(Float, default=0)                     # ARR lost (positive number)
+    tenure_months = Column(Integer, nullable=True)           # Months as a customer before churn
+    first_arr_month = Column(String(7), nullable=True)       # YYYY-MM of first ARR
+    sf_attributes_json = Column(Text, nullable=True)         # Raw JSON from Salesforce report row
+    # Commonly used attributes extracted for quick querying
+    industry = Column(String(128), nullable=True)
+    segment = Column(String(64), nullable=True)
+    region = Column(String(64), nullable=True)
+    account_type = Column(String(64), nullable=True)
+    churn_reason = Column(String(255), nullable=True)
+    health_score = Column(Float, nullable=True)
+    synced_at = Column(DateTime, server_default=func.now())
+
+
+class ChurnObservations(Base):
+    """AI-generated churn pattern observations, updated after each sync."""
+    __tablename__ = "churn_observations"
+    id = Column(Integer, primary_key=True)
+    generated_at = Column(DateTime, server_default=func.now())
+    observations_json = Column(Text, nullable=True)   # JSON array of bullet strings
+    summary = Column(Text, nullable=True)              # 1-paragraph narrative
+    patterns_json = Column(Text, nullable=True)        # JSON: {by_industry, by_segment, by_tenure, by_arr_size}
+    total_churned = Column(Integer, default=0)
+    total_churn_arr = Column(Float, default=0)
 
 
 class OpportunityLineItem(Base):

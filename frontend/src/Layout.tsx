@@ -40,6 +40,7 @@ const nav: NavItem[] = [
     children: [
       { to: '/analytics', label: 'Product penetration' },
       { to: '/analytics/crm-seats', label: 'CRM seat pricing' },
+      { to: '/analytics/churn', label: 'Churn analysis' },
     ],
   },
   {
@@ -48,7 +49,17 @@ const nav: NavItem[] = [
       { to: '/products-purchased', label: 'Products purchased' },
     ],
   },
-  { to: '/financials', label: 'Financials' },
+  {
+    label: 'Financials',
+    children: [
+      { to: '/financials/analysis', label: 'Monthly Close' },
+      { to: '/financials/pnl', label: 'P&L' },
+      { to: '/financials/cash-flow', label: 'Cash Flow' },
+      { to: '/financials/balance-sheet', label: 'Balance Sheet' },
+      { to: '/financials/fpa-chat', label: 'FP&A Agent' },
+      { to: '/financials/data-sync', label: 'Data Sync' },
+    ],
+  },
   { to: '/admin', label: 'Admin' },
 ]
 

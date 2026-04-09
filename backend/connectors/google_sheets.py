@@ -173,6 +173,28 @@ class GoogleSheetsConnector:
         values, api_range = self._fetch_values(range_a1, spreadsheet_id)
         return self._align_values_to_requested_top_row(values, api_range)
 
+    def list_sheets(self, spreadsheet_id: str | None = None) -> list[dict]:
+        """Return a list of all tabs: [{title, sheetId, rowCount, columnCount}]."""
+        sid = spreadsheet_id or self.sheet_id
+        if not sid:
+            raise ValueError("spreadsheet_id or GOOGLE_SHEET_ID is required")
+        service = self._get_service()
+        meta = service.spreadsheets().get(
+            spreadsheetId=sid,
+            fields="sheets(properties(sheetId,title,gridProperties))",
+        ).execute()
+        result = []
+        for sh in meta.get("sheets") or []:
+            props = sh.get("properties") or {}
+            grid = props.get("gridProperties") or {}
+            result.append({
+                "title": props.get("title", ""),
+                "sheetId": props.get("sheetId"),
+                "rowCount": grid.get("rowCount", 0),
+                "columnCount": grid.get("columnCount", 0),
+            })
+        return result
+
     def get_sheet_gid_by_title(
         self,
         sheet_title: str,

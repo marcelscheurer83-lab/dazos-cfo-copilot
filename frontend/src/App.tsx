@@ -12,11 +12,18 @@ import ARRBridge from './views/ARRBridge'
 import ForecastView from './views/ForecastView'
 import Analytics from './views/Analytics'
 import AnalyticsCRMSeats from './views/AnalyticsCRMSeats'
+import ChurnAnalysis from './views/ChurnAnalysis'
 import Pipeline from './views/Pipeline'
 import Closed from './views/Closed'
 import Renewals from './views/Renewals'
-import Placeholder from './views/Placeholder'
 import Admin from './views/Admin'
+import FinancialsLayout from './views/FinancialsLayout'
+import PnL from './views/PnL'
+import CashFlow from './views/CashFlow'
+import BalanceSheet from './views/BalanceSheet'
+import FinancialAnalysisView from './views/FinancialAnalysisView'
+import FPAChat from './views/FPAChat'
+import FinancialsDataSync from './views/FinancialsDataSync'
 
 class ErrorBoundary extends Component<{ children: ReactNode }, { error: Error | null; key: number }> {
   state = { error: null as Error | null, key: 0 }
@@ -85,9 +92,18 @@ export default function App() {
         <Route path="go-to-market/forecast" element={<ForecastView />} />
         <Route path="analytics" element={<Analytics />} />
         <Route path="analytics/crm-seats" element={<AnalyticsCRMSeats />} />
+        <Route path="analytics/churn" element={<ChurnAnalysis />} />
         <Route path="arr" element={<Navigate to="/products-purchased" replace />} />
         <Route path="closed-data" element={<Navigate to="/bookings" replace />} />
-        <Route path="financials" element={<Placeholder title="Financials" />} />
+        <Route path="financials" element={<FinancialsLayout />}>
+          <Route index element={<Navigate to="/financials/analysis" replace />} />
+          <Route path="analysis" element={<FinancialAnalysisView />} />
+          <Route path="pnl" element={<PnL />} />
+          <Route path="cash-flow" element={<CashFlow />} />
+          <Route path="balance-sheet" element={<BalanceSheet />} />
+          <Route path="fpa-chat" element={<FPAChat />} />
+          <Route path="data-sync" element={<FinancialsDataSync />} />
+        </Route>
         <Route path="admin" element={<Admin />} />
       </Route>
       <Route path="*" element={<Navigate to="/dashboard" replace />} />

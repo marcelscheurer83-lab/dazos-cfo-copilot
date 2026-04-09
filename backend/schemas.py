@@ -119,7 +119,9 @@ class PnLLineOut(BaseModel):
     line_type: str
     category: str
     amount: float
+    plan_amount: Optional[float] = None
     is_subtotal: bool
+    sort_order: int = 0
 
     class Config:
         from_attributes = True
@@ -130,6 +132,21 @@ class CashFlowLineOut(BaseModel):
     section: str
     category: str
     amount: float
+    plan_amount: Optional[float] = None
+    sort_order: int = 0
+
+    class Config:
+        from_attributes = True
+
+
+class BalanceSheetLineOut(BaseModel):
+    period_end: date
+    section: str
+    category: str
+    amount: float
+    plan_amount: Optional[float] = None
+    is_subtotal: bool
+    sort_order: int = 0
 
     class Config:
         from_attributes = True
@@ -145,6 +162,28 @@ class BudgetVsActualOut(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class FinancialAnalysisOut(BaseModel):
+    id: int
+    period_end: date
+    generated_at: Optional[datetime] = None
+    pnl_analysis: Optional[str] = None
+    cashflow_analysis: Optional[str] = None
+    balance_sheet_analysis: Optional[str] = None
+    executive_summary: Optional[str] = None
+    status: str
+
+    class Config:
+        from_attributes = True
+
+
+class FPAChatRequest(BaseModel):
+    messages: list[dict]  # [{role: "user"|"assistant", content: str}]
+
+
+class FPAChatResponse(BaseModel):
+    answer: str
 
 
 class CopilotRequest(BaseModel):

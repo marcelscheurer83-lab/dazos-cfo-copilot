@@ -1688,30 +1688,166 @@ Format as a markdown bullet list. No headers, no preamble."""
         raise HTTPException(status_code=500, detail=f"Analysis failed: {e}")
 
 
+# ── Chargebee tool (shared between FP&A chat and unified agent chat) ──────────
+
+_CHARGEBEE_TOOL: dict = {
+    "name": "chargebee_query",
+    "description": (
+        "Fetch live data from Chargebee (billing engine). Use this when you need current "
+        "subscription, invoice, customer, or payment/transaction data not already in the context. "
+        "Amounts in invoices/transactions are in cents — divide by 100 for dollars."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "resource": {
+                "type": "string",
+                "enum": ["subscriptions", "invoices", "customers", "transactions"],
+                "description": "Which Chargebee resource to fetch.",
+            },
+            "filters": {
+                "type": "object",
+                "description": (
+                    "Optional filters. Supported keys: "
+                    "status (subscriptions: active/cancelled/non_renewing; "
+                    "invoices: paid/payment_due/not_paid; transactions: success/failure), "
+                    "date_after (YYYY-MM-DD — filters by invoice or transaction date), "
+                    "date_before (YYYY-MM-DD), "
+                    "type (transactions only: payment/refund)."
+                ),
+                "additionalProperties": True,
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Max records to return (default 50, max 100).",
+                "default": 50,
+            },
+        },
+        "required": ["resource"],
+    },
+}
+
+
+async def _execute_chargebee_tool(resource: str, filters: dict | None = None, limit: int = 50) -> str:
+    """Execute a Chargebee resource fetch and return compact text result."""
+    import datetime as _dt
+    from connectors.chargebee import ChargebeeConnector
+
+    connector = ChargebeeConnector()
+    if not connector.is_configured():
+        return "ERROR: Chargebee is not configured (CHARGEBEE_SITE / CHARGEBEE_API_KEY missing)."
+
+    filters = filters or {}
+    limit = min(100, max(1, limit))
+
+    def _to_ts(date_str: str) -> int | None:
+        try:
+            d = _dt.date.fromisoformat(str(date_str))
+            return int(_dt.datetime(d.year, d.month, d.day, tzinfo=_dt.timezone.utc).timestamp())
+        except Exception:
+            return None
+
+    try:
+        status = filters.get("status")
+        date_after = _to_ts(filters["date_after"]) if "date_after" in filters else None
+        date_before = _to_ts(filters["date_before"]) if "date_before" in filters else None
+        txn_type = filters.get("type")
+
+        if resource == "subscriptions":
+            resp = await asyncio.to_thread(connector.list_subscriptions, limit=limit, status=status)
+            items = [item.get("subscription", item) for item in (resp.get("list") or [])]
+        elif resource == "invoices":
+            resp = await asyncio.to_thread(
+                connector.list_invoices,
+                limit=limit,
+                status=status,
+                date_after_ts=date_after,
+                date_before_ts=date_before,
+            )
+            items = [item.get("invoice", item) for item in (resp.get("list") or [])]
+        elif resource == "customers":
+            resp = await asyncio.to_thread(connector.list_customers, limit=limit)
+            items = [item.get("customer", item) for item in (resp.get("list") or [])]
+        elif resource == "transactions":
+            resp = await asyncio.to_thread(
+                connector.list_transactions,
+                limit=limit,
+                type=txn_type,
+                status=status,
+                date_after_ts=date_after,
+                date_before_ts=date_before,
+            )
+            items = [item.get("transaction", item) for item in (resp.get("list") or [])]
+        else:
+            return f"ERROR: Unknown resource '{resource}'. Use: subscriptions, invoices, customers, transactions."
+
+        if not items:
+            return f"0 {resource} returned."
+        result_json = json.dumps(items, default=str, indent=2)
+        if len(result_json) > 20000:
+            result_json = result_json[:20000] + "\n...(truncated)"
+        return f"{len(items)} {resource} returned:\n{result_json}"
+    except Exception as exc:
+        return f"ERROR: {exc}"
+
+
 @app.post("/api/financials/fpa-chat", response_model=FPAChatResponse)
 async def fpa_chat(body: FPAChatRequest, db: AsyncSession = Depends(get_db)):
-    """Chat with the FP&A analyst agent (Claude)."""
+    """Chat with the FP&A analyst agent (Claude). Can query Chargebee live via tool use."""
     if not ANTHROPIC_API_KEY:
         raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY not configured — add it to backend/.env")
-
     if not _ANTHROPIC_AVAILABLE:
         raise HTTPException(status_code=503, detail="anthropic package not installed on server")
 
     client = _anthropic_mod.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
     context = await _build_fpa_context(db)
-    system = _FPA_SYSTEM_PROMPT + "\n\n" + context
+    system = (
+        _FPA_SYSTEM_PROMPT
+        + "\n\n"
+        + context
+        + (
+            "\n\n---\n\n## Live Chargebee Data\n\n"
+            "You have access to a `chargebee_query` tool for live billing data. "
+            "Use it when the pre-loaded context doesn't have the specific subscription, "
+            "invoice, or payment detail needed. Always try context first."
+        )
+    )
 
     messages = [{"role": m["role"], "content": m["content"]} for m in body.messages]
     if not messages:
         raise HTTPException(status_code=400, detail="messages required")
 
-    response = await client.messages.create(
-        model="claude-sonnet-4-5",
-        max_tokens=2048,
-        system=system,
-        messages=messages,
-    )
-    answer = response.content[0].text if response.content else ""
+    answer = ""
+    # Agentic loop — up to 5 rounds
+    for _round in range(5):
+        response = await client.messages.create(
+            model="claude-sonnet-4-5",
+            max_tokens=2048,
+            system=system,
+            tools=[_CHARGEBEE_TOOL],
+            messages=messages,
+        )
+
+        tool_use_blocks = [b for b in response.content if b.type == "tool_use"]
+
+        if not tool_use_blocks or response.stop_reason == "end_turn":
+            text_blocks = [b for b in response.content if b.type == "text"]
+            answer = text_blocks[0].text if text_blocks else answer
+            break
+
+        messages.append({"role": "assistant", "content": response.content})
+
+        tool_results = []
+        for block in tool_use_blocks:
+            resource = block.input.get("resource", "")
+            filters = block.input.get("filters", {})
+            limit = block.input.get("limit", 50)
+            logger.info("FP&A CB query [round %d]: %s filters=%s", _round + 1, resource, filters)
+            result = await _execute_chargebee_tool(resource, filters, limit)
+            tool_results.append({"type": "tool_result", "tool_use_id": block.id, "content": result})
+
+        messages.append({"role": "user", "content": tool_results})
+
     return FPAChatResponse(answer=answer)
 
 
@@ -5510,16 +5646,18 @@ async def post_agent_chat(body: AgentChatRequest, db: AsyncSession = Depends(get
         + "\n\n---\n\n"
         + revops_ctx
         + (
-            "\n\n---\n\n## Live Salesforce Queries\n\n"
-            "You have access to a `salesforce_query` tool that executes live SOQL SELECT queries. "
-            "Always try to answer from the pre-loaded context first. "
-            "Use the tool only when you need data that isn't already provided above, "
-            "such as specific opportunity details, account fields, activity history, or custom fields. "
-            "Prefer targeted queries with a LIMIT clause."
+            "\n\n---\n\n## Live Data Tools\n\n"
+            "You have two live-data tools available:\n"
+            "1. `salesforce_query` — run a SOQL SELECT against Salesforce for opportunity, account, or activity data.\n"
+            "2. `chargebee_query` — fetch subscriptions, invoices, customers, or transactions from Chargebee.\n"
+            "Always answer from the pre-loaded context first. "
+            "Use tools only when the context doesn't have what you need. "
+            "For Salesforce, prefer targeted queries with a LIMIT clause. "
+            "For Chargebee, note that amounts are in cents (÷100 for dollars)."
         )
     )
 
-    # Tool: live SOQL query against Salesforce
+    # Tools: live Salesforce SOQL queries + live Chargebee billing data
     sf_tools = [
         {
             "name": "salesforce_query",
@@ -5541,7 +5679,8 @@ async def post_agent_chat(body: AgentChatRequest, db: AsyncSession = Depends(get
                 },
                 "required": ["soql"],
             },
-        }
+        },
+        _CHARGEBEE_TOOL,
     ]
 
     async def _execute_sf_query(soql: str) -> str:
@@ -5601,9 +5740,18 @@ async def post_agent_chat(body: AgentChatRequest, db: AsyncSession = Depends(get
             # Execute each tool call and collect results
             tool_results = []
             for block in tool_use_blocks:
-                soql = block.input.get("soql", "")
-                logger.info("Agent SF query [round %d]: %s", _round + 1, soql[:200])
-                result = await _execute_sf_query(soql)
+                if block.name == "salesforce_query":
+                    soql = block.input.get("soql", "")
+                    logger.info("Agent SF query [round %d]: %s", _round + 1, soql[:200])
+                    result = await _execute_sf_query(soql)
+                elif block.name == "chargebee_query":
+                    resource = block.input.get("resource", "")
+                    filters = block.input.get("filters", {})
+                    limit = block.input.get("limit", 50)
+                    logger.info("Agent CB query [round %d]: %s filters=%s", _round + 1, resource, filters)
+                    result = await _execute_chargebee_tool(resource, filters, limit)
+                else:
+                    result = f"ERROR: Unknown tool '{block.name}'."
                 tool_results.append(
                     {"type": "tool_result", "tool_use_id": block.id, "content": result}
                 )

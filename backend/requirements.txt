@@ -16,3 +16,5 @@ requests>=2.28.0
 tzdata>=2024.1
 # AI forecast scoring
 openai>=1.12.0
+# FP&A agent and AI analysis
+anthropic>=0.92.0

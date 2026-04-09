@@ -236,3 +236,16 @@ class RenewalsOverviewResponse(BaseModel):
     available_months: list[str]  # YYYY-MM from renewal date (or close date fallback), for filter dropdown
     renewals_chart: list[RenewalsChartMonth]  # ~6 months: 3 prior + current + 2 upcoming; excludes mid-term in stacks
     salesforce_base_url: Optional[str] = None
+
+
+class WeeklyBriefingResponse(BaseModel):
+    week_of: Optional[str] = None
+    generated_at: Optional[str] = None
+    briefing_text: Optional[str] = None
+    model_used: Optional[str] = None
+    error: Optional[str] = None
+
+
+class AgentChatRequest(BaseModel):
+    message: str
+    history: list[dict] = []  # [{"role": "user"|"assistant", "content": str}]

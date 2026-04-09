@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   getDashboardKPI,
   getDashboardBookingsMTD,
@@ -9,6 +9,7 @@ import {
   getDatasetStatus,
   refreshAppDataset,
   getArrBridge,
+  postAgentChat,
   type DashboardKPI,
   type BookingsMTDResponse,
   type BookingsMTDRow,
@@ -20,6 +21,7 @@ import {
   type DatasetStatus,
   type DashboardFixedPeriods,
   type OverviewTargets,
+  type ChatMessage,
 } from '../api'
 
 const DATASET_REFRESH_TIMEOUT_MS = 15 * 60 * 1000
@@ -162,6 +164,12 @@ export default function DashboardCurrentSummary({ title = 'Current Performance' 
   const [nrr12m, setNrr12m] = useState<number | null>(null)
   const [grr12m, setGrr12m] = useState<number | null>(null)
 
+  // Agent chat state
+  const [chatHistory, setChatHistory] = useState<ChatMessage[]>([])
+  const [chatInput, setChatInput] = useState('')
+  const [chatLoading, setChatLoading] = useState(false)
+  const chatEndRef = useRef<HTMLDivElement>(null)
+
   const loadAllDashboardData = useCallback(() => {
     const fixed = dashboardFixedPeriodsForTitle(title)
     const mtdOpts = fixed ? { fixedPeriods: fixed } : undefined
@@ -237,6 +245,28 @@ export default function DashboardCurrentSummary({ title = 'Current Performance' 
   useEffect(() => {
     loadAllDashboardData()
   }, [loadAllDashboardData])
+
+  // Scroll chat to bottom when new messages arrive
+  useEffect(() => {
+    chatEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+  }, [chatHistory])
+
+  const handleChatSend = async () => {
+    const msg = chatInput.trim()
+    if (!msg || chatLoading) return
+    setChatInput('')
+    const newHistory: ChatMessage[] = [...chatHistory, { role: 'user', content: msg }]
+    setChatHistory(newHistory)
+    setChatLoading(true)
+    try {
+      const res = await postAgentChat(msg, chatHistory)
+      setChatHistory([...newHistory, { role: 'assistant', content: res.answer }])
+    } catch (e) {
+      setChatHistory([...newHistory, { role: 'assistant', content: `Error: ${e instanceof Error ? e.message : String(e)}` }])
+    } finally {
+      setChatLoading(false)
+    }
+  }
 
   const handleRefreshAppData = () => {
     setRefreshMessage(null)
@@ -321,7 +351,7 @@ export default function DashboardCurrentSummary({ title = 'Current Performance' 
 
       {/* ── Current Performance: 2-column layout (KPI stats + ARR Bridge left | tables right) ── */}
       {overviewOnly && (
-        <div style={{ display: 'grid', gridTemplateColumns: '45fr 55fr', gap: '1.25rem', width: '100%', alignItems: 'start' }}>
+        <div style={{ display: 'grid', gridTemplateColumns: '45fr 55fr', gap: '1.25rem', width: '100%', alignItems: 'stretch' }}>
 
           {/* LEFT column: KPI stat cards in 3×2 grid + ARR Bridge below */}
           <div style={{ display: 'flex', flexDirection: 'column', gap: '1.25rem' }}>
@@ -409,6 +439,79 @@ export default function DashboardCurrentSummary({ title = 'Current Performance' 
 
               </div>
             )}
+
+          {/* Agent Chat — fills remaining left-column space, never grows beyond it */}
+          {overviewOnly && (
+            <div style={{ ...blockStyle, flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0, overflow: 'hidden' }}>
+              <div style={{ marginBottom: '0.75rem', flexShrink: 0 }}>
+                <p style={{ margin: '0.1rem 0 0', fontSize: '0.95rem', fontWeight: 600, color: 'var(--text)' }}>Ask the agents</p>
+                <p style={{ margin: '0.2rem 0 0', fontSize: '0.78rem', color: 'var(--text-muted)' }}>Ask anything about financial performance, pipeline, renewals, or strategy. FP&A and RevOps agents will answer together.</p>
+              </div>
+
+              {/* Message history — scrolls within available space */}
+              {chatHistory.length > 0 && (
+                <div style={{ flex: '1 1 0', overflowY: 'auto', marginBottom: '0.75rem', display: 'flex', flexDirection: 'column', gap: '0.6rem', minHeight: 0 }}>
+                  {chatHistory.map((msg, i) => (
+                    <div key={i} style={{ display: 'flex', justifyContent: msg.role === 'user' ? 'flex-end' : 'flex-start' }}>
+                      <div style={{
+                        maxWidth: '90%',
+                        padding: '0.55rem 0.85rem',
+                        borderRadius: msg.role === 'user' ? '12px 12px 2px 12px' : '12px 12px 12px 2px',
+                        background: msg.role === 'user' ? '#1e40af' : 'var(--surface-alt, #1e293b)',
+                        border: '1px solid var(--border)',
+                        fontSize: '0.82rem',
+                        color: 'var(--text)',
+                        lineHeight: 1.55,
+                        whiteSpace: 'pre-wrap',
+                        wordBreak: 'break-word',
+                      }}>
+                        {msg.role === 'assistant' && (
+                          <p style={{ margin: '0 0 0.25rem', fontSize: '0.68rem', fontWeight: 600, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Dazos RevOps Agent</p>
+                        )}
+                        {msg.content}
+                      </div>
+                    </div>
+                  ))}
+                  {chatLoading && (
+                    <div style={{ display: 'flex', justifyContent: 'flex-start' }}>
+                      <div style={{ padding: '0.55rem 0.85rem', borderRadius: '12px 12px 12px 2px', background: 'var(--surface-alt, #1e293b)', border: '1px solid var(--border)', fontSize: '0.82rem', color: 'var(--text-muted)' }}>
+                        Thinking…
+                      </div>
+                    </div>
+                  )}
+                  <div ref={chatEndRef} />
+                </div>
+              )}
+
+              {/* Input row — pinned to bottom, never shrinks */}
+              <div style={{ marginTop: 'auto', flexShrink: 0, display: 'flex', gap: '0.5rem', alignItems: 'flex-end' }}>
+                <textarea
+                  value={chatInput}
+                  onChange={(e) => setChatInput(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleChatSend() } }}
+                  placeholder="Ask about ARR, pipeline, renewals, cash… (Enter to send)"
+                  disabled={chatLoading}
+                  rows={2}
+                  style={{ flex: 1, resize: 'none', background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 8, color: 'var(--text)', fontSize: '0.82rem', padding: '0.5rem 0.75rem', outline: 'none', lineHeight: 1.5, minHeight: 52 }}
+                />
+                <button
+                  onClick={handleChatSend}
+                  disabled={chatLoading || !chatInput.trim()}
+                  style={{ padding: '0.5rem 1.1rem', background: '#1e40af', border: 'none', borderRadius: 8, color: '#fff', fontSize: '0.82rem', fontWeight: 600, cursor: chatLoading || !chatInput.trim() ? 'not-allowed' : 'pointer', opacity: chatLoading || !chatInput.trim() ? 0.5 : 1, whiteSpace: 'nowrap', height: 52 }}
+                >
+                  Send
+                </button>
+                {chatHistory.length > 0 && (
+                  <button
+                    onClick={() => setChatHistory([])}
+                    style={{ padding: '0.5rem 0.75rem', background: 'transparent', border: '1px solid var(--border)', borderRadius: 8, color: 'var(--text-muted)', fontSize: '0.78rem', cursor: 'pointer', whiteSpace: 'nowrap', height: 52 }}
+                  >
+                    Clear
+                  </button>
+                )}
+              </div>
+            </div>
+          )}
 
           </div>
 

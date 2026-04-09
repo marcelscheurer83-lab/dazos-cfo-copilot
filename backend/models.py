@@ -420,6 +420,18 @@ class ChurnObservations(Base):
     total_churn_arr = Column(Float, default=0)
 
 
+class WeeklyBriefing(Base):
+    """Auto-generated weekly executive briefing combining FP&A and RevOps context. Generated every Monday at 7am EST."""
+    __tablename__ = "weekly_briefings"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    week_of = Column(Date, nullable=False)          # the Monday this briefing covers
+    generated_at = Column(DateTime, nullable=False)
+    briefing_text = Column(Text, nullable=True)     # markdown formatted briefing
+    model_used = Column(String(100), nullable=True)
+    error = Column(Text, nullable=True)
+    created_at = Column(DateTime, server_default=func.now())
+
+
 class OpportunityLineItem(Base):
     """Synced from Salesforce — product lines on opportunities. total_price = MRR (monthly); ARR = total_price * 12.
     When same product has multiple segments (different term/price), ARR = (sum(term_months_i * price_i) / sum(term_months_i)) * 12."""

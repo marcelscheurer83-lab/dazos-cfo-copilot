@@ -1611,3 +1611,48 @@ export async function scanFinancialModel(): Promise<{ ok: boolean; tabs_scanned:
   }
   return r.json()
 }
+
+// ── Weekly Briefing ───────────────────────────────────────────────────────────
+
+export interface WeeklyBriefingData {
+  week_of: string | null
+  generated_at: string | null
+  briefing_text: string | null
+  model_used: string | null
+  error: string | null
+}
+
+export async function getWeeklyBriefing(): Promise<WeeklyBriefingData> {
+  const r = await apiFetch('/briefing/weekly')
+  if (!r.ok) throw new Error(`HTTP ${r.status}`)
+  return r.json()
+}
+
+export async function generateWeeklyBriefing(): Promise<{ ok: boolean; week_of?: string; generated_at?: string; error?: string }> {
+  const r = await apiFetch('/briefing/generate', { method: 'POST' })
+  if (!r.ok) {
+    const err = await r.json().catch(() => ({}))
+    throw new Error((err as { detail?: string }).detail || `HTTP ${r.status}`)
+  }
+  return r.json()
+}
+
+// ── Agent Chat ────────────────────────────────────────────────────────────────
+
+export interface ChatMessage {
+  role: 'user' | 'assistant'
+  content: string
+}
+
+export async function postAgentChat(message: string, history: ChatMessage[]): Promise<{ answer: string }> {
+  const r = await apiFetch('/agent/chat', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ message, history }),
+  })
+  if (!r.ok) {
+    const err = await r.json().catch(() => ({}))
+    throw new Error((err as { detail?: string }).detail || `HTTP ${r.status}`)
+  }
+  return r.json()
+}

@@ -68,6 +68,7 @@ from models import (
     ForecastSnapshot,
     ChurnRecord,
     ChurnObservations,
+    WeeklyBriefing,
 )
 from schemas import (
     KPISummary,
@@ -92,6 +93,8 @@ from schemas import (
     RenewalsChartMonth,
     RenewalsOverviewRow,
     RenewalsOverviewResponse,
+    WeeklyBriefingResponse,
+    AgentChatRequest,
 )
 from seed_data import seed
 
@@ -5453,6 +5456,84 @@ async def post_ai_rescore(db: AsyncSession = Depends(get_db)):
     return result
 
 
+@app.get("/api/briefing/weekly")
+async def get_weekly_briefing(db: AsyncSession = Depends(get_db)):
+    """Return the most recent weekly executive briefing."""
+    result = await db.execute(
+        select(WeeklyBriefing).order_by(WeeklyBriefing.generated_at.desc()).limit(1)
+    )
+    row: WeeklyBriefing | None = result.scalar_one_or_none()
+    if row is None:
+        return WeeklyBriefingResponse()
+    return WeeklyBriefingResponse(
+        week_of=str(row.week_of),
+        generated_at=row.generated_at.isoformat() if row.generated_at else None,
+        briefing_text=row.briefing_text,
+        model_used=row.model_used,
+        error=row.error,
+    )
+
+
+@app.post("/api/briefing/generate")
+async def post_generate_weekly_briefing(db: AsyncSession = Depends(get_db)):
+    """On-demand trigger for weekly executive briefing generation."""
+    result = await _generate_weekly_briefing(db)
+    return result
+
+
+@app.post("/api/agent/chat")
+async def post_agent_chat(body: AgentChatRequest, db: AsyncSession = Depends(get_db)):
+    """Unified executive assistant chat. Draws on FP&A + RevOps context.
+    Accepts conversation history; returns the assistant reply."""
+    if not _ANTHROPIC_AVAILABLE or _anthropic_mod is None:
+        raise HTTPException(status_code=503, detail="anthropic package not available")
+    anthropic_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
+    if not anthropic_key:
+        raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY not set")
+    if not body.message.strip():
+        raise HTTPException(status_code=400, detail="message cannot be empty")
+
+    try:
+        fpa_ctx = await _build_fpa_context(db)
+    except Exception:
+        fpa_ctx = "*(FP&A context unavailable)*"
+    try:
+        revops_ctx = await _build_revops_context(db)
+    except Exception:
+        revops_ctx = "*(RevOps context unavailable)*"
+
+    full_system = (
+        _EXEC_ASSISTANT_SYSTEM_PROMPT
+        + "\n\n---\n\n## Current Data\n\n"
+        + fpa_ctx
+        + "\n\n---\n\n"
+        + revops_ctx
+    )
+
+    # Build message history + new user message
+    messages: list[dict] = []
+    for h in body.history:
+        role = h.get("role", "user")
+        content = h.get("content", "")
+        if role in ("user", "assistant") and content:
+            messages.append({"role": role, "content": content})
+    messages.append({"role": "user", "content": body.message})
+
+    try:
+        client = _anthropic_mod.AsyncAnthropic(api_key=anthropic_key)
+        response = await client.messages.create(
+            model="claude-sonnet-4-5",
+            max_tokens=2048,
+            system=full_system,
+            messages=messages,
+        )
+        answer = response.content[0].text if response.content else "No response from agent."
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Agent error: {e}")
+
+    return {"answer": answer}
+
+
 @app.post("/api/arr-snapshot/refresh")
 async def post_arr_snapshot_refresh(db: AsyncSession = Depends(get_db)):
     """Rebuild MonthlyArrSnapshot from current ARR history data (lightweight, no external API calls)."""
@@ -6775,6 +6856,262 @@ _REVOPS_AGENT_SYSTEM_PROMPT = os.getenv(
 You are process-oriented, metric-driven, and direct. Your job is to give executives a clear, unified view of revenue performance, identify where the funnel is leaking, and surface actionable fixes. You do not editorialize; you diagnose and recommend.""",
 )
 
+# Combined system prompt for the unified Executive Assistant (used in /api/agent/chat and weekly briefings)
+_EXEC_ASSISTANT_SYSTEM_PROMPT = (
+    _FPA_SYSTEM_PROMPT
+    + "\n\n---\n\n"
+    + _REVOPS_AGENT_SYSTEM_PROMPT
+    + """\n\n## Your role as unified Executive Assistant
+You have full access to both financial (FP&A) and revenue-operations (RevOps) data above. \
+Answer from whichever domain is most relevant; synthesize both when the question spans them. \
+Be direct, specific with numbers, and lead with the answer. \
+When asked for a weekly briefing, produce structured markdown."""
+)
+
+
+async def _build_revops_context(db: AsyncSession) -> str:
+    """Build a markdown RevOps context string for agent chat and weekly briefings.
+    Covers: current-quarter open pipeline summary, AI probability snapshot,
+    latest AI observations (forecast / pipeline / renewals), and renewal risk snapshot."""
+    import json as _rjson
+    import calendar as _rcal
+    lines: list[str] = ["# RevOps Context\n"]
+
+    try:
+        now_est = datetime.now(EST)
+        q_num = (now_est.month - 1) // 3 + 1
+        q_start_m = (q_num - 1) * 3 + 1
+        q_end_m = q_start_m + 2
+        q_start = date(now_est.year, q_start_m, 1)
+        q_end = date(now_est.year, q_end_m, _rcal.monthrange(now_est.year, q_end_m)[1])
+        q_label = f"Q{q_num} '{str(now_est.year)[2:]}"
+
+        # ── Open pipeline summary ──────────────────────────────────────────────
+        opp_result = await db.execute(select(Opportunity))
+        all_opps: list[Opportunity] = list(opp_result.scalars().all())
+
+        open_opps = [
+            o for o in all_opps
+            if not _is_closed_won_stage(o.stage_name) and not _is_closed_lost_stage(o.stage_name)
+        ]
+
+        def _opp_arr(o: Opportunity) -> float:
+            return float(o.mrr * 12) if o.mrr else float(o.amount or 0)
+
+        nb_opps = [o for o in open_opps if not _is_renewal_record_type(o.record_type_name or "")]
+        ren_opps = [o for o in open_opps if _is_renewal_record_type(o.record_type_name or "")]
+
+        nb_q = [o for o in nb_opps if o.close_date and q_start <= o.close_date <= q_end]
+        ren_q = [o for o in ren_opps if o.close_date and q_start <= o.close_date <= q_end]
+
+        nb_arr = sum(_opp_arr(o) for o in nb_q)
+        ren_arr = sum(_opp_arr(o) for o in ren_q)
+
+        # Latest AI scores
+        scores_result = await db.execute(
+            select(DealAIScore).order_by(DealAIScore.scored_at.desc())
+        )
+        score_rows: list[DealAIScore] = list(scores_result.scalars().all())
+        latest_scored_at = score_rows[0].scored_at if score_rows else None
+        if latest_scored_at:
+            run_scores = [s for s in score_rows if s.scored_at == latest_scored_at]
+            score_map = {s.sf_opp_id: s.probability for s in run_scores}
+            avg_prob = sum(score_map.values()) / len(score_map) if score_map else 0
+            weighted_nb = sum(_opp_arr(o) * score_map.get(o.sf_id or "", 0) for o in nb_q if o.sf_id in score_map)
+            scored_at_str = latest_scored_at.strftime("%b %d %Y %H:%M")
+        else:
+            avg_prob = 0
+            weighted_nb = 0
+            scored_at_str = "not yet scored"
+
+        lines.append(f"## Pipeline — {q_label}")
+        lines.append(f"- Open NB/Expansion deals in quarter: {len(nb_q)} | Total ARR: ${nb_arr:,.0f}")
+        lines.append(f"- AI-weighted NB pipeline: ${weighted_nb:,.0f} (avg probability: {avg_prob*100:.0f}%)")
+        lines.append(f"- Open renewal deals in quarter: {len(ren_q)} | Total ARR at risk: ${ren_arr:,.0f}")
+        lines.append(f"- AI scores last run: {scored_at_str}\n")
+
+        # Top 5 open deals by ARR
+        top5 = sorted(nb_q, key=lambda o: -_opp_arr(o))[:5]
+        if top5:
+            lines.append("### Top 5 Open NB Deals (by ARR)")
+            for o in top5:
+                prob = score_map.get(o.sf_id or "", None) if latest_scored_at else None
+                prob_str = f" | AI prob: {prob*100:.0f}%" if prob is not None else ""
+                lines.append(f"- {o.account_name}: ${_opp_arr(o):,.0f} | Stage: {o.stage_name} | Close: {o.close_date}{prob_str}")
+            lines.append("")
+
+        # ── Active customer base & product penetration ────────────────────────
+        try:
+            today_ctx = now_est.date()
+            closed_won_opps = [o for o in all_opps if _is_closed_won_stage(o.stage_name)]
+
+            # Live ARR accounts: closed-won accounts whose most recent CW opp is not followed by a lost renewal
+            # Approximation: account has at least one CW opp with close_date <= today
+            live_accts: dict[str, str] = {}  # sf_account_id -> account_name
+            for o in closed_won_opps:
+                if o.account_id and (o.close_date is None or o.close_date <= today_ctx):
+                    live_accts[o.account_id] = o.account_name or ""
+
+            lines.append("## Active Customer Base")
+            lines.append(f"- Total accounts with at least one Closed Won opportunity: {len(live_accts)}")
+
+            # Product penetration via OpportunityLineItem on closed-won opps
+            cw_sf_ids = {o.sf_id for o in closed_won_opps if o.sf_id}
+            if cw_sf_ids:
+                li_result = await db.execute(
+                    select(OpportunityLineItem).where(OpportunityLineItem.opportunity_sf_id.in_(cw_sf_ids))
+                )
+                line_items: list[OpportunityLineItem] = list(li_result.scalars().all())
+
+                # Map opp sf_id -> account_id for de-duplication
+                opp_to_acct = {o.sf_id: o.account_id for o in closed_won_opps if o.sf_id and o.account_id}
+
+                # Count distinct accounts per product (normalized name)
+                product_accts: dict[str, set[str]] = {}
+                for li in line_items:
+                    pname = _normalized_product_name(li.product_name) or (li.product_name or "").strip()
+                    if not pname:
+                        continue
+                    acct_id = opp_to_acct.get(li.opportunity_sf_id or "", "")
+                    if acct_id:
+                        product_accts.setdefault(pname, set()).add(acct_id)
+
+                # Also tally total quantity (seats/units) per product
+                product_qty: dict[str, float] = {}
+                for li in line_items:
+                    pname = _normalized_product_name(li.product_name) or (li.product_name or "").strip()
+                    if not pname:
+                        continue
+                    product_qty[pname] = product_qty.get(pname, 0.0) + (li.quantity or 0.0)
+
+                if product_accts:
+                    total_accts = max(len(live_accts), 1)
+                    lines.append("### Product Penetration (accounts & seats/units from Closed Won line items)")
+                    for pname, accts in sorted(product_accts.items(), key=lambda x: -len(x[1])):
+                        pct = round(len(accts) / total_accts * 100)
+                        qty = product_qty.get(pname, 0)
+                        qty_str = f" | {qty:,.0f} seats/units total" if qty else ""
+                        lines.append(f"- {pname}: {len(accts)} accounts ({pct}% of customer base){qty_str}")
+            lines.append("")
+        except Exception as prod_err:
+            lines.append(f"*(Product penetration unavailable: {prod_err})*\n")
+
+        # ── AI observations ────────────────────────────────────────────────────
+        obs_result = await db.execute(
+            select(AIForecastObservations).order_by(AIForecastObservations.scored_at.desc())
+        )
+        obs_rows = list(obs_result.scalars().all())
+        seen_types: set[str] = set()
+        for obs in obs_rows:
+            if obs.obs_type in seen_types:
+                continue
+            seen_types.add(obs.obs_type)
+            try:
+                bullets: list[str] = _rjson.loads(obs.observations_json or "[]")
+                if bullets:
+                    lines.append(f"### Agent Observations — {obs.obs_type.title()} ({obs.quarter_label or ''})")
+                    for b in bullets:
+                        lines.append(f"- {b}")
+                    lines.append("")
+            except Exception:
+                pass
+
+    except Exception as e:
+        lines.append(f"*(RevOps context unavailable: {e})*\n")
+
+    return "\n".join(lines)
+
+
+async def _generate_weekly_briefing(db: AsyncSession) -> dict:
+    """Generate a weekly executive briefing combining FP&A and RevOps context.
+    Upserts a WeeklyBriefing row for the current week_of (Monday). Returns summary dict."""
+    if not _ANTHROPIC_AVAILABLE or _anthropic_mod is None:
+        return {"ok": False, "error": "anthropic package not available"}
+    anthropic_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
+    if not anthropic_key:
+        return {"ok": False, "error": "ANTHROPIC_API_KEY not set"}
+
+    logger = logging.getLogger(__name__)
+
+    # Determine week_of = most recent Monday
+    now_est = datetime.now(EST)
+    days_since_monday = now_est.weekday()  # 0 = Monday
+    week_of = (now_est - timedelta(days=days_since_monday)).date()
+
+    # Previous week Mon–Sun for "last week" framing
+    prev_monday = week_of - timedelta(days=7)
+    prev_sunday = week_of - timedelta(days=1)
+
+    try:
+        fpa_context = await _build_fpa_context(db)
+    except Exception as e:
+        fpa_context = f"*(FP&A context unavailable: {e})*"
+
+    try:
+        revops_context = await _build_revops_context(db)
+    except Exception as e:
+        revops_context = f"*(RevOps context unavailable: {e})*"
+
+    combined_context = (
+        "## Financial Context (FP&A)\n\n" + fpa_context
+        + "\n\n---\n\n" + revops_context
+    )
+
+    briefing_prompt = (
+        f"Today is {now_est.strftime('%A, %B %d, %Y')}. "
+        f"Last week ran {prev_monday.strftime('%b %d')}–{prev_sunday.strftime('%b %d, %Y')}.\n\n"
+        "Using the financial and RevOps data provided, write a concise weekly executive briefing in markdown. "
+        "Structure it with exactly these four sections:\n\n"
+        "## Last Week Highlights\n"
+        "3–5 bullets on what happened: bookings vs plan, pipeline changes, renewals activity, cash/financial movements.\n\n"
+        "## Key Metrics\n"
+        "A compact table or bullets showing the 5–7 most important current metrics with actuals and vs-plan deltas.\n\n"
+        "## Pipeline & Renewals Watch\n"
+        "3–5 bullets: deals that moved, at-risk renewals, AI confidence changes, anything the exec team must watch.\n\n"
+        "## This Week's Focus\n"
+        "Top 3–5 prioritized actions for the CFO and exec team this week. Be specific — name accounts, amounts, decisions.\n\n"
+        "Be direct. No filler. Targeted for a CFO/CEO audience."
+    )
+
+    generated_at = datetime.now(EST)
+    briefing_text: str | None = None
+    error_text: str | None = None
+
+    try:
+        client = _anthropic_mod.AsyncAnthropic(api_key=anthropic_key)
+        response = await client.messages.create(
+            model="claude-sonnet-4-5",
+            max_tokens=2000,
+            system=_EXEC_ASSISTANT_SYSTEM_PROMPT,
+            messages=[
+                {"role": "user", "content": combined_context + "\n\n---\n\n" + briefing_prompt},
+            ],
+        )
+        briefing_text = response.content[0].text if response.content else None
+    except Exception as e:
+        error_text = str(e)
+        logger.exception("Weekly briefing generation failed: %s", e)
+
+    # Upsert: replace any existing briefing for this week_of
+    await db.execute(
+        delete(WeeklyBriefing).where(WeeklyBriefing.week_of == week_of)
+    )
+    db.add(WeeklyBriefing(
+        week_of=week_of,
+        generated_at=generated_at,
+        briefing_text=briefing_text,
+        model_used="claude-sonnet-4-5",
+        error=error_text,
+    ))
+    await db.commit()
+
+    return {
+        "ok": briefing_text is not None,
+        "week_of": str(week_of),
+        "generated_at": generated_at.isoformat(),
+        "error": error_text,
+    }
+
 
 async def _run_ai_forecast_scoring(db: AsyncSession) -> dict:
     """Score all open NB + Expansion opportunities with an LLM using field history as context.
@@ -7381,6 +7718,7 @@ async def _scheduled_salesforce_jobs() -> None:
     last_eod_date: Optional[date] = None
     last_ai_score_date: Optional[date] = None
     last_forecast_snapshot_date: Optional[date] = None
+    last_weekly_briefing_date: Optional[date] = None
 
     while True:
         try:
@@ -7392,6 +7730,8 @@ async def _scheduled_salesforce_jobs() -> None:
             run_ai = scheduled_ai_scoring and now_est.hour == 0 and now_est.minute == 30
             # Daily forecast snapshot at 01:00 EST (after SF sync + AI scoring)
             run_forecast_snap = now_est.hour == 1 and now_est.minute == 0
+            # Weekly briefing every Monday at 07:00 EST
+            run_weekly_briefing = (now_est.weekday() == 0 and now_est.hour == 7 and now_est.minute == 0)
 
             if run_hourly and (last_sync_hour is None or last_sync_hour != (today_est, now_est.hour)):
                 async with _salesforce_sync_lock:
@@ -7451,6 +7791,18 @@ async def _scheduled_salesforce_jobs() -> None:
                     except Exception as e:
                         await session.rollback()
                         logging.getLogger(__name__).exception("AI forecast scoring failed: %s", e)
+
+            if run_weekly_briefing and (last_weekly_briefing_date is None or last_weekly_briefing_date != today_est):
+                async with AsyncSessionLocal() as session:
+                    try:
+                        briefing_result = await _generate_weekly_briefing(session)
+                        last_weekly_briefing_date = today_est
+                        logging.getLogger(__name__).info(
+                            "Weekly briefing generated for week_of=%s ok=%s",
+                            briefing_result.get("week_of"), briefing_result.get("ok")
+                        )
+                    except Exception as e:
+                        logging.getLogger(__name__).exception("Weekly briefing generation failed: %s", e)
 
         except asyncio.CancelledError:
             raise

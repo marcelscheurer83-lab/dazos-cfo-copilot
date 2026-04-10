@@ -1832,6 +1832,87 @@ async def _execute_chargebee_tool(resource: str, filters: dict | None = None, li
         return f"ERROR: {exc}"
 
 
+# ── Google Sheets tool (shared between FP&A chat and unified agent chat) ──────
+
+_SHEETS_TOOL: dict = {
+    "name": "google_sheets_query",
+    "description": (
+        "Read live data directly from the Dazos Google Sheets financial model. "
+        "Use this when the pre-loaded context doesn't have the specific detail needed — "
+        "e.g. individual G&A line items, a specific row or range, custom formulas, or data "
+        "from a tab not included in the snapshot. "
+        "Call list_sheets first if you're unsure which tab or range to read."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["read_range", "list_sheets"],
+                "description": (
+                    "read_range: fetch cell data from a specific A1 range (e.g. 'P&L!A1:Z100'). "
+                    "list_sheets: list all available sheet tabs with their dimensions."
+                ),
+            },
+            "range": {
+                "type": "string",
+                "description": (
+                    "A1 notation range to read. Required for read_range. "
+                    "Examples: 'P&L!A1:Z100', 'OVERVIEW_2026P!A1:ZZ50', 'G&A Detail!A:Z'."
+                ),
+            },
+            "reason": {
+                "type": "string",
+                "description": "Brief explanation of what data this fetches and why.",
+            },
+        },
+        "required": ["action"],
+    },
+}
+
+
+async def _execute_sheets_tool(action: str, range_a1: str | None = None) -> str:
+    """Read live data from the Google Sheets financial model."""
+    from connectors.google_sheets import GoogleSheetsConnector
+
+    connector = GoogleSheetsConnector()
+    connector.set_base_path(Path(__file__).resolve().parent)
+
+    if not connector.sheet_id:
+        return "ERROR: Google Sheets not configured (GOOGLE_SHEET_ID not set in .env)."
+
+    try:
+        if action == "list_sheets":
+            sheets = await asyncio.to_thread(connector.list_sheets)
+            if not sheets:
+                return "No sheet tabs found."
+            lines = ["Available sheet tabs:"]
+            for s in sheets:
+                lines.append(
+                    f"- {s['title']}  ({s.get('rowCount', '?')} rows × {s.get('columnCount', '?')} cols)"
+                )
+            return "\n".join(lines)
+
+        if action == "read_range":
+            if not range_a1:
+                return "ERROR: 'range' parameter is required for read_range."
+            rows = await asyncio.to_thread(connector.read_range, range_a1)
+            if not rows:
+                return f"Range '{range_a1}' returned no data."
+            lines = []
+            for row in rows[:300]:
+                lines.append("\t".join("" if cell is None else str(cell) for cell in row))
+            text = "\n".join(lines)
+            if len(text) > 25000:
+                text = text[:25000] + "\n...(truncated)"
+            return f"{len(rows)} rows from '{range_a1}':\n{text}"
+
+        return f"ERROR: Unknown action '{action}'. Use read_range or list_sheets."
+
+    except Exception as exc:
+        return f"ERROR reading sheet: {exc}"
+
+
 @app.post("/api/financials/fpa-chat", response_model=FPAChatResponse)
 async def fpa_chat(body: FPAChatRequest, db: AsyncSession = Depends(get_db)):
     """Chat with the FP&A analyst agent (Claude). Can query Chargebee live via tool use."""
@@ -1847,11 +1928,14 @@ async def fpa_chat(body: FPAChatRequest, db: AsyncSession = Depends(get_db)):
         + "\n\n"
         + context
         + (
-            "\n\n---\n\n## Live Chargebee Data\n\n"
-            "You have access to a `chargebee_query` tool for live billing data (invoices, payments, collections). "
-            "IMPORTANT routing rule: ARR, MRR, NRR, subscription counts, churn, and all revenue metrics "
-            "always come from Salesforce data in the pre-loaded context above — never from Chargebee. "
-            "Use Chargebee only for cash and billing questions."
+            "\n\n---\n\n## Live Data Tools\n\n"
+            "You have two live-data tools:\n"
+            "1. `google_sheets_query` — read live data from the Dazos Google Sheets financial model. "
+            "Use this for any financial detail not in the pre-loaded context: specific P&L line items, "
+            "G&A breakdown, budget vs actuals rows, custom ranges. "
+            "Call list_sheets first if unsure which tab to use.\n"
+            "2. `chargebee_query` — live billing data: invoices, payments, collections, overdue balances. "
+            "Use ONLY for cash/billing questions — never for ARR or revenue metrics (those come from Salesforce context)."
         )
     )
 
@@ -1860,13 +1944,13 @@ async def fpa_chat(body: FPAChatRequest, db: AsyncSession = Depends(get_db)):
         raise HTTPException(status_code=400, detail="messages required")
 
     answer = ""
-    # Agentic loop — up to 5 rounds
-    for _round in range(5):
+    # Agentic loop — up to 6 rounds (Sheets may need list_sheets + read_range)
+    for _round in range(6):
         response = await client.messages.create(
             model="claude-sonnet-4-5",
-            max_tokens=2048,
+            max_tokens=4096,
             system=system,
-            tools=[_CHARGEBEE_TOOL],
+            tools=[_SHEETS_TOOL, _CHARGEBEE_TOOL],
             messages=messages,
         )
 
@@ -1881,11 +1965,19 @@ async def fpa_chat(body: FPAChatRequest, db: AsyncSession = Depends(get_db)):
 
         tool_results = []
         for block in tool_use_blocks:
-            resource = block.input.get("resource", "")
-            filters = block.input.get("filters", {})
-            limit = block.input.get("limit", 50)
-            _logger.info("FP&A CB query [round %d]: %s filters=%s", _round + 1, resource, filters)
-            result = await _execute_chargebee_tool(resource, filters, limit)
+            if block.name == "google_sheets_query":
+                action = block.input.get("action", "")
+                range_a1 = block.input.get("range")
+                _logger.info("FP&A Sheets query [round %d]: action=%s range=%s", _round + 1, action, range_a1)
+                result = await _execute_sheets_tool(action, range_a1)
+            elif block.name == "chargebee_query":
+                resource = block.input.get("resource", "")
+                filters = block.input.get("filters", {})
+                limit = block.input.get("limit", 50)
+                _logger.info("FP&A CB query [round %d]: %s filters=%s", _round + 1, resource, filters)
+                result = await _execute_chargebee_tool(resource, filters, limit)
+            else:
+                result = f"ERROR: Unknown tool '{block.name}'."
             tool_results.append({"type": "tool_result", "tool_use_id": block.id, "content": result})
 
         messages.append({"role": "user", "content": tool_results})
@@ -5703,17 +5795,20 @@ async def post_agent_chat(body: AgentChatRequest, db: AsyncSession = Depends(get
         + revops_ctx
         + (
             "\n\n---\n\n## Live Data Tools\n\n"
-            "You have two live-data tools:\n"
+            "You have three live-data tools:\n"
             "1. `salesforce_query` — SOQL SELECT for ARR, subscriptions, opportunities, accounts, activity, pipeline. "
             "Use for ALL revenue metrics: ARR, MRR, NRR, churn, expansion, bookings, subscription counts.\n"
             "2. `chargebee_query` — live billing data: invoices, payments, collections, overdue balances, payment failures. "
-            "Use ONLY for cash and billing questions — never for ARR or subscription metrics.\n\n"
+            "Use ONLY for cash and billing questions — never for ARR or subscription metrics.\n"
+            "3. `google_sheets_query` — read live data from the Dazos Google Sheets financial model. "
+            "Use for any financial detail not in the pre-loaded context: specific P&L line items, G&A breakdown, "
+            "budget rows, headcount, or any tab/range. Call list_sheets first if unsure which tab to read.\n\n"
             "Always answer from the pre-loaded context first; only call a tool when the context lacks the data. "
             "Salesforce: include a LIMIT clause. Chargebee: amounts are in cents (÷100 for dollars)."
         )
     )
 
-    # Tools: live Salesforce SOQL queries + live Chargebee billing data
+    # Tools: live Salesforce SOQL queries + Chargebee billing + Google Sheets financial model
     sf_tools = [
         {
             "name": "salesforce_query",
@@ -5737,6 +5832,7 @@ async def post_agent_chat(body: AgentChatRequest, db: AsyncSession = Depends(get
             },
         },
         _CHARGEBEE_TOOL,
+        _SHEETS_TOOL,
     ]
 
     async def _execute_sf_query(soql: str) -> str:
@@ -5772,8 +5868,8 @@ async def post_agent_chat(body: AgentChatRequest, db: AsyncSession = Depends(get
         client = _anthropic_mod.AsyncAnthropic(api_key=anthropic_key)
         answer = "No response from agent."
 
-        # Agentic loop — up to 5 rounds to allow multi-step tool use
-        for _round in range(5):
+        # Agentic loop — up to 6 rounds (Sheets may need list_sheets + read_range)
+        for _round in range(6):
             response = await client.messages.create(
                 model="claude-sonnet-4-5",
                 max_tokens=4096,
@@ -5806,6 +5902,11 @@ async def post_agent_chat(body: AgentChatRequest, db: AsyncSession = Depends(get
                     limit = block.input.get("limit", 50)
                     _logger.info("Agent CB query [round %d]: %s filters=%s", _round + 1, resource, filters)
                     result = await _execute_chargebee_tool(resource, filters, limit)
+                elif block.name == "google_sheets_query":
+                    action = block.input.get("action", "")
+                    range_a1 = block.input.get("range")
+                    _logger.info("Agent Sheets query [round %d]: action=%s range=%s", _round + 1, action, range_a1)
+                    result = await _execute_sheets_tool(action, range_a1)
                 else:
                     result = f"ERROR: Unknown tool '{block.name}'."
                 tool_results.append(
@@ -7147,11 +7248,12 @@ _EXEC_ASSISTANT_SYSTEM_PROMPT = (
     _FPA_SYSTEM_PROMPT
     + "\n\n---\n\n"
     + _REVOPS_AGENT_SYSTEM_PROMPT
-    + """\n\n## Your role as unified Executive Assistant
-You have full access to both financial (FP&A) and revenue-operations (RevOps) data above. \
-Answer from whichever domain is most relevant; synthesize both when the question spans them. \
-Be direct, specific with numbers, and lead with the answer. \
-When asked for a weekly briefing, produce structured markdown."""
+    + """\n\n## Your role as the Dazos Executive Agent
+You are a single unified agent with full access to both FP&A (financials, P&L, cash, budget) and \
+RevOps (pipeline, ARR, renewals, Salesforce, Chargebee billing) data. \
+Answer from whichever domain is most relevant; synthesize across both when the question spans them. \
+Do NOT label your answers as coming from "FP&A" or "RevOps" — just answer directly as the Executive Agent. \
+Be direct, specific with numbers, and lead with the answer."""
 )
 
 

@@ -475,7 +475,7 @@ export default function DashboardCurrentSummary({ title = 'Current Performance' 
                         wordBreak: 'break-word',
                       }}>
                         {msg.role === 'assistant' && (
-                          <p style={{ margin: '0 0 0.25rem', fontSize: '0.68rem', fontWeight: 600, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Dazos RevOps Agent</p>
+                          <p style={{ margin: '0 0 0.25rem', fontSize: '0.68rem', fontWeight: 600, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Dazos Executive Agent</p>
                         )}
                         {msg.content}
                       </div>

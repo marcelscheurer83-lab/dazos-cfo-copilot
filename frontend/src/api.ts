@@ -1661,11 +1661,15 @@ export interface ChatMessage {
   content: string
 }
 
-export async function postAgentChat(message: string, history: ChatMessage[]): Promise<{ answer: string }> {
+export async function postAgentChat(
+  message: string,
+  history: ChatMessage[],
+  sessionId: string,
+): Promise<{ answer: string; memory_used?: boolean }> {
   const r = await apiFetch('/agent/chat', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ message, history }),
+    body: JSON.stringify({ message, history, session_id: sessionId }),
   })
   if (!r.ok) {
     const err = await r.json().catch(() => ({}))

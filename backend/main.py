@@ -69,6 +69,7 @@ from models import (
     ChurnRecord,
     ChurnObservations,
     WeeklyBriefing,
+    ConversationMessage,
 )
 from schemas import (
     KPISummary,
@@ -326,6 +327,11 @@ async def _migrate_db() -> None:
                 await db.commit()
             except Exception:
                 await db.rollback()
+    # Create new tables (idempotent — create_all skips existing tables)
+    from database import engine
+    from models import Base
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
 
 
 @asynccontextmanager
@@ -5765,6 +5771,121 @@ async def post_generate_weekly_briefing(db: AsyncSession = Depends(get_db)):
     return result
 
 
+# ── Agent conversation memory ─────────────────────────────────────────────────
+
+_MEMORY_STOPWORDS = frozenset(
+    "a an the is are was were be been being have has had do does did will would could should "
+    "may might shall can i we you he she it they them their our your my his her its "
+    "in on at of to for with by from as into about over under between through after before "
+    "what how why when who where which that this these those and or but not no if so than "
+    "how many what's our we're i'm the's it's don't doesn't didn't can't won't isn't aren't "
+    "just tell show me get us give please".split()
+)
+
+
+def _extract_keywords(text: str, max_kw: int = 20) -> str:
+    """Extract meaningful lowercase keywords from a message for lightweight indexing."""
+    words = re.findall(r"[a-z]{3,}", text.lower())
+    kw = [w for w in words if w not in _MEMORY_STOPWORDS]
+    return " ".join(dict.fromkeys(kw[:max_kw]))  # dedup, preserve order
+
+
+async def _save_conversation_turn(
+    db: AsyncSession, session_id: str, user_msg: str, assistant_msg: str
+) -> None:
+    """Persist a user+assistant exchange to the conversation memory store."""
+    if not session_id:
+        return
+    try:
+        db.add(ConversationMessage(
+            session_id=session_id, role="user", content=user_msg,
+            keywords=_extract_keywords(user_msg),
+        ))
+        db.add(ConversationMessage(
+            session_id=session_id, role="assistant", content=assistant_msg,
+            keywords=_extract_keywords(assistant_msg),
+        ))
+        await db.commit()
+    except Exception:
+        await db.rollback()
+
+
+async def _get_memory_context(
+    db: AsyncSession, session_id: str, current_message: str, max_chars: int = 4000
+) -> str:
+    """
+    Retrieve relevant past exchanges for the current question.
+    Strategy:
+    1. Most-recent exchanges from *other* sessions (always included — recency matters)
+    2. Keyword-matched exchanges from any past session (topical relevance)
+    Returns a formatted string to inject into the system prompt, or "" if nothing found.
+    """
+    if not session_id:
+        return ""
+    try:
+        # Fetch up to 120 past messages excluding current session, newest first
+        result = await db.execute(
+            select(ConversationMessage)
+            .where(ConversationMessage.session_id != session_id)
+            .order_by(ConversationMessage.created_at.desc())
+            .limit(120)
+        )
+        past: list[ConversationMessage] = list(result.scalars().all())
+
+        if not past:
+            return ""
+
+        # Pair up user+assistant turns (messages are stored in order; walk pairs)
+        pairs: list[tuple[ConversationMessage, ConversationMessage | None]] = []
+        i = 0
+        while i < len(past):
+            msg = past[i]
+            if msg.role == "user":
+                nxt = past[i + 1] if i + 1 < len(past) and past[i + 1].role == "assistant" else None
+                pairs.append((msg, nxt))
+                i += 2 if nxt else 1
+            else:
+                i += 1
+
+        # Score pairs: keyword overlap with current question
+        current_kw = set(_extract_keywords(current_message).split())
+        scored: list[tuple[float, ConversationMessage, ConversationMessage | None]] = []
+        for u_msg, a_msg in pairs:
+            pair_kw = set((u_msg.keywords or "").split())
+            overlap = len(current_kw & pair_kw) if current_kw else 0
+            # Boost by recency: newer = higher base score
+            scored.append((overlap, u_msg, a_msg))
+
+        # Sort: keyword overlap desc, then implicitly by position (newest first from query)
+        scored.sort(key=lambda x: x[0], reverse=True)
+
+        # Always include the 3 most recent, then top keyword matches (deduplicated)
+        recent_ids = {id(u) for _, u, _ in scored[:3]}
+        top_relevant = [t for t in scored if t[0] > 0 and id(t[1]) not in recent_ids][:5]
+        selected = scored[:3] + top_relevant
+
+        if not selected:
+            return ""
+
+        lines = ["## Memory — Relevant past conversations (for context only, not current session)"]
+        char_budget = max_chars
+        for _, u_msg, a_msg in selected:
+            when = u_msg.created_at.strftime("%b %d, %Y") if u_msg.created_at else "unknown date"
+            entry = f"\n[{when}]\nYou asked: {u_msg.content[:400]}"
+            if a_msg:
+                entry += f"\nAgent answered: {a_msg.content[:600]}"
+            if len(entry) > char_budget:
+                break
+            lines.append(entry)
+            char_budget -= len(entry)
+
+        return "\n".join(lines) if len(lines) > 1 else ""
+
+    except Exception as exc:
+        _logger.warning("Memory retrieval failed: %s", exc)
+        return ""
+
+
 @app.post("/api/agent/chat")
 async def post_agent_chat(body: AgentChatRequest, db: AsyncSession = Depends(get_db)):
     """Unified executive assistant chat with live Salesforce query capability.
@@ -5787,12 +5908,16 @@ async def post_agent_chat(body: AgentChatRequest, db: AsyncSession = Depends(get
     except Exception:
         revops_ctx = "*(RevOps context unavailable)*"
 
+    # Load cross-session memory relevant to this question
+    memory_ctx = await _get_memory_context(db, body.session_id, body.message)
+
     full_system = (
         _EXEC_ASSISTANT_SYSTEM_PROMPT
         + "\n\n---\n\n## Current Data\n\n"
         + fpa_ctx
         + "\n\n---\n\n"
         + revops_ctx
+        + (("\n\n---\n\n" + memory_ctx) if memory_ctx else "")
         + (
             "\n\n---\n\n## Live Data Tools\n\n"
             "You have three live-data tools:\n"
@@ -5918,7 +6043,10 @@ async def post_agent_chat(body: AgentChatRequest, db: AsyncSession = Depends(get
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Agent error: {e}")
 
-    return {"answer": answer}
+    # Persist this exchange to long-term memory
+    await _save_conversation_turn(db, body.session_id, body.message, answer)
+
+    return {"answer": answer, "memory_used": bool(memory_ctx)}
 
 
 @app.post("/api/arr-snapshot/refresh")

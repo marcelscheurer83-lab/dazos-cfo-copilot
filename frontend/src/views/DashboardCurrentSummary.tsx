@@ -26,6 +26,16 @@ import {
 import { useJobs } from '../App'
 
 const CHAT_HISTORY_KEY = 'dazos_chat_history'
+const CHAT_SESSION_KEY = 'dazos_chat_session_id'
+
+function getOrCreateSessionId(): string {
+  let id = localStorage.getItem(CHAT_SESSION_KEY)
+  if (!id) {
+    id = `sess_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`
+    localStorage.setItem(CHAT_SESSION_KEY, id)
+  }
+  return id
+}
 
 /** Fixed quarter dashboard pages: no live ARR block; MTD APIs use fixed_periods. */
 function dashboardFixedPeriodsForTitle(title: string): DashboardFixedPeriods | undefined {
@@ -171,6 +181,8 @@ export default function DashboardCurrentSummary({ title = 'Current Performance' 
   })
   const [chatInput, setChatInput] = useState('')
   const [chatLoading, setChatLoading] = useState(false)
+  const [memoryUsed, setMemoryUsed] = useState(false)
+  const chatSessionId = useRef(getOrCreateSessionId())
   const chatEndRef = useRef<HTMLDivElement>(null)
 
   const { jobs } = useJobs()
@@ -280,8 +292,9 @@ export default function DashboardCurrentSummary({ title = 'Current Performance' 
     setChatHistory(newHistory)
     setChatLoading(true)
     try {
-      const res = await postAgentChat(msg, chatHistory)
+      const res = await postAgentChat(msg, chatHistory, chatSessionId.current)
       setChatHistory([...newHistory, { role: 'assistant', content: res.answer }])
+      if (res.memory_used) setMemoryUsed(true)
     } catch (e) {
       setChatHistory([...newHistory, { role: 'assistant', content: `Error: ${e instanceof Error ? e.message : String(e)}` }])
     } finally {
@@ -453,8 +466,15 @@ export default function DashboardCurrentSummary({ title = 'Current Performance' 
           {overviewOnly && (
             <div style={{ ...blockStyle, flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0, overflow: 'hidden' }}>
               <div style={{ marginBottom: '0.75rem', flexShrink: 0 }}>
-                <p style={{ margin: '0.1rem 0 0', fontSize: '0.95rem', fontWeight: 600, color: 'var(--text)' }}>Ask the agents</p>
-                <p style={{ margin: '0.2rem 0 0', fontSize: '0.78rem', color: 'var(--text-muted)' }}>Ask anything about financial performance, pipeline, renewals, or strategy. FP&A and RevOps agents will answer together.</p>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem' }}>
+                  <p style={{ margin: '0.1rem 0 0', fontSize: '0.95rem', fontWeight: 600, color: 'var(--text)' }}>Ask the agents</p>
+                  {memoryUsed && (
+                    <span style={{ fontSize: '0.68rem', color: '#38bdf8', background: 'rgba(56,189,248,0.1)', border: '1px solid rgba(56,189,248,0.25)', borderRadius: 4, padding: '0.1rem 0.4rem' }}>
+                      memory active
+                    </span>
+                  )}
+                </div>
+                <p style={{ margin: '0.2rem 0 0', fontSize: '0.78rem', color: 'var(--text-muted)' }}>Ask anything about financial performance, pipeline, renewals, or strategy. Agents remember past conversations.</p>
               </div>
 
               {/* Message history — scrolls within available space */}
@@ -475,7 +495,7 @@ export default function DashboardCurrentSummary({ title = 'Current Performance' 
                         wordBreak: 'break-word',
                       }}>
                         {msg.role === 'assistant' && (
-                          <p style={{ margin: '0 0 0.25rem', fontSize: '0.68rem', fontWeight: 600, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Dazos Executive Agent</p>
+                          <p style={{ margin: '0 0 0.25rem', fontSize: '0.68rem', fontWeight: 600, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Dazos Agents</p>
                         )}
                         {msg.content}
                       </div>

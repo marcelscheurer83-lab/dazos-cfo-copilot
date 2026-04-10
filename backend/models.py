@@ -432,6 +432,19 @@ class WeeklyBriefing(Base):
     created_at = Column(DateTime, server_default=func.now())
 
 
+class ConversationMessage(Base):
+    """Persistent agent conversation memory. Stores every user/assistant exchange
+    so agents can recall past questions, decisions, and context across sessions."""
+    __tablename__ = "conversation_messages"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    session_id = Column(String(64), nullable=False, index=True)
+    role = Column(String(16), nullable=False)   # "user" | "assistant"
+    content = Column(Text, nullable=False)
+    created_at = Column(DateTime, server_default=func.now())
+    # Lightweight keyword index for cross-session retrieval (space-separated lowercased terms)
+    keywords = Column(Text, nullable=True)
+
+
 class OpportunityLineItem(Base):
     """Synced from Salesforce — product lines on opportunities. total_price = MRR (monthly); ARR = total_price * 12.
     When same product has multiple segments (different term/price), ARR = (sum(term_months_i * price_i) / sum(term_months_i)) * 12."""

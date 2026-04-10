@@ -249,3 +249,4 @@ class WeeklyBriefingResponse(BaseModel):
 class AgentChatRequest(BaseModel):
     message: str
     history: list[dict] = []  # [{"role": "user"|"assistant", "content": str}]
+    session_id: str = ""      # persistent browser session ID for cross-session memory

@@ -1853,7 +1853,7 @@ async def fpa_chat(body: FPAChatRequest, db: AsyncSession = Depends(get_db)):
             resource = block.input.get("resource", "")
             filters = block.input.get("filters", {})
             limit = block.input.get("limit", 50)
-            logger.info("FP&A CB query [round %d]: %s filters=%s", _round + 1, resource, filters)
+            _logger.info("FP&A CB query [round %d]: %s filters=%s", _round + 1, resource, filters)
             result = await _execute_chargebee_tool(resource, filters, limit)
             tool_results.append({"type": "tool_result", "tool_use_id": block.id, "content": result})
 
@@ -5753,13 +5753,13 @@ async def post_agent_chat(body: AgentChatRequest, db: AsyncSession = Depends(get
             for block in tool_use_blocks:
                 if block.name == "salesforce_query":
                     soql = block.input.get("soql", "")
-                    logger.info("Agent SF query [round %d]: %s", _round + 1, soql[:200])
+                    _logger.info("Agent SF query [round %d]: %s", _round + 1, soql[:200])
                     result = await _execute_sf_query(soql)
                 elif block.name == "chargebee_query":
                     resource = block.input.get("resource", "")
                     filters = block.input.get("filters", {})
                     limit = block.input.get("limit", 50)
-                    logger.info("Agent CB query [round %d]: %s filters=%s", _round + 1, resource, filters)
+                    _logger.info("Agent CB query [round %d]: %s filters=%s", _round + 1, resource, filters)
                     result = await _execute_chargebee_tool(resource, filters, limit)
                 else:
                     result = f"ERROR: Unknown tool '{block.name}'."

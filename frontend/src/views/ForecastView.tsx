@@ -1,4 +1,5 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
+import { useJobs } from '../App'
 import {
   ComposedChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip,
   Legend, ResponsiveContainer, ReferenceLine, Line,
@@ -520,20 +521,37 @@ function fmtPct2(v: number | null | undefined): string {
 }
 
 function AIForecastPanel({ aiData, onRescore }: { aiData: AIForecastResponse | null; onRescore: () => void }) {
-  const [rescoring, setRescoring] = useState(false)
   const [rescoreMsg, setRescoreMsg] = useState<string | null>(null)
+  const { jobs } = useJobs()
+  const prevJobsRef = useRef(jobs)
+
+  const rescoring = jobs.some((j) => j.type === 'ai_rescore' && j.status === 'running')
+
+  // When a rescore job completes, refresh the AI panel
+  useEffect(() => {
+    const prev = prevJobsRef.current
+    const justDone = jobs.find(
+      (j) => j.type === 'ai_rescore' && j.status !== 'running' &&
+        prev.find((p) => p.id === j.id && p.status === 'running')
+    )
+    prevJobsRef.current = jobs
+    if (justDone) {
+      setRescoreMsg(justDone.status === 'done' ? `Scoring complete. ${justDone.result ?? ''}` : `Error: ${justDone.result ?? 'unknown'}`)
+      if (justDone.status === 'done') onRescore()
+    }
+  }, [jobs, onRescore])
 
   const handleRescore = async () => {
-    setRescoring(true)
     setRescoreMsg(null)
     try {
       const r = await triggerAIRescore()
-      setRescoreMsg(r.ok ? `Scored ${r.scored ?? 0} deals.` : (r.error ?? 'Failed'))
-      if (r.ok) onRescore()
+      if (r.ok) {
+        setRescoreMsg('AI scoring started — you can navigate away, it will complete in the background.')
+      } else {
+        setRescoreMsg(r.error ?? 'Failed to start scoring.')
+      }
     } catch (e: unknown) {
       setRescoreMsg(e instanceof Error ? e.message : 'Error')
-    } finally {
-      setRescoring(false)
     }
   }
 

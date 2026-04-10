@@ -1,5 +1,6 @@
-import { Component, type ReactNode, useState } from 'react'
+import { Component, createContext, type ReactNode, useCallback, useContext, useEffect, useRef, useState } from 'react'
 import { Routes, Route, Navigate } from 'react-router-dom'
+import { getActiveJobs, type ActiveJob } from './api'
 import Layout from './Layout'
 import Login from './Login'
 import Dashboard from './views/Dashboard'
@@ -24,6 +25,39 @@ import BalanceSheet from './views/BalanceSheet'
 import FinancialAnalysisView from './views/FinancialAnalysisView'
 import FPAChat from './views/FPAChat'
 import FinancialsDataSync from './views/FinancialsDataSync'
+
+// ── Global background-jobs context ───────────────────────────────────────────
+interface JobsContextValue {
+  jobs: ActiveJob[]
+  runningJobs: ActiveJob[]
+}
+export const JobsContext = createContext<JobsContextValue>({ jobs: [], runningJobs: [] })
+export const useJobs = () => useContext(JobsContext)
+
+function JobsProvider({ children }: { children: ReactNode }) {
+  const [jobs, setJobs] = useState<ActiveJob[]>([])
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  const poll = useCallback(async () => {
+    try {
+      const data = await getActiveJobs()
+      setJobs(data.jobs)
+    } catch {
+      // silently ignore poll errors
+    }
+  }, [])
+
+  useEffect(() => {
+    poll()
+    // Poll every 4s when any job is running, otherwise every 15s
+    const running = jobs.some((j) => j.status === 'running')
+    timerRef.current = setTimeout(poll, running ? 4000 : 15000)
+    return () => { if (timerRef.current) clearTimeout(timerRef.current) }
+  }, [jobs, poll])
+
+  const runningJobs = jobs.filter((j) => j.status === 'running')
+  return <JobsContext.Provider value={{ jobs, runningJobs }}>{children}</JobsContext.Provider>
+}
 
 class ErrorBoundary extends Component<{ children: ReactNode }, { error: Error | null; key: number }> {
   state = { error: null as Error | null, key: 0 }
@@ -69,6 +103,7 @@ export default function App() {
   }
 
   return (
+    <JobsProvider>
     <ErrorBoundary>
     <Routes>
       <Route path="/" element={<Layout />}>
@@ -109,5 +144,6 @@ export default function App() {
       <Route path="*" element={<Navigate to="/dashboard" replace />} />
     </Routes>
     </ErrorBoundary>
+    </JobsProvider>
   )
 }

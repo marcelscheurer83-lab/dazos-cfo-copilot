@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { Outlet, NavLink, useLocation } from 'react-router-dom'
+import { useJobs } from './App'
 
 type NavLinkItem = { to: string; label: string }
 type NavSection = { label: string; children: NavLinkItem[] }
@@ -90,6 +91,7 @@ const ANALYTICS_PATHS = ['/analytics', '/analytics/crm-seats']
 
 export default function Layout() {
   const location = useLocation()
+  const { runningJobs } = useJobs()
   const [dashboardExpanded, setDashboardExpanded] = useState(true)
   const [gtmExpanded, setGtmExpanded] = useState(true)
   const [arrScheduleExpanded, setArrScheduleExpanded] = useState(true)
@@ -210,6 +212,31 @@ export default function Layout() {
           })}
         </nav>
         <div style={{ marginTop: 'auto', padding: '1rem 1.25rem', borderTop: '1px solid var(--border)' }}>
+          {runningJobs.length > 0 && (
+            <div style={{
+              marginBottom: '0.75rem',
+              padding: '0.5rem 0.65rem',
+              borderRadius: 6,
+              background: 'rgba(56,189,248,0.08)',
+              border: '1px solid rgba(56,189,248,0.2)',
+              display: 'flex',
+              alignItems: 'center',
+              gap: '0.5rem',
+            }}>
+              <span style={{
+                display: 'inline-block',
+                width: 7,
+                height: 7,
+                borderRadius: '50%',
+                background: '#38bdf8',
+                flexShrink: 0,
+                animation: 'pulse 1.4s ease-in-out infinite',
+              }} />
+              <span style={{ fontSize: '0.72rem', color: '#38bdf8', lineHeight: 1.3 }}>
+                {runningJobs.map((j) => j.label).join(', ')} in progress…
+              </span>
+            </div>
+          )}
           <button
             type="button"
             onClick={() => {

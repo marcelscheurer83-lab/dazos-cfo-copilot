@@ -489,6 +489,37 @@ app.add_middleware(APITimingMiddleware)
 _DASHBOARD_MTD_PATHS = frozenset({"/api/dashboard/cash-mtd", "/api/dashboard/bookings-mtd"})
 _logger = logging.getLogger(__name__)
 
+# ── Background job registry ───────────────────────────────────────────────────
+# Tracks in-flight and recently-completed jobs so the frontend can poll for
+# status regardless of which view triggered the work.
+_bg_jobs: dict[str, dict] = {}
+
+
+def _bg_job_start(job_id: str, job_type: str, label: str) -> None:
+    _bg_jobs[job_id] = {
+        "id": job_id,
+        "type": job_type,
+        "label": label,
+        "status": "running",
+        "started_at": datetime.now(EST).isoformat(),
+        "finished_at": None,
+        "result": None,
+    }
+
+
+def _bg_job_done(job_id: str, ok: bool, detail: str = "") -> None:
+    if job_id in _bg_jobs:
+        _bg_jobs[job_id].update({
+            "status": "done" if ok else "error",
+            "finished_at": datetime.now(EST).isoformat(),
+            "result": detail,
+        })
+    # Prune: keep at most the 30 most recent jobs
+    if len(_bg_jobs) > 30:
+        oldest = sorted(_bg_jobs.keys(), key=lambda k: _bg_jobs[k].get("started_at", ""))
+        for k in oldest[:-30]:
+            del _bg_jobs[k]
+
 
 @app.exception_handler(Exception)
 async def _dashboard_mtd_exception_handler(request: Request, exc: Exception):
@@ -5590,17 +5621,31 @@ async def get_forecast_accuracy(db: AsyncSession = Depends(get_db)):
 
 
 @app.post("/api/forecast/ai-rescore")
-async def post_ai_rescore(db: AsyncSession = Depends(get_db)):
+async def post_ai_rescore():
     """
-    On-demand trigger for AI forecast scoring. Runs _run_ai_forecast_scoring immediately.
+    On-demand trigger for AI forecast scoring. Returns immediately; scoring runs in background.
+    Poll GET /api/jobs/active to track progress.
     Requires ANTHROPIC_API_KEY in .env. Does NOT require ENABLE_AI_FORECAST_SCORING.
     """
-    result = await _run_ai_forecast_scoring(db)
-    if result.get("ok"):
-        await db.commit()
-    else:
-        await db.rollback()
-    return result
+    job_id = f"rescore_{int(time.time())}"
+    _bg_job_start(job_id, "ai_rescore", "AI Scoring")
+
+    async def _run() -> None:
+        try:
+            async with AsyncSessionLocal() as session:
+                result = await _run_ai_forecast_scoring(session)
+                if result.get("ok"):
+                    await session.commit()
+                else:
+                    await session.rollback()
+                scored = result.get("scored", 0)
+                _bg_job_done(job_id, bool(result.get("ok")), f"Scored {scored} deals")
+        except Exception as exc:
+            _logger.exception("Background AI rescore failed: %s", exc)
+            _bg_job_done(job_id, False, str(exc))
+
+    asyncio.create_task(_run())
+    return {"ok": True, "job_id": job_id, "status": "started", "message": "AI scoring started in background"}
 
 
 @app.get("/api/briefing/weekly")
@@ -13538,13 +13583,30 @@ async def get_dataset_status(db: AsyncSession = Depends(get_db)):
 async def post_dataset_refresh():
     """
     Refresh app data into SQLite: Salesforce, Google Sheets (DATASET_SHEET_RANGES), Chargebee (each if configured).
+    Returns immediately; refresh runs in the background. Poll GET /api/jobs/active to track progress.
     QuickBooks is synced separately via POST /api/sync/quickbooks when ready.
     """
-    try:
-        return await _refresh_app_dataset()
-    except Exception as e:
-        await _persist_app_dataset_state(False, [{"step": "fatal", "ok": False, "detail": str(e)}], str(e))
-        return JSONResponse(status_code=200, content={"ok": False, "error": str(e), "steps": []})
+    job_id = f"refresh_{int(time.time())}"
+    _bg_job_start(job_id, "dataset_refresh", "Data Refresh")
+
+    async def _run() -> None:
+        try:
+            result = await _refresh_app_dataset()
+            _bg_job_done(job_id, bool(result.get("ok")), result.get("error") or "")
+        except Exception as exc:
+            _logger.exception("Background dataset refresh failed: %s", exc)
+            await _persist_app_dataset_state(False, [{"step": "fatal", "ok": False, "detail": str(exc)}], str(exc))
+            _bg_job_done(job_id, False, str(exc))
+
+    asyncio.create_task(_run())
+    return {"ok": True, "job_id": job_id, "status": "started", "message": "Data refresh started in background"}
+
+
+@app.get("/api/jobs/active")
+async def get_active_jobs():
+    """Return all tracked background jobs (running + recently completed). Frontend polls this to show progress."""
+    jobs = sorted(_bg_jobs.values(), key=lambda j: j.get("started_at", ""), reverse=True)
+    return {"jobs": jobs[:30]}
 
 
 # ── Frontend static file serving (production single-service Railway deploy) ──────────────────

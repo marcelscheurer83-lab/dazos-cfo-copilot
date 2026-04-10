@@ -23,8 +23,9 @@ import {
   type OverviewTargets,
   type ChatMessage,
 } from '../api'
+import { useJobs } from '../App'
 
-const DATASET_REFRESH_TIMEOUT_MS = 15 * 60 * 1000
+const CHAT_HISTORY_KEY = 'dazos_chat_history'
 
 /** Fixed quarter dashboard pages: no live ARR block; MTD APIs use fixed_periods. */
 function dashboardFixedPeriodsForTitle(title: string): DashboardFixedPeriods | undefined {
@@ -164,11 +165,16 @@ export default function DashboardCurrentSummary({ title = 'Current Performance' 
   const [nrr12m, setNrr12m] = useState<number | null>(null)
   const [grr12m, setGrr12m] = useState<number | null>(null)
 
-  // Agent chat state
-  const [chatHistory, setChatHistory] = useState<ChatMessage[]>([])
+  // Agent chat state — persisted to sessionStorage so navigation doesn't lose history
+  const [chatHistory, setChatHistory] = useState<ChatMessage[]>(() => {
+    try { return JSON.parse(sessionStorage.getItem(CHAT_HISTORY_KEY) || '[]') } catch { return [] }
+  })
   const [chatInput, setChatInput] = useState('')
   const [chatLoading, setChatLoading] = useState(false)
   const chatEndRef = useRef<HTMLDivElement>(null)
+
+  const { jobs } = useJobs()
+  const prevJobsRef = useRef(jobs)
 
   const loadAllDashboardData = useCallback(() => {
     const fixed = dashboardFixedPeriodsForTitle(title)
@@ -246,10 +252,25 @@ export default function DashboardCurrentSummary({ title = 'Current Performance' 
     loadAllDashboardData()
   }, [loadAllDashboardData])
 
-  // Scroll chat to bottom when new messages arrive
+  // Persist chat history to sessionStorage on every change
   useEffect(() => {
+    sessionStorage.setItem(CHAT_HISTORY_KEY, JSON.stringify(chatHistory))
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [chatHistory])
+
+  // Reload dashboard data when a dataset_refresh job completes
+  useEffect(() => {
+    const prev = prevJobsRef.current
+    const justDone = jobs.filter(
+      (j) => j.type === 'dataset_refresh' && j.status !== 'running' &&
+        prev.find((p) => p.id === j.id && p.status === 'running')
+    )
+    prevJobsRef.current = jobs
+    if (justDone.length > 0) {
+      setRefreshMessage(justDone[0].status === 'done' ? 'Refresh complete.' : `Refresh error: ${justDone[0].result || 'unknown'}`)
+      loadAllDashboardData()
+    }
+  }, [jobs, loadAllDashboardData])
 
   const handleChatSend = async () => {
     const msg = chatInput.trim()
@@ -268,33 +289,21 @@ export default function DashboardCurrentSummary({ title = 'Current Performance' 
     }
   }
 
-  const handleRefreshAppData = () => {
+  const handleRefreshAppData = async () => {
     setRefreshMessage(null)
     setRefreshLoading(true)
-    const ac = new AbortController()
-    const timeoutId = window.setTimeout(() => ac.abort(), DATASET_REFRESH_TIMEOUT_MS)
-    refreshAppDataset(ac.signal)
-      .then((res) => {
-        window.clearTimeout(timeoutId)
-        setRefreshLoading(false)
-        if (res.ok) {
-          setRefreshMessage(res.message ?? 'Refresh complete.')
-          loadAllDashboardData()
-        } else {
-          const err = res.error ?? 'Refresh failed'
-          setRefreshMessage(isLegacyQuickBooksBanner(err) ? null : err)
-          loadAllDashboardData()
-        }
-      })
-      .catch((e) => {
-        window.clearTimeout(timeoutId)
-        setRefreshLoading(false)
-        if (e instanceof Error && e.name === 'AbortError') {
-          setRefreshMessage('Refresh timed out or was cancelled. The server may still be working — wait and reload, or check backend logs.')
-        } else {
-          setRefreshMessage(e instanceof Error ? e.message : 'Refresh failed')
-        }
-      })
+    try {
+      const res = await refreshAppDataset()
+      setRefreshLoading(false)
+      if (res.ok) {
+        setRefreshMessage('Refresh started — you can navigate away, it will complete in the background.')
+      } else {
+        setRefreshMessage(res.error ?? 'Refresh failed to start.')
+      }
+    } catch (e) {
+      setRefreshLoading(false)
+      setRefreshMessage(e instanceof Error ? e.message : 'Refresh failed')
+    }
   }
 
   if (err) return <p style={{ color: 'var(--negative)' }}>{err}</p>

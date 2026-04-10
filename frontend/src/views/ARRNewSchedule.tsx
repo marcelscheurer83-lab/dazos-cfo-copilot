@@ -8,8 +8,6 @@ import {
   type DatasetStatus,
 } from '../api'
 
-const DATASET_REFRESH_TIMEOUT_MS = 15 * 60 * 1000
-
 function isLegacyQuickBooksBanner(msg: string | null | undefined): boolean {
   if (msg == null || msg === '') return false
   const s = msg.toLowerCase()
@@ -119,29 +117,22 @@ export default function ARRNewSchedule() {
       .catch(() => setDatasetStatus(null))
   }, [])
 
-  const handleRefreshAppData = useCallback(() => {
+  const handleRefreshAppData = useCallback(async () => {
     setRefreshMessage(null)
     setRefreshLoading(true)
-    const ac = new AbortController()
-    const timeoutId = window.setTimeout(() => ac.abort(), DATASET_REFRESH_TIMEOUT_MS)
-    refreshAppDataset(ac.signal)
-      .then((res) => {
-        window.clearTimeout(timeoutId)
-        setRefreshLoading(false)
-        const err = res.ok ? null : (res.error ?? 'Refresh failed')
-        setRefreshMessage(err && !isLegacyQuickBooksBanner(err) ? err : (res.ok ? (res.message ?? 'Refresh complete.') : null))
-        load()
-      })
-      .catch((e: unknown) => {
-        window.clearTimeout(timeoutId)
-        setRefreshLoading(false)
-        if (e instanceof Error && e.name === 'AbortError') {
-          setRefreshMessage('Refresh timed out. The server may still be working — wait and reload, or check backend logs.')
-        } else {
-          setRefreshMessage(e instanceof Error ? e.message : 'Refresh failed')
-        }
-      })
-  }, [load])
+    try {
+      const res = await refreshAppDataset()
+      setRefreshLoading(false)
+      if (res.ok) {
+        setRefreshMessage('Refresh started — running in the background.')
+      } else {
+        setRefreshMessage(res.error ?? 'Refresh failed to start.')
+      }
+    } catch (e: unknown) {
+      setRefreshLoading(false)
+      setRefreshMessage(e instanceof Error ? e.message : 'Refresh failed')
+    }
+  }, [])
 
   const handleExport = useCallback(() => {
     setExportStatus('loading')

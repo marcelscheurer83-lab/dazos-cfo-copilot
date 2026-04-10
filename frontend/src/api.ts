@@ -930,14 +930,15 @@ export async function getOverviewTargets(): Promise<OverviewTargets> {
 }
 
 /** Unified refresh: Salesforce, Google Sheets (DATASET_SHEET_RANGES), Chargebee when configured. QuickBooks is separate (POST /api/sync/quickbooks). Can take many minutes. */
-export async function refreshAppDataset(signal?: AbortSignal): Promise<{
+export async function refreshAppDataset(): Promise<{
   ok: boolean
-  error?: string
-  steps?: unknown[]
+  job_id?: string
+  status?: string
   message?: string
+  error?: string
 }> {
-  const r = await apiFetch('/dataset/refresh', { method: 'POST', signal })
-  let data: { ok?: boolean; error?: string; steps?: unknown[]; message?: string }
+  const r = await apiFetch('/dataset/refresh', { method: 'POST' })
+  let data: { ok?: boolean; job_id?: string; status?: string; message?: string; error?: string }
   try {
     const text = await r.text()
     data = text ? JSON.parse(text) : {}
@@ -945,7 +946,7 @@ export async function refreshAppDataset(signal?: AbortSignal): Promise<{
     return { ok: false, error: 'Invalid response from server.' }
   }
   if (!r.ok) return { ok: false, error: data.error ?? 'Refresh failed' }
-  return data as { ok: boolean; error?: string; steps?: unknown[]; message?: string }
+  return data as { ok: boolean; job_id?: string; status?: string; message?: string; error?: string }
 }
 
 /** @deprecated Prefer refreshAppDataset() from the Dashboard. */
@@ -1431,9 +1432,25 @@ export async function getAIObservations(type: 'forecast' | 'pipeline' | 'renewal
   return r.json()
 }
 
-export async function triggerAIRescore(): Promise<{ ok: boolean; scored?: number; error?: string }> {
+export async function triggerAIRescore(): Promise<{ ok: boolean; job_id?: string; status?: string; message?: string; scored?: number; error?: string }> {
   const r = await apiFetch('/forecast/ai-rescore', { method: 'POST' })
   if (!r.ok) throw new Error(`AI rescore failed: HTTP ${r.status}`)
+  return r.json()
+}
+
+export interface ActiveJob {
+  id: string
+  type: string
+  label: string
+  status: 'running' | 'done' | 'error'
+  started_at: string
+  finished_at: string | null
+  result: string | null
+}
+
+export async function getActiveJobs(): Promise<{ jobs: ActiveJob[] }> {
+  const r = await apiFetch('/jobs/active')
+  if (!r.ok) return { jobs: [] }
   return r.json()
 }
 

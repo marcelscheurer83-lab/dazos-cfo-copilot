@@ -110,3 +110,8 @@ button {
 .new-schedule-arr-table > p span {
   text-shadow: 0 0 1px rgba(34, 211, 238, 0.35), -1px 0 2px rgba(56, 189, 248, 0.22);
 }
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.3; }
+}

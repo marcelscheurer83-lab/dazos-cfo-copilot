@@ -3,10 +3,9 @@ import { Routes, Route, Navigate } from 'react-router-dom'
 import { getActiveJobs, type ActiveJob } from './api'
 import Layout from './Layout'
 import Login from './Login'
-import Dashboard from './views/Dashboard'
+import DashboardLayout from './views/DashboardLayout'
+import GoToMarketLayout from './views/GoToMarketLayout'
 import DashboardCurrentSummary from './views/DashboardCurrentSummary'
-import ARR from './views/ARR'
-import ARRScheduleActiveArr from './views/ARRScheduleActiveArr'
 import ARRNewSchedule from './views/ARRNewSchedule'
 import ARRCohortChurn from './views/ARRCohortChurn'
 import ARRBridge from './views/ARRBridge'
@@ -17,7 +16,8 @@ import ChurnAnalysis from './views/ChurnAnalysis'
 import Pipeline from './views/Pipeline'
 import Closed from './views/Closed'
 import Renewals from './views/Renewals'
-import Admin from './views/Admin'
+import ARRLayout from './views/ARRLayout'
+import AnalysesLayout from './views/AnalysesLayout'
 import FinancialsLayout from './views/FinancialsLayout'
 import PnL from './views/PnL'
 import CashFlow from './views/CashFlow'
@@ -108,26 +108,46 @@ export default function App() {
     <Routes>
       <Route path="/" element={<Layout />}>
         <Route index element={<Navigate to="/dashboard" replace />} />
-        <Route path="dashboard" element={<Dashboard />}>
+        <Route path="dashboard" element={<DashboardLayout />}>
           <Route index element={<Navigate to="current-overview" replace />} />
           <Route path="current-overview" element={<DashboardCurrentSummary />} />
           <Route path="current-summary" element={<Navigate to="/dashboard/current-overview" replace />} />
+          <Route path="forecast" element={<ForecastView />} />
           <Route path="q1-2026" element={<DashboardCurrentSummary title="Q1 2026" />} />
           <Route path="q2-2026" element={<DashboardCurrentSummary title="Q2 2026" />} />
         </Route>
-        <Route path="bookings" element={<Closed />} />
-        <Route path="renewals" element={<Renewals />} />
-        <Route path="pipeline-overview" element={<Pipeline />} />
-        <Route path="products-purchased" element={<ARR />} />
-        <Route path="customer-overview" element={<Navigate to="/products-purchased" replace />} />
-        <Route path="arr-schedule/active-arr" element={<ARRScheduleActiveArr />} />
-        <Route path="arr-schedule/new-schedule" element={<ARRNewSchedule />} />
-        <Route path="arr-schedule/cohort-churn" element={<ARRCohortChurn />} />
-        <Route path="arr-schedule/bridge" element={<ARRBridge />} />
-        <Route path="go-to-market/forecast" element={<ForecastView />} />
-        <Route path="analytics" element={<Analytics />} />
-        <Route path="analytics/crm-seats" element={<AnalyticsCRMSeats />} />
-        <Route path="analytics/churn" element={<ChurnAnalysis />} />
+        <Route path="go-to-market" element={<GoToMarketLayout />}>
+          <Route index element={<Navigate to="/go-to-market/bookings" replace />} />
+          <Route path="bookings" element={<Closed />} />
+          <Route path="renewals" element={<Renewals />} />
+          <Route path="pipeline" element={<Pipeline />} />
+        </Route>
+        {/* Legacy URL redirects */}
+        <Route path="go-to-market/forecast" element={<Navigate to="/dashboard/forecast" replace />} />
+        <Route path="bookings" element={<Navigate to="/go-to-market/bookings" replace />} />
+        <Route path="renewals" element={<Navigate to="/go-to-market/renewals" replace />} />
+        <Route path="pipeline-overview" element={<Navigate to="/go-to-market/pipeline" replace />} />
+        {/* Legacy deep-links kept working */}
+        <Route path="arr-schedule/active-arr" element={<Navigate to="/arr/schedule" replace />} />
+        <Route path="arr-schedule/new-schedule" element={<Navigate to="/arr/schedule" replace />} />
+        <Route path="arr-schedule/cohort-churn" element={<Navigate to="/arr/cohort-churn" replace />} />
+        <Route path="arr-schedule/bridge" element={<Navigate to="/arr/bridge" replace />} />
+        <Route path="arr" element={<ARRLayout />}>
+          <Route index element={<Navigate to="/arr/bridge" replace />} />
+          <Route path="bridge" element={<ARRBridge />} />
+          <Route path="cohort-churn" element={<ARRCohortChurn />} />
+          <Route path="schedule" element={<ARRNewSchedule />} />
+        </Route>
+        {/* Legacy deep-links kept working */}
+        <Route path="analytics" element={<Navigate to="/analyses/product-penetration" replace />} />
+        <Route path="analytics/crm-seats" element={<Navigate to="/analyses/crm-seats" replace />} />
+        <Route path="analytics/churn" element={<Navigate to="/analyses/churn" replace />} />
+        <Route path="analyses" element={<AnalysesLayout />}>
+          <Route index element={<Navigate to="/analyses/product-penetration" replace />} />
+          <Route path="product-penetration" element={<Analytics />} />
+          <Route path="crm-seats" element={<AnalyticsCRMSeats />} />
+          <Route path="churn" element={<ChurnAnalysis />} />
+        </Route>
         <Route path="arr" element={<Navigate to="/products-purchased" replace />} />
         <Route path="closed-data" element={<Navigate to="/bookings" replace />} />
         <Route path="financials" element={<FinancialsLayout />}>
@@ -139,7 +159,6 @@ export default function App() {
           <Route path="fpa-chat" element={<FPAChat />} />
           <Route path="data-sync" element={<FinancialsDataSync />} />
         </Route>
-        <Route path="admin" element={<Admin />} />
       </Route>
       <Route path="*" element={<Navigate to="/dashboard" replace />} />
     </Routes>

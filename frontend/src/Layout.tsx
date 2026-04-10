@@ -1,4 +1,3 @@
-import { useEffect, useState } from 'react'
 import { Outlet, NavLink, useLocation } from 'react-router-dom'
 import { useJobs } from './App'
 
@@ -11,57 +10,11 @@ function isSection(item: NavItem): item is NavSection {
 }
 
 const nav: NavItem[] = [
-  {
-    label: 'Dashboard',
-    children: [
-      { to: '/dashboard/current-overview', label: 'Current Performance' },
-      { to: '/go-to-market/forecast', label: 'Current Forecast' },
-      { to: '/dashboard/q2-2026', label: 'Q2 2026' },
-      { to: '/dashboard/q1-2026', label: 'Q1 2026' },
-    ],
-  },
-  {
-    label: 'Go-To-Market',
-    children: [
-      { to: '/bookings', label: 'Bookings' },
-      { to: '/renewals', label: 'Renewals' },
-      { to: '/pipeline-overview', label: 'Pipeline' },
-    ],
-  },
-  {
-    label: 'ARR',
-    children: [
-      { to: '/arr-schedule/bridge', label: 'Bridge' },
-      { to: '/arr-schedule/cohort-churn', label: 'Cohort Retention' },
-      { to: '/arr-schedule/new-schedule', label: 'Schedule' },
-    ],
-  },
-  {
-    label: 'Analyses',
-    children: [
-      { to: '/analytics', label: 'Product penetration' },
-      { to: '/analytics/crm-seats', label: 'CRM seat pricing' },
-      { to: '/analytics/churn', label: 'Churn analysis' },
-    ],
-  },
-  {
-    label: 'Exports',
-    children: [
-      { to: '/products-purchased', label: 'Products purchased' },
-    ],
-  },
-  {
-    label: 'Financials',
-    children: [
-      { to: '/financials/analysis', label: 'Monthly Close' },
-      { to: '/financials/pnl', label: 'P&L' },
-      { to: '/financials/cash-flow', label: 'Cash Flow' },
-      { to: '/financials/balance-sheet', label: 'Balance Sheet' },
-      { to: '/financials/fpa-chat', label: 'FP&A Agent' },
-      { to: '/financials/data-sync', label: 'Data Sync' },
-    ],
-  },
-  { to: '/admin', label: 'Admin' },
+  { to: '/dashboard', label: 'Dashboard' },
+  { to: '/go-to-market', label: 'Go-To-Market' },
+  { to: '/arr', label: 'ARR' },
+  { to: '/analyses', label: 'Analyses' },
+  { to: '/financials', label: 'Financials' },
 ]
 
 const topLevelFontSize = '0.875rem'
@@ -84,41 +37,9 @@ const subLinkStyle = (isActive: boolean) => ({
   fontSize: subLevelFontSize,
 })
 
-const GTM_PATHS = ['/bookings', '/renewals', '/pipeline-overview']
-const ARR_SCHEDULE_PATHS = ['/arr-schedule/new-schedule', '/arr-schedule/cohort-churn', '/arr-schedule/bridge']
-const EXPORTS_PATHS = ['/products-purchased', '/customer-overview']
-const ANALYTICS_PATHS = ['/analytics', '/analytics/crm-seats']
-
 export default function Layout() {
   const location = useLocation()
   const { runningJobs } = useJobs()
-  const [dashboardExpanded, setDashboardExpanded] = useState(true)
-  const [gtmExpanded, setGtmExpanded] = useState(true)
-  const [arrScheduleExpanded, setArrScheduleExpanded] = useState(true)
-  const [exportsExpanded, setExportsExpanded] = useState(true)
-  const [analyticsExpanded, setAnalyticsExpanded] = useState(true)
-
-  useEffect(() => {
-    if (GTM_PATHS.some((p) => location.pathname === p || location.pathname.startsWith(p + '/'))) {
-      setGtmExpanded(true)
-    }
-  }, [location.pathname])
-  useEffect(() => {
-    if (ARR_SCHEDULE_PATHS.some((p) => location.pathname === p || location.pathname.startsWith(p + '/'))) {
-      setArrScheduleExpanded(true)
-    }
-  }, [location.pathname])
-  useEffect(() => {
-    if (EXPORTS_PATHS.some((p) => location.pathname === p || location.pathname.startsWith(p + '/'))) {
-      setExportsExpanded(true)
-    }
-  }, [location.pathname])
-  useEffect(() => {
-    if (ANALYTICS_PATHS.some((p) => location.pathname === p || location.pathname.startsWith(p + '/'))) {
-      setAnalyticsExpanded(true)
-    }
-  }, [location.pathname])
-
   return (
     <div style={{ display: 'flex', minHeight: '100vh' }}>
       <aside
@@ -141,35 +62,12 @@ export default function Layout() {
               const isSectionActive = item.children.some((c) =>
                 location.pathname === c.to || (c.to !== '/dashboard' && location.pathname.startsWith(c.to + '/'))
               )
-              const isExpanded =
-                item.label === 'Dashboard'
-                  ? dashboardExpanded
-                  : item.label === 'Go-To-Market'
-                  ? gtmExpanded
-                  : item.label === 'ARR'
-                    ? arrScheduleExpanded
-                    : item.label === 'Exports'
-                      ? exportsExpanded
-                    : item.label === 'Analyses'
-                      ? analyticsExpanded
-                      : true
-              const setExpanded =
-                item.label === 'Dashboard'
-                  ? (v: boolean) => setDashboardExpanded(v)
-                  : item.label === 'Go-To-Market'
-                  ? (v: boolean) => setGtmExpanded(v)
-                  : item.label === 'ARR'
-                    ? (v: boolean) => setArrScheduleExpanded(v)
-                    : item.label === 'Exports'
-                      ? (v: boolean) => setExportsExpanded(v)
-                      : item.label === 'Analyses'
-                      ? (v: boolean) => setAnalyticsExpanded(v)
-                      : () => {}
+              const isExpanded = true
               return (
                 <div key={idx} style={{ marginBottom: '0.25rem' }}>
                   <button
                     type="button"
-                    onClick={() => setExpanded(!isExpanded)}
+                    onClick={() => {}}
                     style={{
                       width: '100%',
                       padding: '0.6rem 1.25rem',

@@ -40,9 +40,6 @@ function fmtK(n: number) {
 function fmtUSD(n: number) {
   return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 }).format(n)
 }
-function fmtPct(n: number | null) {
-  return n == null || !Number.isFinite(n) ? '—' : `${n.toFixed(1)}%`
-}
 function fmtVar(n: number, pctMode = false) {
   if (!Number.isFinite(n)) return '—'
   const sign = n >= 0 ? '+' : ''
@@ -54,12 +51,6 @@ const isCOGS       = (c: string) => /^total\s+co?gs$/i.test(c.trim()) || /^(tota
 const isGrossProfit = (c: string) => /gross\s+profit/i.test(c)
 const isOpEx       = (c: string) => /^total\s+op.?ex$/i.test(c.trim()) || /^total\s+operating/i.test(c.trim()) || /^operating\s+exp/i.test(c.trim())
 const isNetIncome  = (c: string) => /^net\s+income$/i.test(c.trim()) || /^net\s+(income|loss)/i.test(c.trim())
-
-function varColor(v: number, invert = false) {
-  const eff = invert ? -v : v
-  if (Math.abs(eff) < 0.5) return 'var(--text-muted)'
-  return eff > 0 ? POSITIVE_COLOR : NEGATIVE_COLOR
-}
 
 // ── KPI Card ─────────────────────────────────────────────────────────────────
 function KPICard({
@@ -288,10 +279,6 @@ export default function Forecast2026() {
   const fyGMActual = fyRev.forecast !== 0 ? (fyGP.forecast / fyRev.forecast) * 100 : null
   const fyGMPlan   = fyRev.plan != null && fyGP.plan != null && fyRev.plan !== 0
     ? (fyGP.plan / fyRev.plan) * 100 : null
-  const fyEBITDAMarginAct  = fyRev.forecast !== 0 ? (fyEBITDA.forecast / fyRev.forecast) * 100 : null
-  const fyEBITDAMarginPlan = fyRev.plan != null && fyEBITDA.plan != null && fyRev.plan !== 0
-    ? (fyEBITDA.plan / fyRev.plan) * 100 : null
-
   // Chart data: all 12 months, 3 series (actual / forecast / plan)
   const chartData = useMemo(() => {
     return allYear2026.map((pe) => {
@@ -532,7 +519,7 @@ export default function Forecast2026() {
               <XAxis dataKey="month" tick={{ fill: 'var(--text-muted)', fontSize: 11 }} axisLine={false} tickLine={false} />
               <YAxis tickFormatter={fmtK} tick={{ fill: 'var(--text-muted)', fontSize: 11 }} axisLine={false} tickLine={false} width={55} />
               <Tooltip
-                formatter={(value: number, name: string) => [fmtK(value), fmtLegend(name)]}
+                formatter={(value: number | undefined, name: string) => [fmtK(value ?? 0), fmtLegend(name)]}
                 contentStyle={tooltipStyle} labelStyle={{ color: 'var(--text)', fontWeight: 600 }}
               />
               <Legend formatter={fmtLegend} wrapperStyle={legendStyle} />
@@ -552,7 +539,7 @@ export default function Forecast2026() {
               <XAxis dataKey="month" tick={{ fill: 'var(--text-muted)', fontSize: 11 }} axisLine={false} tickLine={false} />
               <YAxis tickFormatter={(v) => `${v.toFixed(0)}%`} tick={{ fill: 'var(--text-muted)', fontSize: 11 }} axisLine={false} tickLine={false} width={40} domain={['auto', 'auto']} />
               <Tooltip
-                formatter={(value: number, name: string) => [`${value.toFixed(1)}%`, fmtLegend(name)]}
+                formatter={(value: number | undefined, name: string) => [`${(value ?? 0).toFixed(1)}%`, fmtLegend(name)]}
                 contentStyle={tooltipStyle} labelStyle={{ color: 'var(--text)', fontWeight: 600 }}
               />
               <Legend formatter={fmtLegend} wrapperStyle={legendStyle} />
@@ -575,7 +562,7 @@ export default function Forecast2026() {
               <XAxis dataKey="month" tick={{ fill: 'var(--text-muted)', fontSize: 11 }} axisLine={false} tickLine={false} />
               <YAxis tickFormatter={fmtK} tick={{ fill: 'var(--text-muted)', fontSize: 11 }} axisLine={false} tickLine={false} width={55} />
               <Tooltip
-                formatter={(value: number, name: string) => [fmtK(value), fmtLegend(name)]}
+                formatter={(value: number | undefined, name: string) => [fmtK(value ?? 0), fmtLegend(name)]}
                 contentStyle={tooltipStyle} labelStyle={{ color: 'var(--text)', fontWeight: 600 }}
               />
               <Legend formatter={fmtLegend} wrapperStyle={legendStyle} />
@@ -595,7 +582,7 @@ export default function Forecast2026() {
               <XAxis dataKey="month" tick={{ fill: 'var(--text-muted)', fontSize: 11 }} axisLine={false} tickLine={false} />
               <YAxis tickFormatter={fmtK} tick={{ fill: 'var(--text-muted)', fontSize: 11 }} axisLine={false} tickLine={false} width={55} />
               <Tooltip
-                formatter={(value: number, name: string) => [fmtK(value), fmtLegend(name)]}
+                formatter={(value: number | undefined, name: string) => [fmtK(value ?? 0), fmtLegend(name)]}
                 contentStyle={tooltipStyle} labelStyle={{ color: 'var(--text)', fontWeight: 600 }}
               />
               <Legend formatter={fmtLegend} wrapperStyle={legendStyle} />

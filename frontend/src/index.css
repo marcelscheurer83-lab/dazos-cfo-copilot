@@ -15,7 +15,7 @@
 }
 
 html {
-  font-size: 125%; /* scale up so localhost matches the deployed look */
+  font-size: 125%;
 }
 
 * {

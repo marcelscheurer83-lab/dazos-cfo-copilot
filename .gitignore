@@ -6,6 +6,7 @@ backend/credentials/
 
 # Python
 backend/.venv/
+backend/.venv312/
 __pycache__/
 *.py[cod]
 *.db

@@ -260,6 +260,8 @@ export default function YTDOverview() {
     const m: Record<string, Record<string, { actual: number; plan: number | null }>> = {}
     for (const l of pnlLines) {
       if (!m[l.period_end]) m[l.period_end] = {}
+      // Never overwrite a real actual row with a plan-only row (amount=0)
+      if (l.is_plan_only && m[l.period_end][l.category]) continue
       m[l.period_end][l.category] = { actual: l.amount, plan: l.plan_amount ?? null }
     }
     return m
@@ -475,6 +477,7 @@ export default function YTDOverview() {
     for (const l of deptLines) {
       if (!m[l.period_end]) m[l.period_end] = {}
       if (!m[l.period_end][l.dept]) m[l.period_end][l.dept] = {}
+      if (l.is_plan_only && m[l.period_end][l.dept][l.category]) continue
       m[l.period_end][l.dept][l.category] = { actual: l.amount, plan: l.plan_amount ?? null }
     }
     return m

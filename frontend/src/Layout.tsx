@@ -156,7 +156,7 @@ export default function Layout() {
           </button>
         </div>
       </aside>
-      <main style={{ flex: 1, padding: '2rem', overflow: 'auto', maxWidth: 1400 }}>
+      <main style={{ flex: 1, padding: '2rem', overflow: 'auto' }}>
         <Outlet />
       </main>
     </div>

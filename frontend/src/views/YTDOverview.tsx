@@ -267,6 +267,20 @@ export default function YTDOverview() {
     return m
   }, [pnlLines])
 
+  // Sum non-subtotal actual rows by line_type per period — fallback when the total row is missing
+  const byPeriodType = useMemo(() => {
+    const m: Record<string, Record<string, { actual: number; plan: number | null }>> = {}
+    for (const l of pnlLines) {
+      if (l.is_plan_only || l.is_subtotal) continue
+      if (!m[l.period_end]) m[l.period_end] = {}
+      const cur = m[l.period_end][l.line_type] ?? { actual: 0, plan: null }
+      cur.actual += l.amount
+      if (l.plan_amount != null) cur.plan = (cur.plan ?? 0) + l.plan_amount
+      m[l.period_end][l.line_type] = cur
+    }
+    return m
+  }, [pnlLines])
+
   const bsByPeriod = useMemo(() => {
     const m: Record<string, Record<string, { actual: number; plan: number | null }>> = {}
     for (const l of bsLines) {
@@ -318,6 +332,28 @@ export default function YTDOverview() {
     return { actual: a, plan: anyPlan ? p : null }
   }
 
+  // Sum by line_type across available months (fallback when total row is absent)
+  function ytdSumType(lineType: string): { actual: number; plan: number | null } {
+    let a = 0; let p: number | null = null; let anyPlan = false
+    for (const pe of availMonths) {
+      const c = byPeriodType[pe]?.[lineType]
+      if (c) { a += c.actual; if (c.plan != null) { anyPlan = true; p = (p ?? 0) + c.plan } }
+    }
+    return { actual: a, plan: anyPlan ? p : null }
+  }
+
+  // Get value for a period falling back to type-level sum when total row is absent
+  function getRevVal(period: string): { actual: number; plan: number | null } {
+    const v = getVal(period, catNames.revenue)
+    if (v.actual !== 0 || v.plan != null) return v
+    return byPeriodType[period]?.['revenue'] ?? { actual: 0, plan: null }
+  }
+  function getOpExVal(period: string): { actual: number; plan: number | null } {
+    const v = getVal(period, catNames.opex)
+    if (v.actual !== 0 || v.plan != null) return v
+    return byPeriodType[period]?.['opex'] ?? { actual: 0, plan: null }
+  }
+
   function getLatestBs(cat: string): { actual: number; plan: number | null } {
     if (!latestMonth) return { actual: 0, plan: null }
     return bsByPeriod[latestMonth]?.[cat] ?? { actual: 0, plan: null }
@@ -339,7 +375,7 @@ export default function YTDOverview() {
   // ── Chart data ─────────────────────────────────────────────────────────────
   const chartData = useMemo(() => {
     return availMonths.map((pe) => {
-      const rev = getVal(pe, catNames.revenue)
+      const rev = getRevVal(pe)
       const gp = getVal(pe, catNames.grossProfit)
       const ni = getVal(pe, catNames.ebitda)
       const cash = getBsVal(pe, cashCat)
@@ -358,12 +394,12 @@ export default function YTDOverview() {
         cashPlan: cash.plan,
       }
     })
-  }, [availMonths, catNames, cashCat, byPeriod, bsByPeriod])
+  }, [availMonths, catNames, cashCat, byPeriod, bsByPeriod, byPeriodType])
 
   // ── KPI values ─────────────────────────────────────────────────────────────
-  const ytdRev = ytdSum(catNames.revenue)
+  const ytdRev = (() => { const v = ytdSum(catNames.revenue); return (v.actual !== 0 || v.plan != null) ? v : ytdSumType('revenue') })()
   const ytdGP = ytdSum(catNames.grossProfit)
-  const ytdOpEx = ytdSum(catNames.opex)
+  const ytdOpEx = (() => { const v = ytdSum(catNames.opex); return (v.actual !== 0 || v.plan != null) ? v : ytdSumType('opex') })()
   const ytdNI = ytdSum(catNames.netIncome)
   const latestCash = latestMonth ? getBsVal(latestMonth, cashCat) : { actual: 0, plan: null }
 
@@ -378,9 +414,9 @@ export default function YTDOverview() {
   // ── MBR table rows ─────────────────────────────────────────────────────────
   const mbrRows = useMemo(() => {
     if (!latestMonth) return []
-    const revM = getVal(latestMonth, catNames.revenue)
+    const revM = getRevVal(latestMonth)
     const gpM = getVal(latestMonth, catNames.grossProfit)
-    const opexM = getVal(latestMonth, catNames.opex)
+    const opexM = getOpExVal(latestMonth)
     const niM = getVal(latestMonth, catNames.netIncome)
     const cashM = getBsVal(latestMonth, cashCat)
 
@@ -431,7 +467,7 @@ export default function YTDOverview() {
         pctMode: false,
       },
     ]
-  }, [latestMonth, catNames, cashCat, byPeriod, bsByPeriod, ytdRev, ytdGP, ytdOpEx, ytdNI, ytdEBITDA, ytdGMActual, ytdGMPlan, ytdEBITDAMarginAct, ytdEBITDAMarginPlan])
+  }, [latestMonth, catNames, cashCat, byPeriod, bsByPeriod, byPeriodType, ytdRev, ytdGP, ytdOpEx, ytdNI, ytdEBITDA, ytdGMActual, ytdGMPlan, ytdEBITDAMarginAct, ytdEBITDAMarginPlan])
 
   // ── Department section rows ─────────────────────────────────────────────────
   // CoGS

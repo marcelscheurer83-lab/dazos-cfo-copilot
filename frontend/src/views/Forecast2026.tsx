@@ -206,6 +206,21 @@ export default function Forecast2026() {
     return m
   }, [pnlLines])
 
+  // Sum non-subtotal rows by line_type per period — fallback when total row is absent
+  const byPeriodType = useMemo(() => {
+    const m: Record<string, Record<string, PeriodVal>> = {}
+    for (const l of pnlLines) {
+      if (l.is_subtotal) continue
+      if (!m[l.period_end]) m[l.period_end] = {}
+      const cur = m[l.period_end][l.line_type] ?? { actual: 0, plan: null, is_plan_only: l.is_plan_only }
+      cur.actual += l.amount
+      if (l.plan_amount != null) cur.plan = (cur.plan ?? 0) + l.plan_amount
+      cur.is_plan_only = cur.is_plan_only && l.is_plan_only
+      m[l.period_end][l.line_type] = cur
+    }
+    return m
+  }, [pnlLines])
+
   const bsByPeriod = useMemo(() => {
     const m: Record<string, Record<string, PeriodVal>> = {}
     for (const l of bsLines) {
@@ -256,6 +271,25 @@ export default function Forecast2026() {
     return { forecast: fc, plan: anyPlan ? pl : null }
   }
 
+  // Full-year forecast by line_type — fallback when total row is missing
+  function fyForecastByType(lineType: string): { forecast: number; plan: number | null } {
+    let fc = 0, pl = 0, anyPlan = false
+    for (const pe of allYear2026) {
+      const c = byPeriodType[pe]?.[lineType]
+      if (!c) continue
+      fc += c.is_plan_only ? (c.plan ?? 0) : c.actual
+      if (c.plan != null) { pl += c.plan; anyPlan = true }
+    }
+    return { forecast: fc, plan: anyPlan ? pl : null }
+  }
+
+  // Per-period revenue with line_type fallback
+  function getRevVal(pe: string): PeriodVal {
+    const v = getVal(pe, catNames.revenue)
+    if (v.actual !== 0 || v.plan != null) return v
+    return byPeriodType[pe]?.['revenue'] ?? { actual: 0, plan: null, is_plan_only: !actualMonthsSet.has(pe) }
+  }
+
   // Get BS value at end of year (either actual if Dec is synced, or latest actual)
   function fyBs(cat: string | null): { forecast: number; plan: number | null } {
     if (!cat) return { forecast: 0, plan: null }
@@ -268,10 +302,10 @@ export default function Forecast2026() {
     return { forecast: v.actual, plan: v.plan }
   }
 
-  // Full-year KPIs
-  const fyRev     = fyForecast(catNames.revenue)
+  // Full-year KPIs (with line_type fallback when total row is absent in DB)
+  const fyRev  = (() => { const v = fyForecast(catNames.revenue); return (v.forecast !== 0 || v.plan != null) ? v : fyForecastByType('revenue') })()
   const fyGP      = fyForecast(catNames.grossProfit)
-  const fyOpEx    = fyForecast(catNames.opex)
+  const fyOpEx = (() => { const v = fyForecast(catNames.opex); return (v.forecast !== 0 || v.plan != null) ? v : fyForecastByType('opex') })()
   const fyNI      = fyForecast(catNames.netIncome)
   const fyCash    = fyBs(cashCat)
 
@@ -282,7 +316,7 @@ export default function Forecast2026() {
   const chartData = useMemo(() => {
     return allYear2026.map((pe) => {
       const isPast = actualMonthsSet.has(pe)
-      const rev  = getVal(pe, catNames.revenue)
+      const rev  = getRevVal(pe)
       const gp   = getVal(pe, catNames.grossProfit)
       const ni   = getVal(pe, catNames.ebitda)
       const cash = getBsVal(pe, cashCat)
@@ -312,14 +346,14 @@ export default function Forecast2026() {
         gmPlan,
       }
     })
-  }, [allYear2026, actualMonthsSet, catNames, cashCat, byPeriod, bsByPeriod])
+  }, [allYear2026, actualMonthsSet, catNames, cashCat, byPeriod, bsByPeriod, byPeriodType])
 
   // Financial Overview rows
   const overviewRows = useMemo((): ForecastRow[] => {
-    const revFY = fyForecast(catNames.revenue)
-    const gpFY  = fyForecast(catNames.grossProfit)
-    const opexFY = fyForecast(catNames.opex)
-    const niFY  = fyForecast(catNames.netIncome)
+    const revFY  = (() => { const v = fyForecast(catNames.revenue); return (v.forecast !== 0 || v.plan != null) ? v : fyForecastByType('revenue') })()
+    const gpFY   = fyForecast(catNames.grossProfit)
+    const opexFY = (() => { const v = fyForecast(catNames.opex); return (v.forecast !== 0 || v.plan != null) ? v : fyForecastByType('opex') })()
+    const niFY   = fyForecast(catNames.netIncome)
     const ebFY  = fyForecast(catNames.ebitda)
     const cashFY = fyBs(cashCat)
 
@@ -340,7 +374,7 @@ export default function Forecast2026() {
       { label: 'Cash Balance',      forecast: cashFY.forecast, plan: cashFY.plan },
     ]
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [pnlLines, bsLines, catNames, cashCat, allYear2026, actualMonthsSet, byPeriod, bsByPeriod])
+  }, [pnlLines, bsLines, catNames, cashCat, allYear2026, actualMonthsSet, byPeriod, bsByPeriod, byPeriodType])
 
   // CoGS rows
   const cogsRows: ForecastRow[] = useMemo(() => {

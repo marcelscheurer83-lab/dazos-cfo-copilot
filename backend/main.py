@@ -46,6 +46,7 @@ from models import (
     CashFlowLine,
     BudgetLine,
     BalanceSheetLine,
+    DeptDetailLine,
     FinancialAnalysis,
     SheetSnapshot,
     Account,
@@ -76,6 +77,7 @@ from schemas import (
     PnLLineOut,
     CashFlowLineOut,
     BalanceSheetLineOut,
+    DeptDetailLineOut,
     BudgetVsActualOut,
     FinancialAnalysisOut,
     FPAChatRequest,
@@ -299,6 +301,9 @@ async def _migrate_db() -> None:
         ("accounts", "payment_status",            "VARCHAR(64)"),
         ("accounts", "outstanding_balance",       "FLOAT"),
         ("accounts", "overdue_invoice_count",     "INTEGER"),
+        ("cash_flow_lines",   "is_subtotal",   "INTEGER"),
+        ("pnl_lines",         "is_plan_only",  "INTEGER"),
+        ("dept_detail_lines", "is_plan_only",  "INTEGER"),
     ]
     async with AsyncSessionLocal() as db:
         for tbl, col, col_type in new_cols:
@@ -601,29 +606,422 @@ async def get_kpi(
     )
 
 
+@app.get("/api/pnl/periods")
+async def get_pnl_periods(db: AsyncSession = Depends(get_db)):
+    """Return list of available P&L periods, newest first."""
+    r = await db.execute(
+        select(PnLLine.period_end).distinct().order_by(PnLLine.period_end.desc())
+    )
+    periods = [str(row) for row in r.scalars().all()]
+    return {"periods": periods}
+
+
+@app.get("/api/pnl/observations")
+async def get_pnl_observations(
+    period_end: date = Query(...),
+    db: AsyncSession = Depends(get_db),
+):
+    """Generate brief FP&A observations for the selected month and YTD."""
+    # Fetch YTD data: all months in the same fiscal year up to selected period
+    fiscal_year_start = date(period_end.year, 1, 1)
+    r = await db.execute(
+        select(PnLLine)
+        .where(PnLLine.period_end >= fiscal_year_start)
+        .where(PnLLine.period_end <= period_end)
+        .order_by(PnLLine.period_end, PnLLine.sort_order)
+    )
+    all_rows = r.scalars().all()
+    if not all_rows:
+        return {"observations": None, "period_end": str(period_end)}
+
+    # Build compact text for the LLM
+    periods = sorted(set(r.period_end for r in all_rows))
+    month_rows = [r for r in all_rows if r.period_end == period_end]
+
+    def _fmt_amt(v):
+        if v is None:
+            return "—"
+        return f"${v/1000:.0f}k" if abs(v) < 1_000_000 else f"${v/1_000_000:.2f}M"
+
+    lines_block = []
+    for row in sorted(month_rows, key=lambda x: x.sort_order):
+        act = _fmt_amt(row.amount)
+        plan = _fmt_amt(row.plan_amount) if row.plan_amount is not None else "—"
+        var = _fmt_amt(row.amount - row.plan_amount) if row.plan_amount is not None else "—"
+        prefix = "**" if row.is_subtotal else "  "
+        lines_block.append(f"{prefix}{row.category}: Actual={act} Plan={plan} Var={var}")
+    month_text = "\n".join(lines_block)
+
+    # YTD aggregation
+    from collections import defaultdict
+    ytd_actual: dict = defaultdict(float)
+    ytd_plan: dict = defaultdict(float)
+    ytd_has_plan: dict = defaultdict(bool)
+    sort_map: dict = {}
+    subtype_map: dict = {}
+    for row in all_rows:
+        ytd_actual[row.category] += row.amount
+        if row.plan_amount is not None:
+            ytd_plan[row.category] += row.plan_amount
+            ytd_has_plan[row.category] = True
+        sort_map[row.category] = row.sort_order
+        subtype_map[row.category] = row.is_subtotal
+
+    ytd_block = []
+    for cat in sorted(ytd_actual, key=lambda c: sort_map.get(c, 0)):
+        act = _fmt_amt(ytd_actual[cat])
+        plan = _fmt_amt(ytd_plan[cat]) if ytd_has_plan.get(cat) else "—"
+        var = _fmt_amt(ytd_actual[cat] - ytd_plan[cat]) if ytd_has_plan.get(cat) else "—"
+        prefix = "**" if subtype_map.get(cat) else "  "
+        ytd_block.append(f"{prefix}{cat}: Actual={act} Plan={plan} Var={var}")
+    ytd_text = "\n".join(ytd_block)
+
+    period_label = period_end.strftime("%B %Y")
+    ytd_label = f"Jan–{period_end.strftime('%b')} {period_end.year}"
+
+    prompt = f"""You are a CFO-level FP&A analyst. Review the P&L for {period_label} and share 4–6 concise bullet point observations for an executive audience. Focus on: key variances vs plan, trends, risks, and areas of concern or outperformance. Be specific with numbers.
+
+## {period_label} — Month Actuals vs Plan
+{month_text}
+
+## {ytd_label} — YTD Actuals vs Plan
+{ytd_text}
+
+Respond with bullet points only (use • as bullet). No headers, no preamble."""
+
+    try:
+        import anthropic as _anthropic
+        _client = _anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+        msg = _client.messages.create(
+            model="claude-sonnet-4-5",
+            max_tokens=600,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        obs_text = msg.content[0].text.strip()
+    except Exception as e:
+        logger.exception("P&L observations LLM error")
+        obs_text = None
+
+    return {"observations": obs_text, "period_end": str(period_end)}
+
+
+@app.get("/api/cf/observations")
+async def get_cf_observations(
+    period_end: date = Query(...),
+    db: AsyncSession = Depends(get_db),
+):
+    """Generate brief FP&A observations for the Cash Flow statement."""
+    fiscal_year_start = date(period_end.year, 1, 1)
+    r = await db.execute(
+        select(CashFlowLine)
+        .where(CashFlowLine.period_end >= fiscal_year_start)
+        .where(CashFlowLine.period_end <= period_end)
+        .order_by(CashFlowLine.period_end, CashFlowLine.sort_order)
+    )
+    all_rows = r.scalars().all()
+    if not all_rows:
+        return {"observations": None, "period_end": str(period_end)}
+
+    def _fmt_amt(v):
+        if v is None:
+            return "—"
+        return f"${v/1000:.0f}k" if abs(v) < 1_000_000 else f"${v/1_000_000:.2f}M"
+
+    month_rows = [row for row in all_rows if row.period_end == period_end]
+    lines_block = []
+    for row in sorted(month_rows, key=lambda x: x.sort_order):
+        act = _fmt_amt(row.amount)
+        plan = _fmt_amt(row.plan_amount) if row.plan_amount is not None else "—"
+        var = _fmt_amt(row.amount - row.plan_amount) if row.plan_amount is not None else "—"
+        lines_block.append(f"  [{row.section}] {row.category}: Actual={act} Plan={plan} Var={var}")
+    month_text = "\n".join(lines_block)
+
+    from collections import defaultdict
+    ytd_actual: dict = defaultdict(float)
+    ytd_plan: dict = defaultdict(float)
+    ytd_has_plan: dict = defaultdict(bool)
+    sort_map: dict = {}
+    sec_map: dict = {}
+    for row in all_rows:
+        ytd_actual[row.category] += row.amount
+        if row.plan_amount is not None:
+            ytd_plan[row.category] += row.plan_amount
+            ytd_has_plan[row.category] = True
+        sort_map[row.category] = row.sort_order
+        sec_map[row.category] = row.section
+
+    ytd_block = []
+    for cat in sorted(ytd_actual, key=lambda c: sort_map.get(c, 0)):
+        act = _fmt_amt(ytd_actual[cat])
+        plan = _fmt_amt(ytd_plan[cat]) if ytd_has_plan.get(cat) else "—"
+        var = _fmt_amt(ytd_actual[cat] - ytd_plan[cat]) if ytd_has_plan.get(cat) else "—"
+        ytd_block.append(f"  [{sec_map.get(cat,'?')}] {cat}: Actual={act} Plan={plan} Var={var}")
+    ytd_text = "\n".join(ytd_block)
+
+    period_label = period_end.strftime("%B %Y")
+    ytd_label = f"Jan–{period_end.strftime('%b')} {period_end.year}"
+
+    prompt = f"""You are a CFO-level FP&A analyst. Review the Cash Flow statement for {period_label} and share 4–6 concise bullet point observations for an executive audience. Focus on: operating cash generation vs plan, key working capital movements, investing activity, liquidity implications. Be specific with numbers.
+
+## {period_label} — Month Actuals vs Plan
+{month_text}
+
+## {ytd_label} — YTD Actuals vs Plan
+{ytd_text}
+
+Respond with bullet points only (use • as bullet). No headers, no preamble."""
+
+    try:
+        import anthropic as _anthropic
+        _client = _anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+        msg = _client.messages.create(
+            model="claude-sonnet-4-5",
+            max_tokens=600,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        obs_text = msg.content[0].text.strip()
+    except Exception as e:
+        logger.exception("CF observations LLM error")
+        obs_text = None
+
+    return {"observations": obs_text, "period_end": str(period_end)}
+
+
+@app.get("/api/bs/observations")
+async def get_bs_observations(
+    period_end: date = Query(...),
+    db: AsyncSession = Depends(get_db),
+):
+    """Generate brief FP&A observations for the Balance Sheet."""
+    r = await db.execute(
+        select(BalanceSheetLine)
+        .where(BalanceSheetLine.period_end == period_end)
+        .order_by(BalanceSheetLine.sort_order)
+    )
+    all_rows = r.scalars().all()
+    if not all_rows:
+        return {"observations": None, "period_end": str(period_end)}
+
+    def _fmt_amt(v):
+        if v is None:
+            return "—"
+        return f"${v/1000:.0f}k" if abs(v) < 1_000_000 else f"${v/1_000_000:.2f}M"
+
+    lines_block = []
+    for row in all_rows:
+        act = _fmt_amt(row.amount)
+        plan = _fmt_amt(row.plan_amount) if row.plan_amount is not None else "—"
+        var = _fmt_amt(row.amount - row.plan_amount) if row.plan_amount is not None else "—"
+        prefix = "**" if row.is_subtotal else "  "
+        lines_block.append(f"{prefix}[{row.section}] {row.category}: Actual={act} Plan={plan} Var={var}")
+    bs_text = "\n".join(lines_block)
+
+    period_label = period_end.strftime("%B %Y")
+
+    prompt = f"""You are a CFO-level FP&A analyst. Review the Balance Sheet for {period_label} and share 4–6 concise bullet point observations for an executive audience. Focus on: liquidity position, working capital trends, key variances vs plan, leverage, and any balance sheet risks. Be specific with numbers.
+
+## {period_label} — Balance Sheet Actuals vs Plan
+{bs_text}
+
+Respond with bullet points only (use • as bullet). No headers, no preamble."""
+
+    try:
+        import anthropic as _anthropic
+        _client = _anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+        msg = _client.messages.create(
+            model="claude-sonnet-4-5",
+            max_tokens=600,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        obs_text = msg.content[0].text.strip()
+    except Exception as e:
+        logger.exception("BS observations LLM error")
+        obs_text = None
+
+    return {"observations": obs_text, "period_end": str(period_end)}
+
+
+@app.get("/api/dept-detail", response_model=list[DeptDetailLineOut])
+async def get_dept_detail(
+    period_end: Optional[date] = Query(None),
+    months: int = Query(3, ge=1, le=24),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return department detail lines for up to `months` month-ends."""
+    anchor = period_end
+    if anchor is None:
+        r_anchor = await db.execute(select(func.max(DeptDetailLine.period_end)))
+        anchor = r_anchor.scalar_one_or_none()
+        if anchor is None:
+            return []
+
+    r_periods = await db.execute(
+        select(DeptDetailLine.period_end)
+        .where(DeptDetailLine.period_end <= anchor)
+        .distinct()
+        .order_by(DeptDetailLine.period_end.desc())
+        .limit(months)
+    )
+    periods = sorted(r_periods.scalars().all())
+
+    if not periods:
+        return []
+
+    r = await db.execute(
+        select(DeptDetailLine)
+        .where(DeptDetailLine.period_end.in_(periods))
+        .order_by(DeptDetailLine.period_end, DeptDetailLine.sort_order)
+    )
+    rows = r.scalars().all()
+    return [
+        DeptDetailLineOut(
+            period_end=row.period_end,
+            dept=row.dept,
+            category=row.category,
+            amount=row.amount,
+            plan_amount=row.plan_amount,
+            is_subtotal=bool(row.is_subtotal),
+            is_plan_only=bool(row.is_plan_only),
+            sort_order=row.sort_order,
+        )
+        for row in rows
+    ]
+
+
+@app.get("/api/overview/observations")
+async def get_overview_observations(
+    period_end: date = Query(...),
+    db: AsyncSession = Depends(get_db),
+):
+    """Generate YTD executive summary observations across P&L, Cash Flow, and Balance Sheet."""
+    # Gather YTD P&L data (all months up to period_end)
+    pnl_r = await db.execute(
+        select(PnLLine)
+        .where(PnLLine.period_end <= period_end)
+        .order_by(PnLLine.period_end, PnLLine.sort_order)
+    )
+    pnl_rows = pnl_r.scalars().all()
+
+    # Latest BS snapshot
+    bs_r = await db.execute(
+        select(BalanceSheetLine)
+        .where(BalanceSheetLine.period_end == period_end)
+        .order_by(BalanceSheetLine.sort_order)
+    )
+    bs_rows = bs_r.scalars().all()
+
+    if not pnl_rows:
+        return {"observations": None, "period_end": str(period_end)}
+
+    def _fmt(v):
+        if v is None: return "—"
+        return f"${v/1000:.0f}k" if abs(v) < 1_000_000 else f"${v/1_000_000:.2f}M"
+
+    # Aggregate YTD P&L by category
+    ytd: dict[str, dict] = {}
+    for row in pnl_rows:
+        if row.category not in ytd:
+            ytd[row.category] = {"actual": 0.0, "plan": 0.0, "has_plan": False,
+                                  "line_type": row.line_type, "is_subtotal": row.is_subtotal}
+        ytd[row.category]["actual"] += row.amount
+        if row.plan_amount is not None:
+            ytd[row.category]["plan"] += row.plan_amount
+            ytd[row.category]["has_plan"] = True
+
+    # Month label for period
+    period_label = period_end.strftime("%B %Y")
+    ytd_label = f"Jan–{period_end.strftime('%b')} {period_end.year}"
+
+    pnl_lines = []
+    for cat, d in ytd.items():
+        if not d["is_subtotal"] and d["line_type"] not in ("other",):
+            continue  # only show subtotals and 'other' items for brevity
+        var = _fmt(d["actual"] - d["plan"]) if d["has_plan"] else "—"
+        pnl_lines.append(f"  {cat}: Actual={_fmt(d['actual'])} Plan={_fmt(d['plan']) if d['has_plan'] else '—'} Var={var}")
+    pnl_text = "\n".join(pnl_lines)
+
+    bs_lines = [
+        f"  {r.category}: {_fmt(r.amount)}" + (f" vs Plan {_fmt(r.plan_amount)}" if r.plan_amount else "")
+        for r in bs_rows if r.is_subtotal or r.category.lower() in ("cash", "accounts receivable", "deferred revenue")
+    ]
+    bs_text = "\n".join(bs_lines)
+
+    prompt = f"""You are a CFO-level FP&A analyst. Based on the {ytd_label} YTD financial data below, provide 5–7 concise executive bullet points covering: revenue performance vs plan, gross margin, OpEx discipline, EBITDA trend, cash position, and any notable risks or highlights. Be specific with dollar amounts and percentages.
+
+## YTD P&L ({ytd_label})
+{pnl_text}
+
+## Balance Sheet as of {period_label}
+{bs_text}
+
+Respond with bullet points only (use • as bullet). No headers, no preamble."""
+
+    try:
+        import anthropic as _anthropic
+        _client = _anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+        msg = _client.messages.create(
+            model="claude-sonnet-4-5",
+            max_tokens=700,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        obs_text = msg.content[0].text.strip()
+    except Exception as e:
+        logger.exception("Overview observations LLM error")
+        obs_text = None
+
+    return {"observations": obs_text, "period_end": str(period_end)}
+
+
 @app.get("/api/pnl", response_model=list[PnLLineOut])
 async def get_pnl(
     period_end: Optional[date] = Query(None),
-    months: int = Query(3, ge=1, le=12),
+    months: int = Query(3, ge=1, le=24),
     db: AsyncSession = Depends(get_db),
 ):
-    q = select(PnLLine).order_by(PnLLine.period_end.desc(), PnLLine.id)
-    if period_end:
-        q = q.where(PnLLine.period_end <= period_end)
-    r = await db.execute(q.limit(500))
+    """
+    Return P&L lines for up to ``months`` distinct month-ends, all <= ``period_end`` (newest first in DB, output chronological).
+
+    Uses a two-step query so every month includes **all** categories (avoids the old ``limit(1000)`` truncating mid-month and breaking YTD).
+    """
+    anchor = period_end
+    if anchor is None:
+        r_anchor = await db.execute(select(func.max(PnLLine.period_end)))
+        anchor = r_anchor.scalar_one_or_none()
+        if anchor is None:
+            return []
+
+    pr = await db.execute(
+        select(PnLLine.period_end)
+        .distinct()
+        .where(PnLLine.period_end <= anchor)
+        .order_by(PnLLine.period_end.desc())
+        .limit(months)
+    )
+    period_list = [t[0] for t in pr.all()]
+    if not period_list:
+        return []
+
+    r = await db.execute(
+        select(PnLLine)
+        .where(PnLLine.period_end.in_(period_list))
+        .order_by(PnLLine.period_end, PnLLine.sort_order)
+    )
     rows = r.scalars().all()
-    seen = set()
-    by_period = {}
-    for row in rows:
-        if row.period_end not in by_period:
-            by_period[row.period_end] = []
-        if len(by_period) > months:
-            break
-        by_period[row.period_end].append(row)
-    out = []
-    for period in sorted(by_period.keys(), reverse=True)[:months]:
-        for row in by_period[period]:
-            out.append(PnLLineOut(period_end=row.period_end, line_type=row.line_type, category=row.category, amount=row.amount, is_subtotal=bool(row.is_subtotal)))
+    out: list[PnLLineOut] = []
+    for period in sorted(period_list):
+        for row in rows:
+            if row.period_end != period:
+                continue
+            out.append(PnLLineOut(
+                period_end=row.period_end,
+                line_type=row.line_type,
+                category=row.category,
+                amount=row.amount,
+                plan_amount=row.plan_amount,
+                is_subtotal=bool(row.is_subtotal),
+                is_plan_only=bool(row.is_plan_only),
+                sort_order=row.sort_order or 0,
+            ))
     return out
 
 
@@ -639,7 +1037,11 @@ async def get_cashflow(
     r = await db.execute(q.limit(200))
     rows = r.scalars().all()
     periods = sorted(set(row.period_end for row in rows), reverse=True)[:months]
-    out = [CashFlowLineOut(period_end=row.period_end, section=row.section, category=row.category, amount=row.amount) for row in rows if row.period_end in periods]
+    out = [CashFlowLineOut(
+        period_end=row.period_end, section=row.section, category=row.category,
+        amount=row.amount, plan_amount=row.plan_amount,
+        is_subtotal=bool(row.is_subtotal), sort_order=row.sort_order,
+    ) for row in rows if row.period_end in periods]
     return out
 
 
@@ -1181,12 +1583,166 @@ Be specific — include tab names, row numbers, and column letters where you can
 # ── Financial model sync (Google Sheets → DB) ────────────────────────────────
 
 _SHEET_TAB_MAP = {
-    "pnl": {"actuals": "P&L", "plan": "P&L_2026P"},
-    "bs":  {"actuals": "BS",  "plan": "BS_2026P"},
-    "cf":  {"actuals": "CF",  "plan": "CF_2026P"},
+    "pnl":  {"actuals": "P&L",                        "plan": "P&L_2026P"},
+    "bs":   {"actuals": "BS",                         "plan": "BS_2026P"},
+    "cf":   {"actuals": "CF",                         "plan": "CF_2026P"},
+    "dept": {"actuals": "Sales & Marketing",           "plan": "Sales & Marketing_2026P",           "default_dept": "Sales & Marketing"},
+    "pe":   {"actuals": "Product & Engineering",       "plan": "Product & Engineering_2026P",       "default_dept": "Product & Engineering"},
+    "ga":   {"actuals": "General & Administrative",    "plan": "General & Administrative_2026P",    "default_dept": "General & Administrative"},
 }
 
 _SYNC_STATUS_KEY_PREFIX = "__sync_status__"
+
+# Ordered list of all model tabs to snapshot for agent context
+_ALL_MODEL_TABS = [
+    "OVERVIEW", "ASSUMPTIONS",
+    "P&L", "BS", "CF",
+    "Sales and CS capacity", "Headcount",
+    "ARR_Calculations", "ARR_Actuals", "ARR_Schedule",
+    "CoGS", "Sales & Marketing", "Product & Engineering", "General & Administrative",
+    "OVERVIEW_2026P", "P&L_2026P", "BS_2026P", "CF_2026P",
+    "Sales and CS capacity_2026P", "Headcount_2026P", "Hiring plan_2026P",
+    "ARR_Calculations_2026P", "CoGS_2026P", "Sales & Marketing_2026P",
+    "Product & Engineering_2026P", "General & Administrative_2026P",
+]
+
+
+@app.post("/api/financials/sync-model-tabs")
+async def sync_model_tabs(db: AsyncSession = Depends(get_db)):
+    """
+    Read all model tabs from Google Sheets and store as raw snapshots for agent context.
+    """
+    from connectors.google_sheets import GoogleSheetsConnector
+    connector = GoogleSheetsConnector()
+    connector.set_base_path(Path(__file__).resolve().parent)
+    if not connector.is_configured():
+        raise HTTPException(status_code=503, detail="Google Sheets not configured.")
+
+    # Phase 1: list available tabs
+    try:
+        available = await asyncio.to_thread(connector.list_sheets)
+        available_titles = {s["title"] for s in available}
+        _logger.info(f"sync_model_tabs: found {len(available)} tabs in spreadsheet")
+    except Exception as e:
+        _logger.exception("sync_model_tabs: list_sheets failed")
+        raise HTTPException(status_code=500, detail=f"Could not list sheets: {e}")
+
+    results: list[dict] = []
+
+    def _transient_sheets_read_error(msg: str) -> bool:
+        """True if a retry may help (Google burst / flaky SSL / rate hints)."""
+        m = (msg or "").lower()
+        return any(
+            x in m
+            for x in (
+                "ssl", "wrong version", "length mismatch", "internal error",
+                "connection reset", "broken pipe", "eof", "temporarily",
+                "429", "rate", "quota", "timed out", "timeout",
+                "remote end closed", "decryption failed",
+            )
+        )
+
+    async def _read_one_attempt(tab_name: str, per_tab_timeout: float) -> dict:
+        """Single read attempt — no DB access."""
+        if tab_name not in available_titles:
+            return {"tab": tab_name, "ok": False, "error": "Tab not found in spreadsheet"}
+        try:
+            raw = await asyncio.wait_for(
+                asyncio.to_thread(connector.read_range, f"'{tab_name}'!A1:CX500"),
+                timeout=per_tab_timeout,
+            )
+            if not raw:
+                return {"tab": tab_name, "ok": False, "error": "Empty or unreadable"}
+            lines = []
+            for row in raw:
+                cells = [str(c) for c in row]
+                if any(c.strip() for c in cells):
+                    lines.append("\t".join(cells))
+            return {"tab": tab_name, "ok": True, "rows": len(lines), "text": "\n".join(lines)}
+        except asyncio.TimeoutError:
+            return {"tab": tab_name, "ok": False, "error": f"Timed out after {int(per_tab_timeout)}s"}
+        except Exception as e:
+            return {"tab": tab_name, "ok": False, "error": str(e)}
+
+    async def _read_one(tab_name: str) -> dict:
+        """Read with retries; sequential callers avoid Google API SSL / burst issues."""
+        per_tab_timeout = 90.0
+        max_attempts = 3
+        last: dict | None = None
+        for attempt in range(1, max_attempts + 1):
+            if attempt > 1:
+                await asyncio.sleep(0.8 * attempt)
+            last = await _read_one_attempt(tab_name, per_tab_timeout)
+            if last.get("ok"):
+                return last
+            err = last.get("error") or ""
+            if attempt < max_attempts and _transient_sheets_read_error(err):
+                _logger.warning("sync_model_tabs: retry %d/%d for %s: %s", attempt, max_attempts, tab_name, err[:200])
+                continue
+            _logger.warning("sync_model_tabs: failed %s after %d attempt(s): %s", tab_name, attempt, err[:400])
+            return last
+
+    # Phase 1: read tabs one at a time (no parallel Google calls — avoids SSL / rate-limit storms)
+    read_results: list[dict] = []
+    for idx, tab_name in enumerate(_ALL_MODEL_TABS):
+        read_results.append(await _read_one(tab_name))
+        if idx + 1 < len(_ALL_MODEL_TABS):
+            await asyncio.sleep(0.35)
+
+    # Phase 2: write to DB sequentially (one session, no concurrency issues)
+    for r in read_results:
+        if not r.get("ok"):
+            results.append({"tab": r["tab"], "ok": False, "error": r.get("error")})
+            continue
+        try:
+            snap_key = f"{_FPA_TAB_SNAPSHOT_PREFIX}{r['tab']}"
+            await db.execute(delete(SheetSnapshot).where(SheetSnapshot.range_name == snap_key))
+            db.add(SheetSnapshot(
+                source="model_tab_sync",
+                range_name=snap_key,
+                data_json=json.dumps({"text": r["text"], "rows": r["rows"]}),
+            ))
+            results.append({"tab": r["tab"], "ok": True, "rows": r["rows"]})
+        except Exception as e:
+            _logger.exception(f"sync_model_tabs: DB write error for {r['tab']}")
+            results.append({"tab": r["tab"], "ok": False, "error": f"DB error: {e}"})
+
+    await db.commit()
+
+    synced = [r for r in results if r["ok"]]
+    failed = [r for r in results if not r["ok"]]
+    return {"synced": len(synced), "failed": len(failed), "details": results}
+
+
+@app.get("/api/financials/model-tabs-status")
+async def get_model_tabs_status(db: AsyncSession = Depends(get_db)):
+    """Return sync status for each model tab."""
+    r = await db.execute(
+        select(SheetSnapshot)
+        .where(SheetSnapshot.range_name.like(f"{_FPA_TAB_SNAPSHOT_PREFIX}%"))
+        .order_by(SheetSnapshot.as_of.desc())
+    )
+    rows = r.scalars().all()
+    # Latest snapshot per tab
+    seen: dict[str, SheetSnapshot] = {}
+    for row in rows:
+        title = row.range_name[len(_FPA_TAB_SNAPSHOT_PREFIX):]
+        if title not in seen:
+            seen[title] = row
+    out = []
+    for tab in _ALL_MODEL_TABS:
+        snap = seen.get(tab)
+        if snap:
+            d = json.loads(snap.data_json) if snap.data_json else {}
+            out.append({
+                "tab": tab,
+                "synced": True,
+                "synced_at": snap.as_of.isoformat() if snap.as_of else None,
+                "rows": d.get("rows"),
+            })
+        else:
+            out.append({"tab": tab, "synced": False, "synced_at": None, "rows": None})
+    return {"tabs": out}
 
 
 def _col_letter(n: int) -> str:
@@ -1198,11 +1754,38 @@ def _col_letter(n: int) -> str:
     return result
 
 
-def _sheet_to_compact_text(rows: list[list], max_rows: int = 300, max_cols: int = 180) -> str:
-    """Convert raw sheet rows to a compact text block, skipping fully-empty rows."""
+def _excel_serial_to_month_label(value) -> str | None:
+    """
+    Convert an Excel date serial number to a 'Mon YYYY' label (e.g. 46051 → 'Feb 2026').
+    Returns None if the value doesn't look like a plausible Excel date serial (2000-2040).
+    """
+    from datetime import date, timedelta
+    try:
+        n = int(float(str(value)))
+    except (ValueError, TypeError):
+        return None
+    # Excel serials for 2000-01-01 through 2040-12-31 ≈ 36526 – 51910
+    if not (36526 <= n <= 51910):
+        return None
+    try:
+        d = date(1899, 12, 30) + timedelta(days=n)
+        return d.strftime("%b %Y")  # e.g. "Feb 2026"
+    except Exception:
+        return None
+
+
+def _sheet_to_compact_text(rows: list[list], max_rows: int = 500, max_cols: int = 120) -> str:
+    """Convert raw sheet rows to a compact text block, skipping fully-empty rows.
+    Excel date serial numbers in header rows are converted to readable month labels."""
     lines = []
     for i, row in enumerate(rows[:max_rows]):
-        cells = [str(c) if c != "" else "" for c in row[:max_cols]]
+        raw_cells = row[:max_cols]
+        cells: list[str] = []
+        for c in raw_cells:
+            s = str(c) if c != "" else ""
+            # Replace Excel date serials with readable month labels
+            label = _excel_serial_to_month_label(s)
+            cells.append(label if label is not None else s)
         # Skip rows where every cell is empty
         if not any(c.strip() for c in cells):
             continue
@@ -1213,14 +1796,532 @@ def _sheet_to_compact_text(rows: list[list], max_rows: int = 300, max_cols: int 
     return "\n".join(lines)
 
 
-async def _read_tab(connector, title: str, max_rows: int = 300, max_cols: int = 180) -> list[list]:
-    """Read a sheet tab, returning raw rows. Returns [] if tab not found."""
+_MONTH_LABEL_RE = re.compile(r'^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(20\d{2})$')
+
+
+def _sheet_to_monthly_compact_text(
+    rows: list[list],
+    max_rows: int = 500,
+    min_year: int = 2024,
+    max_year: int = 2026,
+) -> str:
+    """
+    Like _sheet_to_compact_text but keeps only the row-label columns (first 2)
+    and monthly period columns whose header matches 'Mon YYYY' within [min_year, max_year].
+    This reduces 100+ column sheets to ~40 columns, cutting prompt size by 60-70%.
+    Excel date serials in headers are converted first.
+    """
+    # Build all rows with serial-to-label conversion applied
+    all_rows: list[list[str]] = []
+    for row in rows[:max_rows]:
+        cells: list[str] = []
+        for c in row[:200]:
+            s = str(c) if c != "" else ""
+            lbl = _excel_serial_to_month_label(s)
+            cells.append(lbl if lbl is not None else s)
+        all_rows.append(cells)
+
+    # Find the header row that contains month labels and collect matching col indices
+    month_col_indices: list[int] = []
+    for row in all_rows:
+        cols = []
+        for j, cell in enumerate(row):
+            m = _MONTH_LABEL_RE.match(cell.strip())
+            if m and min_year <= int(m.group(2)) <= max_year:
+                cols.append(j)
+        if len(cols) >= 3:
+            month_col_indices = cols
+            break
+
+    if not month_col_indices:
+        # No monthly header found — fall back to standard compact text (limited cols)
+        return _sheet_to_compact_text(rows, max_rows=max_rows, max_cols=50)
+
+    lines: list[str] = []
+    for i, row in enumerate(all_rows):
+        label_cols = [row[j] if j < len(row) else "" for j in range(2)]
+        month_vals = [row[j] if j < len(row) else "" for j in month_col_indices]
+        combined = label_cols + month_vals
+        if not any(c.strip() for c in combined):
+            continue
+        # Trim trailing empty cells
+        while combined and not combined[-1].strip():
+            combined.pop()
+        if not any(c.strip() for c in combined):
+            continue
+        lines.append(f"R{i+1}: {combined}")
+
+    return "\n".join(lines)
+
+
+def _sheet_titles_index(available: list[dict]) -> dict[str, str]:
+    """Map lowered tab title → exact title as in Google Sheets (for A1 quoting)."""
+    out: dict[str, str] = {}
+    for s in available or []:
+        t = (s.get("title") or "").strip()
+        if t:
+            out[t.lower()] = t
+    return out
+
+
+async def _read_tab_live(
+    connector,
+    exact_title: str,
+    max_rows: int = 500,
+    max_cols: int = 120,
+) -> tuple[list[list], str | None]:
+    """Read tab from Google with retries. Returns (rows, None) or ([], error)."""
     last_col = _col_letter(max_cols)
+    range_a1 = f"'{exact_title}'!A1:{last_col}{max_rows}"
+    last_err: str | None = None
+    for attempt in range(1, 4):
+        if attempt > 1:
+            await asyncio.sleep(0.45 * attempt)
+        try:
+            raw = await asyncio.to_thread(connector.read_range, range_a1)
+            if raw and any(any(str(c).strip() for c in row) for row in raw):
+                return raw, None
+            last_err = f"Empty or all-blank range for tab '{exact_title}'"
+        except Exception as e:
+            last_err = str(e)
+            _logger.warning("_read_tab_live attempt %s/3 %s: %s", attempt, exact_title, last_err[:220])
+    return [], last_err or "read failed"
+
+
+def _snapshot_text_to_rows(text: str) -> list[list]:
+    """Rebuild row matrix from Step-1 sync compact TSV lines."""
+    rows: list[list] = []
+    for line in (text or "").split("\n"):
+        if not line.strip():
+            continue
+        rows.append(line.split("\t"))
+    return rows
+
+
+async def _load_statement_tab_rows(
+    db: AsyncSession,
+    connector,
+    canonical_tab_name: str,
+    titles_by_lower: dict[str, str],
+    max_rows: int = 500,
+    max_cols: int = 120,
+) -> tuple[list[list], str | None]:
+    """
+    Resolve tab name against spreadsheet metadata, read live with retries,
+    then fall back to Step-1 ``SheetSnapshot`` (__tab__…) if Google read fails.
+    """
+    want = canonical_tab_name.strip()
+    exact = titles_by_lower.get(want.lower(), want)
+    rows, err = await _read_tab_live(connector, exact, max_rows=max_rows, max_cols=max_cols)
+    if rows:
+        return rows, None
+    snap_key = f"{_FPA_TAB_SNAPSHOT_PREFIX}{want}"
+    r = await db.execute(
+        select(SheetSnapshot)
+        .where(SheetSnapshot.range_name == snap_key)
+        .order_by(SheetSnapshot.as_of.desc())
+        .limit(1)
+    )
+    snap = r.scalar_one_or_none()
+    if snap and snap.data_json:
+        try:
+            d = json.loads(snap.data_json)
+            t = d.get("text") or ""
+            snap_rows = _snapshot_text_to_rows(t)
+            if snap_rows:
+                _logger.info("sync-from-sheet: using SheetSnapshot for tab %s (%d rows)", want, len(snap_rows))
+                return snap_rows, None
+        except Exception as ex:
+            _logger.warning("sync-from-sheet: snapshot parse failed for %s: %s", want, ex)
+    detail = err or "no data"
+    return [], (
+        f"Tab '{canonical_tab_name}' not available from Google Sheets ({detail}). "
+        f"If Step 1 synced this tab, try Parse again; otherwise run Step 1 — Sync all model tabs."
+    )
+
+
+_CLAUDE_FINANCIAL_MODEL = "claude-sonnet-4-5"
+# Large extractions need a high ceiling; Anthropic SDK rejects non-streaming when implied time > 10 min.
+_CLAUDE_FINANCIAL_MAX_TOKENS = 32768
+
+
+def _strip_claude_json_fences(text: str) -> str:
+    text = (text or "").strip()
+    if text.startswith("```"):
+        text = "\n".join(text.split("\n")[1:])
+    if text.endswith("```"):
+        text = "\n".join(text.split("\n")[:-1])
+    return text.strip()
+
+
+async def _anthropic_financial_extraction_text(client, user_prompt: str) -> str:
+    """Stream the message body — required for high max_tokens (see anthropic _calculate_nonstreaming_timeout)."""
+    async with client.messages.stream(
+        model=_CLAUDE_FINANCIAL_MODEL,
+        max_tokens=_CLAUDE_FINANCIAL_MAX_TOKENS,
+        messages=[{"role": "user", "content": user_prompt}],
+    ) as stream:
+        return await stream.get_final_text()
+
+
+import calendar as _calendar
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Direct sheet parsers — no LLM needed
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _find_monthly_col_map(rows: list[list], year: int = 2026) -> dict[str, int]:
+    """Scan header rows for 'Mon YYYY' labels and return {period_end_iso: col_idx}."""
+    _MON_ABBR = {'jan':1,'feb':2,'mar':3,'apr':4,'may':5,'jun':6,
+                 'jul':7,'aug':8,'sep':9,'oct':10,'nov':11,'dec':12}
+    _MON_RE = re.compile(r'^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*[\s.]+(\d{4})$', re.I)
+    result: dict[str, int] = {}
+    for row in rows[:20]:
+        found: dict[str, int] = {}
+        for j, cell in enumerate(row[:220]):
+            s = str(cell).strip()
+            lbl = _excel_serial_to_month_label(s) or s
+            m = _MON_RE.match(lbl)
+            if m and int(m.group(2)) == year:
+                mon = _MON_ABBR.get(m.group(1)[:3].lower(), 0)
+                if mon:
+                    last = _calendar.monthrange(year, mon)[1]
+                    found[f'{year}-{mon:02d}-{last:02d}'] = j
+        if found:
+            result = found
+            break
+    return result  # {period_end: col_idx}
+
+
+def _cell_num(row: list, col: int) -> float | None:
+    """Return float from row[col], or None if empty/non-numeric."""
+    if col >= len(row):
+        return None
+    v = row[col]
+    if v is None or str(v).strip() == '':
+        return None
     try:
-        raw = await asyncio.to_thread(connector.read_range, f"'{title}'!A1:{last_col}{max_rows}")
-        return raw or []
-    except Exception:
+        return float(str(v).replace(',', ''))
+    except (ValueError, TypeError):
+        return None
+
+
+def _row_lbl(row: list) -> str:
+    """Return the best label for a sheet row: prefer col 1, fall back to col 2 (indented detail rows)."""
+    c1 = str(row[1]).strip() if len(row) > 1 else ''
+    if c1:
+        return c1
+    return str(row[2]).strip() if len(row) > 2 else ''
+
+
+def _plan_lookup(plan_rows: list[list]) -> dict[str, list]:
+    """Build {lower_label: row} for plan tab rows, keeping the FIRST occurrence per label.
+
+    The first occurrence is the actual balance-sheet / P&L line item.  Later occurrences
+    of the same label (e.g. reconciliation section headers in BS_2026P for
+    'Accounts receivable', 'Deferred revenue', 'Accounts payable') are section stubs
+    without monthly column values and must not overwrite the real plan row.
+    """
+    out: dict[str, list] = {}
+    for row in plan_rows:
+        lbl = _row_lbl(row)
+        if lbl and lbl.lower() not in out:   # first occurrence wins
+            out[lbl.lower()] = row
+    return out
+
+
+def _direct_extract_pnl(actuals_rows: list[list], plan_rows: list[list], year: int = 2026) -> list[dict]:
+    """Parse P&L data directly from raw sheet rows — no LLM required."""
+    act_cols = _find_monthly_col_map(actuals_rows, year)
+    pln_cols = _find_monthly_col_map(plan_rows, year) if plan_rows else {}
+    pln_map  = _plan_lookup(plan_rows) if plan_rows else {}
+    if not act_cols:
         return []
+
+    # Phase → line_type mapping; phase changes on hitting known section labels
+    _PHASE_RE = [
+        (re.compile(r'^revenue$', re.I),                         'revenue',    'revenue', True),
+        (re.compile(r'^cost of goods', re.I),                    'cogs',       'cogs',    True),
+        (re.compile(r'^gross (profit|margin)$', re.I),           'gp',         'other',   True),
+        (re.compile(r'(total\s+)?operating exp', re.I),          'opex',       'opex',    True),
+        (re.compile(r'^ebitda$', re.I),                          'below_eb',   'other',   True),
+        (re.compile(r'^net (income|loss)', re.I),                'below_eb',   'other',   True),
+    ]
+    _PHASE_TYPE = {'revenue':'revenue','cogs':'cogs','gp':'other','opex':'opex','below_eb':'other'}
+
+    phase = 'revenue'
+    items: list[dict] = []
+    sort_order = 0
+    done = False  # stop after Net Income row
+
+    for row in actuals_rows:
+        if done:
+            break
+        lbl = _row_lbl(row)
+        if not lbl:
+            continue
+        has_data = any(_cell_num(row, c) is not None for c in act_cols.values())
+        if not has_data:
+            # Still check for phase transitions on blank-value rows
+            for pat, new_ph, _, _ in _PHASE_RE:
+                if pat.search(lbl):
+                    phase = new_ph
+            continue
+
+        line_type, is_sub = _PHASE_TYPE.get(phase, 'other'), False
+        for pat, new_ph, lt, is_s in _PHASE_RE:
+            if pat.search(lbl):
+                phase, line_type, is_sub = new_ph, lt, is_s
+                break
+
+        pln_row = pln_map.get(lbl.lower())
+        periods = []
+        for pe in sorted(act_cols):
+            actual = _cell_num(row, act_cols[pe])
+            plan   = _cell_num(pln_row, pln_cols[pe]) if pln_row and pe in pln_cols else None
+            periods.append({'period_end': pe, 'actual': actual or 0.0, 'plan': plan})
+
+        sort_order += 1
+        items.append({'line_type': line_type, 'category': lbl,
+                      'is_subtotal': is_sub, 'sort_order': sort_order, 'periods': periods})
+
+        # Stop extracting after the Net Income row — everything below is supplemental
+        if re.search(r'^net (income|loss)', lbl, re.I):
+            done = True
+
+    # ── Plan-only rows for future months (used by the 2026 Forecast view) ─────
+    future_pe = sorted(pe for pe in pln_cols if pe not in act_cols)
+    if future_pe and plan_rows and pln_cols:
+        p_phase = 'revenue'
+        for row in plan_rows:
+            lbl = _row_lbl(row)
+            if not lbl:
+                continue
+            has_plan = any(_cell_num(row, pln_cols[pe]) is not None for pe in future_pe)
+            if not has_plan:
+                for pat, new_ph, _, _ in _PHASE_RE:
+                    if pat.search(lbl):
+                        p_phase = new_ph
+                continue
+            p_lt, p_sub = _PHASE_TYPE.get(p_phase, 'other'), False
+            for pat, new_ph, lt, is_s in _PHASE_RE:
+                if pat.search(lbl):
+                    p_phase, p_lt, p_sub = new_ph, lt, is_s
+                    break
+            sort_order += 1
+            periods = [{'period_end': pe, 'actual': 0.0, 'plan': _cell_num(row, pln_cols[pe])} for pe in future_pe]
+            items.append({'line_type': p_lt, 'category': lbl,
+                          'is_subtotal': p_sub, 'sort_order': sort_order,
+                          'is_plan_only': True, 'periods': periods})
+            if re.search(r'^net (income|loss)', lbl, re.I):
+                break
+
+    return items
+
+
+def _direct_extract_cf(actuals_rows: list[list], plan_rows: list[list], year: int = 2026) -> list[dict]:
+    """Parse Cash Flow data directly from raw sheet rows — no LLM required."""
+    act_cols = _find_monthly_col_map(actuals_rows, year)
+    pln_cols = _find_monthly_col_map(plan_rows, year) if plan_rows else {}
+    pln_map  = _plan_lookup(plan_rows) if plan_rows else {}
+    if not act_cols:
+        return []
+
+    _SEC_RE = [
+        (re.compile(r'operating activities', re.I),  'operating'),
+        (re.compile(r'investing activities', re.I),  'investing'),
+        (re.compile(r'financing activities', re.I),  'financing'),
+    ]
+    _NET_RE = re.compile(r'^net cash (provided|used|from|increase|generated)', re.I)
+
+    section = 'operating'
+    items: list[dict] = []
+    sort_order = 0
+
+    for row in actuals_rows:
+        lbl = _row_lbl(row)
+        if not lbl:
+            continue
+        has_data = any(_cell_num(row, c) is not None for c in act_cols.values())
+        # Update section from header rows (no data) or inline
+        for pat, sec in _SEC_RE:
+            if pat.search(lbl):
+                section = sec
+                break
+        if not has_data:
+            continue
+
+        is_sub = bool(_NET_RE.match(lbl.strip()))
+        pln_row = pln_map.get(lbl.lower())
+        periods = []
+        for pe in sorted(act_cols):
+            actual = _cell_num(row, act_cols[pe])
+            plan   = _cell_num(pln_row, pln_cols[pe]) if pln_row and pe in pln_cols else None
+            periods.append({'period_end': pe, 'actual': actual or 0.0, 'plan': plan})
+
+        sort_order += 1
+        items.append({'section': section, 'category': lbl,
+                      'is_subtotal': is_sub, 'sort_order': sort_order, 'periods': periods})
+    return items
+
+
+def _direct_extract_bs(actuals_rows: list[list], plan_rows: list[list], year: int = 2026) -> list[dict]:
+    """Parse Balance Sheet data directly from raw sheet rows — no LLM required."""
+    act_cols = _find_monthly_col_map(actuals_rows, year)
+    pln_cols = _find_monthly_col_map(plan_rows, year) if plan_rows else {}
+    pln_map  = _plan_lookup(plan_rows) if plan_rows else {}
+    if not act_cols:
+        return []
+
+    _BS_SUB_RE = re.compile(
+        r'^(total (current )?(assets?|liabilities|equity|capital)|'
+        r'fixed assets,?\s*net|total liabilities (and equity)?)', re.I
+    )
+    # Section transitions: row label → next section
+    _SEC_TRANS = [
+        (re.compile(r'^total assets$', re.I),       'liability'),
+        (re.compile(r'^total liabilities$', re.I),  'equity'),
+    ]
+
+    section = 'asset'
+    items: list[dict] = []
+    sort_order = 0
+
+    for row in actuals_rows:
+        lbl = _row_lbl(row)
+        if not lbl:
+            continue
+        has_data = any(_cell_num(row, c) is not None for c in act_cols.values())
+        if not has_data:
+            continue
+
+        is_sub = bool(_BS_SUB_RE.search(lbl.strip()))
+        pln_row = pln_map.get(lbl.lower())
+        periods = []
+        for pe in sorted(act_cols):
+            actual = _cell_num(row, act_cols[pe])
+            plan   = _cell_num(pln_row, pln_cols[pe]) if pln_row and pe in pln_cols else None
+            periods.append({'period_end': pe, 'actual': actual or 0.0, 'plan': plan})
+
+        sort_order += 1
+        items.append({'section': section, 'category': lbl,
+                      'is_subtotal': is_sub, 'sort_order': sort_order, 'periods': periods})
+
+        # Stop after "Total liabilities and equity" — everything below is supplemental
+        if re.search(r'total liabilities and equity', lbl, re.I):
+            break
+
+        # Switch section AFTER adding the row
+        for pat, new_sec in _SEC_TRANS:
+            if pat.search(lbl):
+                section = new_sec
+                break
+    return items
+
+
+def _direct_extract_dept(
+    actuals_rows: list[list],
+    plan_rows: list[list],
+    year: int = 2026,
+    default_dept: str = 'Sales & Marketing',
+) -> list[dict]:
+    """Parse department detail from raw sheet rows.
+
+    `default_dept` sets the department for rows that appear before any department
+    header (e.g. combined total rows at the top of the sheet).
+    Department header rows and "Total …" rows are marked is_subtotal=True.
+
+    Plan matching is dept-aware: each (dept, label) pair is matched independently
+    so the same label appearing under different departments (e.g. "Salaries" under
+    Sales, Marketing, and CS) maps to the correct plan row for that department.
+    """
+    act_cols = _find_monthly_col_map(actuals_rows, year)
+    pln_cols = _find_monthly_col_map(plan_rows, year) if plan_rows else {}
+    if not act_cols:
+        return []
+
+    # Department header patterns → canonical dept name (used in both actuals + plan passes)
+    _DEPT_RE = [
+        (re.compile(r'^sales$', re.I),                              'Sales'),
+        (re.compile(r'^marketing$', re.I),                          'Marketing'),
+        (re.compile(r'^customer success$', re.I),                   'Customer Success'),
+        (re.compile(r'^product\s*(&|and)\s*engineering$', re.I),    'Product & Engineering'),
+        (re.compile(r'^general\s*(&|and)\s*administrative$', re.I), 'General & Administrative'),
+    ]
+
+    def _detect_dept(lbl: str, current: str) -> str:
+        for pat, name in _DEPT_RE:
+            if pat.match(lbl.strip()):
+                return name
+        return current
+
+    # Build dept-aware plan map: (dept, lower_label) → row
+    # Keep the FIRST occurrence per key so the aggregate section wins over per-dept duplicates.
+    dept_plan_map: dict[tuple[str, str], list] = {}
+    if plan_rows and pln_cols:
+        pln_dept = default_dept
+        for row in plan_rows:
+            lbl = _row_lbl(row)
+            if not lbl:
+                continue
+            pln_dept = _detect_dept(lbl, pln_dept)
+            key = (pln_dept, lbl.lower())
+            if key not in dept_plan_map:
+                dept_plan_map[key] = row
+
+    dept = default_dept
+    items: list[dict] = []
+    sort_order = 0
+
+    for row in actuals_rows:
+        lbl = _row_lbl(row)
+        if not lbl:
+            continue
+        has_data = any(_cell_num(row, c) is not None for c in act_cols.values())
+        if not has_data:
+            dept = _detect_dept(lbl, dept)
+            continue
+
+        dept = _detect_dept(lbl, dept)
+
+        # Mark department header rows and "Total …" rows as subtotals
+        is_sub = any(pat.match(lbl.strip()) for pat, _ in _DEPT_RE)
+        if not is_sub and re.match(r'^total\s+', lbl, re.I):
+            is_sub = True
+
+        pln_row = dept_plan_map.get((dept, lbl.lower()))
+        periods = []
+        for pe in sorted(act_cols):
+            actual = _cell_num(row, act_cols[pe])
+            plan   = _cell_num(pln_row, pln_cols[pe]) if pln_row and pe in pln_cols else None
+            periods.append({'period_end': pe, 'actual': actual or 0.0, 'plan': plan})
+
+        sort_order += 1
+        items.append({'dept': dept, 'category': lbl,
+                      'is_subtotal': is_sub, 'sort_order': sort_order, 'periods': periods})
+
+    # ── Plan-only rows for future months ──────────────────────────────────────
+    future_pe = sorted(pe for pe in pln_cols if pe not in act_cols)
+    if future_pe and plan_rows and pln_cols:
+        pln_dept2 = default_dept
+        for row in plan_rows:
+            lbl = _row_lbl(row)
+            if not lbl:
+                continue
+            pln_dept2 = _detect_dept(lbl, pln_dept2)
+            has_plan = any(_cell_num(row, pln_cols[pe]) is not None for pe in future_pe)
+            if not has_plan:
+                continue
+            is_sub = any(pat.match(lbl.strip()) for pat, _ in _DEPT_RE)
+            if not is_sub and re.match(r'^total\s+', lbl, re.I):
+                is_sub = True
+            sort_order += 1
+            periods = [{'period_end': pe, 'actual': 0.0, 'plan': _cell_num(row, pln_cols[pe])} for pe in future_pe]
+            items.append({'dept': pln_dept2, 'category': lbl,
+                          'is_subtotal': is_sub, 'sort_order': sort_order,
+                          'is_plan_only': True, 'periods': periods})
+
+    return items
 
 
 async def _claude_extract_pnl(client, actuals_text: str, plan_text: str, period: str) -> list[dict]:
@@ -1228,10 +2329,12 @@ async def _claude_extract_pnl(client, actuals_text: str, plan_text: str, period:
     prompt = f"""Below are two raw Google Sheet tabs for Dazos's P&L.
 TAB 1 = ACTUALS (QuickBooks export). TAB 2 = PLAN (2026 budget model).
 
-Each tab has:
-- Row labels in column A (line item names)
-- Monthly amounts across columns (headers in row 1 or nearby, likely Jan–Dec or similar)
-- Some rows are subtotals/totals (bold in the model, identifiable by label like "Total Revenue", "Gross Profit", etc.)
+CRITICAL: Each tab has THREE column sections in this order:
+  1. Annual totals (headers: "2023", "2024", "2025", "2026", "2027", "2028") — SKIP these
+  2. Quarterly periods (headers: "Q1'23", "Q2'23", ..., "Q4'28") — SKIP these
+  3. Monthly periods (headers: "Jan 2023", "Feb 2023", ..., "Mar 2026", etc.) — USE ONLY THESE
+
+You MUST extract data ONLY from the monthly columns (section 3). Ignore annual and quarterly columns entirely.
 
 ACTUALS:
 {actuals_text}
@@ -1239,7 +2342,7 @@ ACTUALS:
 PLAN:
 {plan_text}
 
-Extract ALL financial line items. For each, return a JSON array of objects:
+Extract ALL financial line items (from the monthly section only). For each, return a JSON array of objects:
 {{
   "line_type": "revenue" | "cogs" | "opex" | "other",
   "category": "<exact row label>",
@@ -1251,9 +2354,10 @@ Extract ALL financial line items. For each, return a JSON array of objects:
 }}
 
 Rules:
-- period_end must be the last day of the month (e.g. Jan 2026 → "2026-01-31")
+- period_end must be the last day of the month (e.g. Jan 2026 → "2026-01-31", Feb 2026 → "2026-02-28", Mar 2026 → "2026-03-31")
+- Extract EVERY monthly column present — do NOT skip any month, even if it is between two other months or has some zero values
 - Costs/expenses should be NEGATIVE numbers (as they appear in a P&L)
-- If a column is a total/YTD column rather than a monthly column, skip it
+- Skip only columns that are explicitly labelled as totals/YTD/full-year (e.g. "Total", "YTD", "FY2026") — never skip a named month column
 - Match plan amounts to the same period_end as actuals; if plan has no corresponding month, set plan to null
 - Skip rows that are purely formatting (blank, separator lines, repeating headers)
 - line_type: revenue = top-line revenue; cogs = cost of goods sold / cost of revenue; opex = operating expenses (S&M, R&D, G&A, etc.); other = EBITDA, net income, interest, etc.
@@ -1261,19 +2365,9 @@ Rules:
 
 Return ONLY the JSON array, no commentary."""
 
-    response = await client.messages.create(
-        model="claude-sonnet-4-5",
-        max_tokens=8192,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    text = response.content[0].text if response.content else "[]"
-    # Strip markdown code fences if present
-    text = text.strip()
-    if text.startswith("```"):
-        text = "\n".join(text.split("\n")[1:])
-    if text.endswith("```"):
-        text = "\n".join(text.split("\n")[:-1])
-    return json.loads(text.strip())
+    raw = await _anthropic_financial_extraction_text(client, prompt)
+    text = _strip_claude_json_fences(raw) or "[]"
+    return json.loads(text)
 
 
 async def _claude_extract_cf(client, actuals_text: str, plan_text: str) -> list[dict]:
@@ -1281,13 +2375,21 @@ async def _claude_extract_cf(client, actuals_text: str, plan_text: str) -> list[
     prompt = f"""Below are two raw Google Sheet tabs for Dazos's Cash Flow Statement.
 TAB 1 = ACTUALS. TAB 2 = PLAN.
 
+CRITICAL: Each tab has THREE column sections in this order:
+  1. Annual totals (headers: "2023", "2024", "2025", "2026", "2027", "2028") — SKIP these
+  2. Quarterly periods (headers: "Q1'23", "Q2'23", ..., "Q4'28") — SKIP these
+  3. Monthly periods (headers: "Jan 2023", "Feb 2023", ..., "Mar 2026", etc.) — USE ONLY THESE
+
+You MUST extract data ONLY from the monthly columns (section 3). Ignore annual and quarterly columns entirely.
+Extract only months that have actual data up to the latest available month (skip future projections beyond the latest actual).
+
 ACTUALS:
 {actuals_text}
 
 PLAN:
 {plan_text}
 
-Extract ALL cash flow line items. Return a JSON array:
+Extract ALL cash flow line items (from the monthly section only). Return a JSON array:
 {{
   "section": "operating" | "investing" | "financing",
   "category": "<exact row label>",
@@ -1298,25 +2400,18 @@ Extract ALL cash flow line items. Return a JSON array:
 }}
 
 Rules:
-- period_end = last day of month (e.g. "2026-01-31")
+- period_end = last day of month (e.g. "2026-01-31", "2026-02-28", "2026-03-31")
+- Extract EVERY monthly column present — do NOT skip any month
 - Cash outflows should be NEGATIVE
-- Skip YTD/total columns — monthly periods only
 - Skip blank/separator/header-only rows
 - Assign section based on standard cash flow statement sections
+- Match actual and plan by the same month label (e.g. "Jan 2026")
 
 Return ONLY the JSON array."""
 
-    response = await client.messages.create(
-        model="claude-sonnet-4-5",
-        max_tokens=8192,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    text = (response.content[0].text if response.content else "[]").strip()
-    if text.startswith("```"):
-        text = "\n".join(text.split("\n")[1:])
-    if text.endswith("```"):
-        text = "\n".join(text.split("\n")[:-1])
-    return json.loads(text.strip())
+    raw = await _anthropic_financial_extraction_text(client, prompt)
+    text = _strip_claude_json_fences(raw) or "[]"
+    return json.loads(text)
 
 
 async def _claude_extract_bs(client, actuals_text: str, plan_text: str) -> list[dict]:
@@ -1324,13 +2419,21 @@ async def _claude_extract_bs(client, actuals_text: str, plan_text: str) -> list[
     prompt = f"""Below are two raw Google Sheet tabs for Dazos's Balance Sheet.
 TAB 1 = ACTUALS. TAB 2 = PLAN.
 
+CRITICAL: Each tab has THREE column sections in this order:
+  1. Annual totals (headers: "2023", "2024", "2025", "2026", "2027", "2028") — SKIP these
+  2. Quarterly periods (headers: "Q1'23", "Q2'23", ..., "Q4'28") — SKIP these
+  3. Monthly periods (headers: "Jan 2023", "Feb 2023", ..., "Mar 2026", etc.) — USE ONLY THESE
+
+You MUST extract data ONLY from the monthly columns (section 3). Ignore annual and quarterly columns entirely.
+Extract only months that have actual data up to the latest available month (skip future projections beyond the latest actual).
+
 ACTUALS:
 {actuals_text}
 
 PLAN:
 {plan_text}
 
-Extract ALL balance sheet line items. Return a JSON array:
+Extract ALL balance sheet line items (from the monthly section only). Return a JSON array:
 {{
   "section": "asset" | "liability" | "equity",
   "category": "<exact row label>",
@@ -1342,24 +2445,55 @@ Extract ALL balance sheet line items. Return a JSON array:
 }}
 
 Rules:
-- period_end = last day of month (e.g. "2026-01-31")
+- period_end = last day of month (e.g. "2026-01-31", "2026-02-28", "2026-03-31")
+- Extract EVERY monthly column present — do NOT skip any month
 - Assets are positive; liabilities and equity are typically positive in a balance sheet
 - is_subtotal = true for Total Assets, Total Current Liabilities, Total Equity, etc.
 - Skip blank/separator/header-only rows
+- Match actual and plan by the same month label (e.g. "Jan 2026")
 
 Return ONLY the JSON array."""
 
-    response = await client.messages.create(
-        model="claude-sonnet-4-5",
-        max_tokens=8192,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    text = (response.content[0].text if response.content else "[]").strip()
-    if text.startswith("```"):
-        text = "\n".join(text.split("\n")[1:])
-    if text.endswith("```"):
-        text = "\n".join(text.split("\n")[:-1])
-    return json.loads(text.strip())
+    raw = await _anthropic_financial_extraction_text(client, prompt)
+    text = _strip_claude_json_fences(raw) or "[]"
+    return json.loads(text)
+
+
+@app.get("/api/financials/parse-preview")
+async def parse_preview(
+    statement: str = Query("cf", description="pnl | bs | cf"),
+    db: AsyncSession = Depends(get_db),
+):
+    """Debug: run the direct parser and return extracted items without writing to DB."""
+    from connectors.google_sheets import GoogleSheetsConnector
+    connector = GoogleSheetsConnector()
+    connector.set_base_path(Path(__file__).resolve().parent)
+    if not connector.is_configured():
+        raise HTTPException(status_code=503, detail="Google Sheets not configured.")
+    tabs = _SHEET_TAB_MAP.get(statement)
+    if not tabs:
+        raise HTTPException(status_code=400, detail="Unknown statement")
+    available_tabs = await asyncio.to_thread(connector.list_sheets)
+    titles_by_lower = _sheet_titles_index(available_tabs)
+    actuals_raw, _ = await _load_statement_tab_rows(db, connector, tabs["actuals"], titles_by_lower)
+    plan_raw, _    = await _load_statement_tab_rows(db, connector, tabs["plan"],    titles_by_lower)
+    act_col_map = _find_monthly_col_map(actuals_raw or [], 2026)
+    pln_col_map = _find_monthly_col_map(plan_raw or [],   2026)
+    # Sample labels from plan tab (first 60 non-empty)
+    plan_labels = [str(r[1]).strip() for r in (plan_raw or []) if len(r) > 1 and str(r[1]).strip()][:60]
+    if statement == "cf":
+        items = _direct_extract_cf(actuals_raw or [], plan_raw or [], 2026)
+    elif statement == "pnl":
+        items = _direct_extract_pnl(actuals_raw or [], plan_raw or [], 2026)
+    else:
+        items = _direct_extract_bs(actuals_raw or [], plan_raw or [], 2026)
+    return {
+        "actuals_col_map": act_col_map,
+        "plan_col_map": pln_col_map,
+        "plan_labels_sample": plan_labels,
+        "item_count": len(items),
+        "items": [{"category": x["category"], "section": x.get("section",""), "is_subtotal": x.get("is_subtotal", False), "periods_with_plan": sum(1 for p in x["periods"] if p["plan"] is not None)} for x in items],
+    }
 
 
 @app.get("/api/financials/sync-status")
@@ -1375,7 +2509,9 @@ async def get_sync_status(db: AsyncSession = Depends(get_db)):
         row = r.scalar_one_or_none()
         if row and row.data_json:
             d = json.loads(row.data_json)
-            result[stmt] = {"synced_at": row.as_of.isoformat() if row.as_of else None, **d}
+            # SQLite strips tz info on write; re-attach UTC so the browser converts correctly
+            as_of_utc = row.as_of.replace(tzinfo=timezone.utc).isoformat() if row.as_of else None
+            result[stmt] = {"synced_at": as_of_utc, **d}
         else:
             result[stmt] = None
     return result
@@ -1387,54 +2523,53 @@ async def sync_financials_from_sheet(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Read actuals + plan tabs from Google Sheets, use Claude to parse them,
-    and upsert structured data into the financial DB tables.
+    Read actuals + plan tabs from Google Sheets and parse them directly
+    into structured DB records (no LLM required).
     """
-    if not ANTHROPIC_API_KEY:
-        raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY not configured")
-
     from connectors.google_sheets import GoogleSheetsConnector
     connector = GoogleSheetsConnector()
     connector.set_base_path(Path(__file__).resolve().parent)
     if not connector.is_configured():
         raise HTTPException(status_code=503, detail="Google Sheets not configured.")
 
-    if not _ANTHROPIC_AVAILABLE:
-        raise HTTPException(status_code=503, detail="anthropic package not installed on server")
-    client = _anthropic_mod.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
-
-    statements = ["pnl", "bs", "cf"] if statement == "all" else [statement]
+    statements = ["pnl", "bs", "cf", "dept", "pe", "ga"] if statement == "all" else [statement]
     if any(s not in _SHEET_TAB_MAP for s in statements):
-        raise HTTPException(status_code=400, detail=f"Unknown statement. Use: pnl, bs, cf, all")
+        raise HTTPException(status_code=400, detail=f"Unknown statement. Use: pnl, bs, cf, dept, pe, ga, all")
 
     results = {}
+
+    available_tabs = await asyncio.to_thread(connector.list_sheets)
+    titles_by_lower = _sheet_titles_index(available_tabs)
 
     for stmt in statements:
         tabs = _SHEET_TAB_MAP[stmt]
         try:
-            # Read both tabs in parallel
-            actuals_raw, plan_raw = await asyncio.gather(
-                _read_tab(connector, tabs["actuals"]),
-                _read_tab(connector, tabs["plan"]),
+            # Sequential reads + retries reduce Google API SSL errors; snapshot fallback uses Step-1 data.
+            actuals_raw, a_err = await _load_statement_tab_rows(
+                db, connector, tabs["actuals"], titles_by_lower,
+            )
+            await asyncio.sleep(0.25)
+            plan_raw, _p_err = await _load_statement_tab_rows(
+                db, connector, tabs["plan"], titles_by_lower,
             )
 
             if not actuals_raw:
-                results[stmt] = {"ok": False, "error": f"Tab '{tabs['actuals']}' not found or empty"}
+                results[stmt] = {"ok": False, "error": a_err or f"Tab '{tabs['actuals']}' not found or empty"}
                 continue
 
-            actuals_text = _sheet_to_compact_text(actuals_raw)
-            plan_text = _sheet_to_compact_text(plan_raw) if plan_raw else "(no plan data)"
-
-            # Claude extraction
+            # Direct parser — no LLM needed
             if stmt == "pnl":
-                items = await _claude_extract_pnl(client, actuals_text, plan_text, "")
+                items = _direct_extract_pnl(actuals_raw, plan_raw or [], year=2026)
             elif stmt == "cf":
-                items = await _claude_extract_cf(client, actuals_text, plan_text)
+                items = _direct_extract_cf(actuals_raw, plan_raw or [], year=2026)
+            elif stmt in ("dept", "pe", "ga"):
+                default_dept = tabs.get("default_dept", "Sales & Marketing")
+                items = _direct_extract_dept(actuals_raw, plan_raw or [], year=2026, default_dept=default_dept)
             else:
-                items = await _claude_extract_bs(client, actuals_text, plan_text)
+                items = _direct_extract_bs(actuals_raw, plan_raw or [], year=2026)
 
             if not items:
-                results[stmt] = {"ok": False, "error": "Claude returned no line items — check tab names and data"}
+                results[stmt] = {"ok": False, "error": "Direct parser found no line items — check sheet tab names and data"}
                 continue
 
             # Collect all period_end dates returned
@@ -1464,6 +2599,7 @@ async def sync_financials_from_sheet(
                             amount=float(p.get("actual") or 0),
                             plan_amount=float(p["plan"]) if p.get("plan") is not None else None,
                             is_subtotal=1 if item.get("is_subtotal") else 0,
+                            is_plan_only=1 if item.get("is_plan_only") else 0,
                             sort_order=item.get("sort_order", 0),
                         ))
 
@@ -1483,6 +2619,7 @@ async def sync_financials_from_sheet(
                             category=item.get("category", ""),
                             amount=float(p.get("actual") or 0),
                             plan_amount=float(p["plan"]) if p.get("plan") is not None else None,
+                            is_subtotal=1 if item.get("is_subtotal") else 0,
                             sort_order=item.get("sort_order", 0),
                         ))
 
@@ -1506,6 +2643,38 @@ async def sync_financials_from_sheet(
                             sort_order=item.get("sort_order", 0),
                         ))
 
+            elif stmt in ("dept", "pe", "ga"):
+                # Determine which dept names this sheet can produce, so we only delete those rows
+                _DEPT_SCOPE = {
+                    "dept": ["Sales & Marketing", "Sales", "Marketing", "Customer Success"],
+                    "pe":   ["Product & Engineering"],
+                    "ga":   ["General & Administrative"],
+                }
+                dept_names = _DEPT_SCOPE[stmt]
+                for pd_ in all_periods:
+                    await db.execute(
+                        delete(DeptDetailLine)
+                        .where(DeptDetailLine.period_end == pd_)
+                        .where(DeptDetailLine.dept.in_(dept_names))
+                    )
+                await db.flush()
+                for item in items:
+                    for p in item.get("periods", []):
+                        try:
+                            pd_ = date.fromisoformat(p["period_end"])
+                        except Exception:
+                            continue
+                        db.add(DeptDetailLine(
+                            period_end=pd_,
+                            dept=item.get("dept", ""),
+                            category=item.get("category", ""),
+                            amount=float(p.get("actual") or 0),
+                            plan_amount=float(p["plan"]) if p.get("plan") is not None else None,
+                            is_subtotal=1 if item.get("is_subtotal") else 0,
+                            is_plan_only=1 if item.get("is_plan_only") else 0,
+                            sort_order=item.get("sort_order", 0),
+                        ))
+
             await db.commit()
 
             # Save sync status
@@ -1522,6 +2691,7 @@ async def sync_financials_from_sheet(
             })
             if status_row:
                 status_row.data_json = status_data
+                status_row.as_of = datetime.now(timezone.utc)
             else:
                 db.add(SheetSnapshot(source="financials_sync", range_name=status_key, data_json=status_data))
             await db.commit()

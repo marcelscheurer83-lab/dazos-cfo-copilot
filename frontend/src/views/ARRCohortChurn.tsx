@@ -1,5 +1,5 @@
 import { useEffect, useState, useMemo } from 'react'
-import { getArrCohortChurn, ArrCohortChurnResponse, CohortRow } from '../api'
+import { getArrCohortChurn, getDatasetStatus, refreshAppDataset, formatLastUpdated, ArrCohortChurnResponse, CohortRow, type DatasetStatus } from '../api'
 
 // ── colour helpers ────────────────────────────────────────────────────────────
 
@@ -44,13 +44,30 @@ export default function ARRCohortChurn() {
   const [data, setData] = useState<ArrCohortChurnResponse | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
+  const [datasetStatus, setDatasetStatus] = useState<DatasetStatus | null>(null)
+  const [refreshLoading, setRefreshLoading] = useState(false)
+  const [refreshMessage, setRefreshMessage] = useState<string | null>(null)
 
   useEffect(() => {
     setLoading(true)
     getArrCohortChurn()
       .then((res) => { setData(res); setLoading(false) })
       .catch((e: unknown) => { setError(e instanceof Error ? e.message : String(e)); setLoading(false) })
+    getDatasetStatus().then(setDatasetStatus).catch(() => {})
   }, [])
+
+  const handleRefreshAppData = async () => {
+    setRefreshMessage(null)
+    setRefreshLoading(true)
+    try {
+      const res = await refreshAppDataset()
+      setRefreshLoading(false)
+      setRefreshMessage(res.ok ? 'Refresh started — it will complete in the background.' : (res.error ?? 'Refresh failed to start.'))
+    } catch (e) {
+      setRefreshLoading(false)
+      setRefreshMessage(e instanceof Error ? e.message : 'Refresh failed')
+    }
+  }
 
   const visibleOffsets = useMemo(() => {
     if (!data) return []
@@ -67,19 +84,19 @@ export default function ARRCohortChurn() {
   return (
     <div style={{ padding: '1.5rem 2rem', minWidth: 0 }}>
       {/* header */}
-      <div style={{ display: 'flex', alignItems: 'baseline', gap: '1.5rem', marginBottom: '0.5rem', flexWrap: 'wrap' }}>
-        <h1 style={{ margin: 0, fontSize: '1.4rem', fontWeight: 700, color: 'var(--text)' }}>
-          ARR Cohort Retention
-        </h1>
-        {data.sheet_snapshot_as_of && (
-          <span style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>
-            Sheet as of {new Date(data.sheet_snapshot_as_of).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}
-          </span>
-        )}
+      <div style={{ display: 'flex', alignItems: 'center', gap: '1rem', marginBottom: '0.5rem', flexWrap: 'wrap' }}>
+        <h1 style={{ margin: 0, fontSize: '1.4rem', fontWeight: 700, color: 'var(--text)' }}>ARR Cohort Retention</h1>
+        <button type="button" onClick={handleRefreshAppData} disabled={refreshLoading} style={{ padding: '0.5rem 1rem', fontSize: '0.9rem', fontWeight: 600, cursor: refreshLoading ? 'wait' : 'pointer', background: 'var(--accent)', color: 'var(--accent-contrast, #fff)', border: 'none', borderRadius: 6 }}>
+          {refreshLoading ? 'Refreshing…' : 'Refresh app data'}
+        </button>
+        <span style={{ fontSize: '0.85rem', color: 'var(--text-muted)' }}>
+          {datasetStatus?.updated_at ? `Last updated: ${formatLastUpdated(datasetStatus.updated_at)}` : 'Click Refresh app data to load latest data.'}
+        </span>
         {data.message && (
           <span style={{ fontSize: '0.8rem', color: 'var(--warning, #d4a010)' }}>{data.message}</span>
         )}
       </div>
+      {refreshMessage && <p style={{ fontSize: '0.9rem', color: refreshMessage.includes('failed') || refreshMessage.includes('error') ? 'var(--negative)' : 'var(--text-muted)', margin: '0 0 0.75rem' }}>{refreshMessage}</p>}
 
       <p style={{ margin: '0 0 1.25rem', fontSize: '0.85rem', color: 'var(--text-muted)', maxWidth: 640 }}>
         Each row = accounts whose first ARR month is the cohort month. Values show % of Month 0 ARR still active

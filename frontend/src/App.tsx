@@ -23,6 +23,8 @@ import PnL from './views/PnL'
 import CashFlow from './views/CashFlow'
 import BalanceSheet from './views/BalanceSheet'
 import FinancialAnalysisView from './views/FinancialAnalysisView'
+import YTDOverview from './views/YTDOverview'
+import Forecast2026 from './views/Forecast2026'
 import FPAChat from './views/FPAChat'
 import FinancialsDataSync from './views/FinancialsDataSync'
 
@@ -112,7 +114,7 @@ export default function App() {
           <Route index element={<Navigate to="current-overview" replace />} />
           <Route path="current-overview" element={<DashboardCurrentSummary />} />
           <Route path="current-summary" element={<Navigate to="/dashboard/current-overview" replace />} />
-          <Route path="forecast" element={<ForecastView />} />
+          <Route path="forecast" element={<Navigate to="/go-to-market/forecast" replace />} />
           <Route path="q1-2026" element={<DashboardCurrentSummary title="Q1 2026" />} />
           <Route path="q2-2026" element={<DashboardCurrentSummary title="Q2 2026" />} />
         </Route>
@@ -121,9 +123,10 @@ export default function App() {
           <Route path="bookings" element={<Closed />} />
           <Route path="renewals" element={<Renewals />} />
           <Route path="pipeline" element={<Pipeline />} />
+          <Route path="forecast" element={<ForecastView />} />
         </Route>
         {/* Legacy URL redirects */}
-        <Route path="go-to-market/forecast" element={<Navigate to="/dashboard/forecast" replace />} />
+        <Route path="go-to-market/forecast" element={<Navigate to="/go-to-market/forecast" replace />} />
         <Route path="bookings" element={<Navigate to="/go-to-market/bookings" replace />} />
         <Route path="renewals" element={<Navigate to="/go-to-market/renewals" replace />} />
         <Route path="pipeline-overview" element={<Navigate to="/go-to-market/pipeline" replace />} />
@@ -150,8 +153,10 @@ export default function App() {
         </Route>
         <Route path="arr" element={<Navigate to="/products-purchased" replace />} />
         <Route path="closed-data" element={<Navigate to="/bookings" replace />} />
-        <Route path="financials" element={<FinancialsLayout />}>
-          <Route index element={<Navigate to="/financials/analysis" replace />} />
+          <Route path="financials" element={<FinancialsLayout />}>
+          <Route index element={<Navigate to="/financials/forecast-2026" replace />} />
+          <Route path="forecast-2026" element={<Forecast2026 />} />
+          <Route path="overview" element={<YTDOverview />} />
           <Route path="analysis" element={<FinancialAnalysisView />} />
           <Route path="pnl" element={<PnL />} />
           <Route path="cash-flow" element={<CashFlow />} />

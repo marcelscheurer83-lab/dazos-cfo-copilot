@@ -1,11 +1,11 @@
 import { NavLink, Outlet } from 'react-router-dom'
 
 const tabs = [
-  { to: '/financials/analysis', label: 'Monthly Close' },
+  { to: '/financials/forecast-2026', label: '2026 Forecast' },
+  { to: '/financials/overview', label: 'YTD Overview' },
   { to: '/financials/pnl', label: 'P&L' },
   { to: '/financials/cash-flow', label: 'Cash Flow' },
   { to: '/financials/balance-sheet', label: 'Balance Sheet' },
-  { to: '/financials/fpa-chat', label: 'FP&A Agent' },
   { to: '/financials/data-sync', label: 'Data Sync' },
 ]
 

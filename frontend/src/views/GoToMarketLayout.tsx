@@ -1,6 +1,7 @@
 import { NavLink, Outlet } from 'react-router-dom'
 
 const tabs = [
+  { to: '/go-to-market/forecast', label: 'Current Quarter Forecast' },
   { to: '/go-to-market/bookings', label: 'Bookings' },
   { to: '/go-to-market/renewals', label: 'Renewals' },
   { to: '/go-to-market/pipeline', label: 'Pipeline' },

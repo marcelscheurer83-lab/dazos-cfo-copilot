@@ -121,6 +121,7 @@ class PnLLineOut(BaseModel):
     amount: float
     plan_amount: Optional[float] = None
     is_subtotal: bool
+    is_plan_only: bool = False
     sort_order: int = 0
 
     class Config:
@@ -133,6 +134,7 @@ class CashFlowLineOut(BaseModel):
     category: str
     amount: float
     plan_amount: Optional[float] = None
+    is_subtotal: bool = False
     sort_order: int = 0
 
     class Config:
@@ -146,6 +148,20 @@ class BalanceSheetLineOut(BaseModel):
     amount: float
     plan_amount: Optional[float] = None
     is_subtotal: bool
+    sort_order: int = 0
+
+    class Config:
+        from_attributes = True
+
+
+class DeptDetailLineOut(BaseModel):
+    period_end: date
+    dept: str
+    category: str
+    amount: float
+    plan_amount: Optional[float] = None
+    is_subtotal: bool = False
+    is_plan_only: bool = False
     sort_order: int = 0
 
     class Config:

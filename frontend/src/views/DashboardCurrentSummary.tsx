@@ -8,6 +8,7 @@ import {
   getOverviewTargets,
   getDatasetStatus,
   refreshAppDataset,
+  formatLastUpdated,
   getArrBridge,
   postAgentChat,
   type DashboardKPI,
@@ -108,11 +109,6 @@ function isLegacyQuickBooksBanner(msg: string | null | undefined): boolean {
   )
 }
 
-function formatDatasetUpdated(iso: string): string {
-  const d = new Date(iso)
-  if (Number.isNaN(d.getTime())) return iso
-  return new Date(iso).toLocaleString('en-US', { month: 'short', day: 'numeric', year: 'numeric', hour: '2-digit', minute: '2-digit' })
-}
 
 const blockStyle: React.CSSProperties = {
   background: 'var(--surface)',
@@ -337,33 +333,37 @@ export default function DashboardCurrentSummary({ title = 'Current Performance' 
         }}
       >
         <h1 style={{ margin: 0, fontSize: '1.5rem', fontWeight: 600 }}>{title}</h1>
-        <button
-          type="button"
-          onClick={handleRefreshAppData}
-          disabled={refreshLoading}
-          style={{
-            padding: '0.5rem 1rem',
-            fontSize: '0.9rem',
-            fontWeight: 600,
-            cursor: refreshLoading ? 'wait' : 'pointer',
-            background: 'var(--accent)',
-            color: 'var(--accent-contrast, #fff)',
-            border: 'none',
-            borderRadius: 6,
-          }}
-        >
-          {refreshLoading ? 'Refreshing…' : 'Refresh app data'}
-        </button>
-        <span style={{ fontSize: '0.85rem', color: 'var(--text-muted)' }}>
-          {datasetStatus?.updated_at
-            ? `Last updated: ${formatDatasetUpdated(datasetStatus.updated_at)}`
-            : 'No refresh yet — click Refresh app data to load Salesforce, Sheets, and Chargebee (if configured).'}
-          {datasetStatus?.last_refresh_ok === false &&
-            datasetStatus?.last_error &&
-            !isLegacyQuickBooksBanner(datasetStatus.last_error) && (
-              <span style={{ color: 'var(--negative)', marginLeft: '0.5rem' }}>Last run error: {datasetStatus.last_error}</span>
-            )}
-        </span>
+        {!isFixedQuarterDashboard(title) && (
+          <>
+            <button
+              type="button"
+              onClick={handleRefreshAppData}
+              disabled={refreshLoading}
+              style={{
+                padding: '0.5rem 1rem',
+                fontSize: '0.9rem',
+                fontWeight: 600,
+                cursor: refreshLoading ? 'wait' : 'pointer',
+                background: 'var(--accent)',
+                color: 'var(--accent-contrast, #fff)',
+                border: 'none',
+                borderRadius: 6,
+              }}
+            >
+              {refreshLoading ? 'Refreshing…' : 'Refresh app data'}
+            </button>
+            <span style={{ fontSize: '0.85rem', color: 'var(--text-muted)' }}>
+              {datasetStatus?.updated_at
+                ? `Last updated: ${formatLastUpdated(datasetStatus.updated_at)}`
+                : 'No refresh yet — click Refresh app data to load Salesforce, Sheets, and Chargebee (if configured).'}
+              {datasetStatus?.last_refresh_ok === false &&
+                datasetStatus?.last_error &&
+                !isLegacyQuickBooksBanner(datasetStatus.last_error) && (
+                  <span style={{ color: 'var(--negative)', marginLeft: '0.5rem' }}>Last run error: {datasetStatus.last_error}</span>
+                )}
+            </span>
+          </>
+        )}
       </div>
       {refreshMessage && !isLegacyQuickBooksBanner(refreshMessage) && (
         <p style={{ fontSize: '0.9rem', color: refreshMessage.includes('failed') || refreshMessage.includes('error') ? 'var(--negative)' : 'var(--text-muted)', margin: '0 0 1rem' }}>

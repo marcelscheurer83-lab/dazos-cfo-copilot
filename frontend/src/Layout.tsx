@@ -13,8 +13,8 @@ const nav: NavItem[] = [
   { to: '/dashboard', label: 'Dashboard' },
   { to: '/go-to-market', label: 'Go-To-Market' },
   { to: '/arr', label: 'ARR' },
-  { to: '/analyses', label: 'Analyses' },
   { to: '/financials', label: 'Financials' },
+  { to: '/analyses', label: 'Analyses' },
 ]
 
 const topLevelFontSize = '0.875rem'

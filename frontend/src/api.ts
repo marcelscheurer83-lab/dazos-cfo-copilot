@@ -161,6 +161,7 @@ export type PnLLine = {
   amount: number
   plan_amount: number | null
   is_subtotal: boolean
+  is_plan_only: boolean
   sort_order: number
 }
 
@@ -170,6 +171,7 @@ export type CashFlowLine = {
   category: string
   amount: number
   plan_amount: number | null
+  is_subtotal: boolean
   sort_order: number
 }
 
@@ -930,6 +932,13 @@ export async function getOverviewTargets(): Promise<OverviewTargets> {
 }
 
 /** Unified refresh: Salesforce, Google Sheets (DATASET_SHEET_RANGES), Chargebee when configured. QuickBooks is separate (POST /api/sync/quickbooks). Can take many minutes. */
+/** Consistent "last updated" label used on every Refresh app data button. */
+export function formatLastUpdated(iso: string): string {
+  const d = new Date(iso)
+  if (Number.isNaN(d.getTime())) return iso
+  return d.toLocaleString('en-US', { month: 'short', day: 'numeric', year: 'numeric', hour: '2-digit', minute: '2-digit' })
+}
+
 export async function refreshAppDataset(): Promise<{
   ok: boolean
   job_id?: string
@@ -1109,11 +1118,61 @@ export async function getKPI(asOf?: string): Promise<KPISummary> {
   return r.json()
 }
 
+export async function getPnLPeriods(): Promise<string[]> {
+  const r = await apiFetch('/pnl/periods')
+  if (!r.ok) throw new Error('Failed to fetch P&L periods')
+  const data = await r.json()
+  return data.periods as string[]
+}
+
 export async function getPnL(periodEnd?: string, months = 3): Promise<PnLLine[]> {
   let path = `/pnl?months=${months}`
   if (periodEnd) path += `&period_end=${periodEnd}`
   const r = await apiFetch(path)
   if (!r.ok) throw new Error('Failed to fetch P&L')
+  return r.json()
+}
+
+export async function getPnLObservations(periodEnd: string): Promise<{ observations: string | null; period_end: string }> {
+  const r = await apiFetch(`/pnl/observations?period_end=${periodEnd}`)
+  if (!r.ok) throw new Error('Failed to fetch P&L observations')
+  return r.json()
+}
+
+export async function getCFObservations(periodEnd: string): Promise<{ observations: string | null; period_end: string }> {
+  const r = await apiFetch(`/cf/observations?period_end=${periodEnd}`)
+  if (!r.ok) throw new Error('Failed to fetch Cash Flow observations')
+  return r.json()
+}
+
+export async function getBSObservations(periodEnd: string): Promise<{ observations: string | null; period_end: string }> {
+  const r = await apiFetch(`/bs/observations?period_end=${periodEnd}`)
+  if (!r.ok) throw new Error('Failed to fetch Balance Sheet observations')
+  return r.json()
+}
+
+export async function getOverviewObservations(periodEnd: string): Promise<{ observations: string | null; period_end: string }> {
+  const r = await apiFetch(`/overview/observations?period_end=${periodEnd}`)
+  if (!r.ok) throw new Error('Failed to fetch overview observations')
+  return r.json()
+}
+
+export type DeptDetailLine = {
+  period_end: string
+  dept: string
+  category: string
+  amount: number
+  plan_amount: number | null
+  is_subtotal: boolean
+  is_plan_only: boolean
+  sort_order: number
+}
+
+export async function getDeptDetail(periodEnd?: string, months = 3): Promise<DeptDetailLine[]> {
+  let path = `/dept-detail?months=${months}`
+  if (periodEnd) path += `&period_end=${periodEnd}`
+  const r = await apiFetch(path)
+  if (!r.ok) throw new Error('Failed to fetch department detail')
   return r.json()
 }
 
@@ -1609,6 +1668,38 @@ export type TabSnapshot = { title: string; synced_at: string | null; non_empty_r
 export async function getTabSnapshots(): Promise<TabSnapshot[]> {
   const r = await apiFetch('/financials/tab-snapshots')
   if (!r.ok) throw new Error('Failed to fetch tab snapshots')
+  return r.json()
+}
+
+export type ModelTabStatus = {
+  tab: string
+  synced: boolean
+  synced_at: string | null
+  rows: number | null
+}
+
+export async function getModelTabsStatus(): Promise<{ tabs: ModelTabStatus[] }> {
+  const r = await apiFetch('/financials/model-tabs-status')
+  if (!r.ok) throw new Error('Failed to fetch model tabs status')
+  return r.json()
+}
+
+/** Model tab sync can take several minutes (many Google Sheet reads). */
+export async function syncModelTabs(
+  signal?: AbortSignal
+): Promise<{ synced: number; failed: number; details: { tab: string; ok: boolean; rows?: number; error?: string }[] }> {
+  const r = await apiFetch('/financials/sync-model-tabs', { method: 'POST', signal })
+  if (!r.ok) {
+    const err = await r.json().catch(() => ({}))
+    const detail = (err as { detail?: string | unknown }).detail
+    const msg =
+      typeof detail === 'string'
+        ? detail
+        : Array.isArray(detail)
+          ? (detail as { msg?: string }[]).map((d) => d.msg).filter(Boolean).join(' ')
+          : `HTTP ${r.status}`
+    throw new Error(msg || 'Failed to sync model tabs')
+  }
   return r.json()
 }
 

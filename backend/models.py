@@ -34,6 +34,7 @@ class PnLLine(Base):
     amount = Column(Float, default=0)
     plan_amount = Column(Float, default=None)  # budget/plan amount for variance analysis
     is_subtotal = Column(Integer, default=0)
+    is_plan_only = Column(Integer, default=0)  # 1 = future month, no actuals yet; amount=0, plan_amount=forecast
     sort_order = Column(Integer, default=0)
 
 
@@ -45,6 +46,7 @@ class CashFlowLine(Base):
     category = Column(String(128), nullable=False)
     amount = Column(Float, default=0)
     plan_amount = Column(Float, default=None)
+    is_subtotal = Column(Integer, default=0)
     sort_order = Column(Integer, default=0)
 
 
@@ -57,6 +59,19 @@ class BalanceSheetLine(Base):
     amount = Column(Float, default=0)
     plan_amount = Column(Float, default=None)
     is_subtotal = Column(Integer, default=0)
+    sort_order = Column(Integer, default=0)
+
+
+class DeptDetailLine(Base):
+    __tablename__ = "dept_detail_lines"
+    id = Column(Integer, primary_key=True)
+    period_end = Column(Date, nullable=False)
+    dept = Column(String(64), nullable=False)   # Sales, Marketing, Customer Success
+    category = Column(String(128), nullable=False)
+    amount = Column(Float, default=0)
+    plan_amount = Column(Float, default=None)
+    is_subtotal = Column(Integer, default=0)
+    is_plan_only = Column(Integer, default=0)
     sort_order = Column(Integer, default=0)
 
 

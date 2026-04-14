@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { getAIObservations, getPipelineOverview, type AIObservationsResponse, type PipelineOverviewResponse } from '../api'
+import { getAIObservations, getDatasetStatus, formatLastUpdated, getPipelineOverview, refreshAppDataset, type AIObservationsResponse, type DatasetStatus, type PipelineOverviewResponse } from '../api'
 import { loadPipelineFilters, savePipelineFilters } from '../tableFilterStorage'
 
 type FilterColumn = 'stage' | 'record_type' | 'close_date' | 'deal_tier'
@@ -77,6 +77,9 @@ function mergedPipelineChartStage(stageName: string | null | undefined): string 
 export default function Pipeline() {
   const [data, setData] = useState<PipelineOverviewResponse | null>(null)
   const [err, setErr] = useState<string | null>(null)
+  const [datasetStatus, setDatasetStatus] = useState<DatasetStatus | null>(null)
+  const [refreshLoading, setRefreshLoading] = useState(false)
+  const [refreshMessage, setRefreshMessage] = useState<string | null>(null)
   const [observations, setObservations] = useState<AIObservationsResponse | null>(null)
   const [sortKey, setSortKey] = useState<SortKey>('arr')
   const [sortDir, setSortDir] = useState<SortDir>('desc')
@@ -115,11 +118,25 @@ export default function Pipeline() {
 
   useEffect(() => {
     loadData()
+    getDatasetStatus().then(setDatasetStatus).catch(() => {})
   }, [loadData])
 
   useEffect(() => {
     getAIObservations('pipeline').then(setObservations).catch(() => {})
   }, [])
+
+  const handleRefreshAppData = async () => {
+    setRefreshMessage(null)
+    setRefreshLoading(true)
+    try {
+      const res = await refreshAppDataset()
+      setRefreshLoading(false)
+      setRefreshMessage(res.ok ? 'Refresh started — it will complete in the background.' : (res.error ?? 'Refresh failed to start.'))
+    } catch (e) {
+      setRefreshLoading(false)
+      setRefreshMessage(e instanceof Error ? e.message : 'Refresh failed')
+    }
+  }
 
   useEffect(() => {
     savePipelineFilters({
@@ -568,7 +585,16 @@ export default function Pipeline() {
 
   return (
     <>
-      <h1 style={{ margin: '0 0 1.5rem', fontSize: '1.5rem', fontWeight: 600, color: 'var(--text)' }}>Pipeline</h1>
+      <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '1rem', marginBottom: '1.5rem' }}>
+        <h1 style={{ margin: 0, fontSize: '1.5rem', fontWeight: 600, color: 'var(--text)' }}>Pipeline</h1>
+        <button type="button" onClick={handleRefreshAppData} disabled={refreshLoading} style={{ padding: '0.5rem 1rem', fontSize: '0.9rem', fontWeight: 600, cursor: refreshLoading ? 'wait' : 'pointer', background: 'var(--accent)', color: 'var(--accent-contrast, #fff)', border: 'none', borderRadius: 6 }}>
+          {refreshLoading ? 'Refreshing…' : 'Refresh app data'}
+        </button>
+        <span style={{ fontSize: '0.85rem', color: 'var(--text-muted)' }}>
+          {datasetStatus?.updated_at ? `Last updated: ${formatLastUpdated(datasetStatus.updated_at)}` : 'Click Refresh app data to load latest data.'}
+        </span>
+      </div>
+      {refreshMessage && <p style={{ fontSize: '0.9rem', color: refreshMessage.includes('failed') || refreshMessage.includes('error') ? 'var(--negative)' : 'var(--text-muted)', margin: '0 0 1rem' }}>{refreshMessage}</p>}
       {/* ── Observations card (full-width) ── */}
       <div style={{
         background: 'var(--surface)',

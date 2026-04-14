@@ -1185,6 +1185,19 @@ _TAB_PRIORITY: dict[str, int] = {
 }
 _TAB_DEFAULT_PRIORITY = 60
 _CONTEXT_TOKEN_BUDGET = 120_000   # ~120K chars ≈ ~30K tokens — well within Claude's window
+# Tool-use rounds for FP&A / executive agent (list_sheets + reads can consume several steps)
+_AGENT_MAX_TOOL_ROUNDS = 12
+
+
+def _anthropic_response_text(content) -> str:
+    """Concatenate all user-visible text blocks from a Claude Messages API `content` list."""
+    parts: list[str] = []
+    for b in content:
+        if getattr(b, "type", None) == "text":
+            t = getattr(b, "text", None)
+            if t:
+                parts.append(t)
+    return "\n\n".join(parts).strip()
 
 
 def _compact_tab(raw_rows: list[list], max_rows: int = 200, max_cols: int = 180) -> str:
@@ -1206,7 +1219,7 @@ async def _build_fpa_context(db: AsyncSession) -> str:
     Priority order:
     1. Model map (structural understanding of the spreadsheet)
     2. All stored tab snapshots (actual data from every sheet tab), ordered by priority
-    3. Structured DB data (P&L, CF, BS already parsed into tables)
+    3. Structured DB data (P&L, department OpEx detail, CF, BS from financials sync)
     4. Live ARR from Salesforce
     5. Latest stored monthly close analysis
     """
@@ -1291,6 +1304,37 @@ async def _build_fpa_context(db: AsyncSession) -> str:
                     cells.append(f"${row.amount:>12,.0f}  {('$'+f'{row.plan_amount:,.0f}') if row and row.plan_amount is not None else '—':>12}" if row else f"{'—':>14}  {'—':>12}")
                 lines.append(f"{cat:<40} " + " | ".join(cells))
             sections.append((500, "## P&L — structured (last 6 months, actual vs plan)", "\n".join(lines)))
+    except Exception:
+        pass
+
+    # ── 3b. Department-level OpEx (G&A, S&M, etc.) — same source as app Financials sync ──
+    try:
+        dept_r = await db.execute(
+            select(DeptDetailLine)
+            .order_by(DeptDetailLine.period_end.desc(), DeptDetailLine.sort_order)
+            .limit(1500)
+        )
+        dept_rows = dept_r.scalars().all()
+        if dept_rows:
+            periods = sorted(set(r.period_end for r in dept_rows), reverse=True)[:6]
+            lines_d: list[str] = []
+            for r in dept_rows:
+                if r.period_end not in periods:
+                    continue
+                plan_str = f" | plan ${r.plan_amount:,.0f}" if r.plan_amount is not None else ""
+                sub = " (subtotal)" if r.is_subtotal else ""
+                lines_d.append(
+                    f"[{r.period_end}] {r.dept} / {r.category}{sub}: ${r.amount:,.0f}{plan_str}"
+                )
+            if lines_d:
+                body = "\n".join(lines_d[:350])
+                if len(lines_d) > 350:
+                    body += f"\n… and {len(lines_d) - 350} more rows (use google_sheets_query for full detail)"
+                sections.append((
+                    498,
+                    "## Operating expenses by department — structured (from financials sync; last 6 periods)",
+                    body,
+                ))
     except Exception:
         pass
 
@@ -3110,7 +3154,9 @@ async def fpa_chat(body: FPAChatRequest, db: AsyncSession = Depends(get_db)):
             "1. `google_sheets_query` — read live data from the Dazos Google Sheets financial model. "
             "Use this for any financial detail not in the pre-loaded context: specific P&L line items, "
             "G&A breakdown, budget vs actuals rows, custom ranges. "
-            "Call list_sheets first if unsure which tab to use.\n"
+            "Call list_sheets first if unsure which tab to use. "
+            "The pre-loaded context already includes **P&L** and **operating expenses by department** from the same "
+            "sync as the Financials app; legal and similar fees are usually under **General & Administrative**.\n"
             "2. `chargebee_query` — live billing data: invoices, payments, collections, overdue balances. "
             "Use ONLY for cash/billing questions — never for ARR or revenue metrics (those come from Salesforce context)."
         )
@@ -3121,8 +3167,8 @@ async def fpa_chat(body: FPAChatRequest, db: AsyncSession = Depends(get_db)):
         raise HTTPException(status_code=400, detail="messages required")
 
     answer = ""
-    # Agentic loop — up to 6 rounds (Sheets may need list_sheets + read_range)
-    for _round in range(6):
+    # Agentic loop — Sheets often needs list_sheets + one or more read_range calls
+    for _round in range(_AGENT_MAX_TOOL_ROUNDS):
         response = await client.messages.create(
             model="claude-sonnet-4-5",
             max_tokens=4096,
@@ -3134,8 +3180,9 @@ async def fpa_chat(body: FPAChatRequest, db: AsyncSession = Depends(get_db)):
         tool_use_blocks = [b for b in response.content if b.type == "tool_use"]
 
         if not tool_use_blocks or response.stop_reason == "end_turn":
-            text_blocks = [b for b in response.content if b.type == "text"]
-            answer = text_blocks[0].text if text_blocks else answer
+            answer = _anthropic_response_text(response.content) or answer
+            if not answer and response.stop_reason == "max_tokens":
+                answer = "The reply was cut off (token limit). Please ask a narrower question or split it into parts."
             break
 
         messages.append({"role": "assistant", "content": response.content})
@@ -3158,6 +3205,15 @@ async def fpa_chat(body: FPAChatRequest, db: AsyncSession = Depends(get_db)):
             tool_results.append({"type": "tool_result", "tool_use_id": block.id, "content": result})
 
         messages.append({"role": "user", "content": tool_results})
+
+    if not answer.strip():
+        _logger.warning("fpa_chat: empty answer after %d tool rounds", _AGENT_MAX_TOOL_ROUNDS)
+        answer = (
+            "I could not finish a reply — often this means the maximum number of data-fetch steps was reached "
+            "without a final answer, or the model returned no text. Please try again. "
+            "For legal or G&A spend, the **Operating expenses by department** section in context (or the "
+            "`General & Administrative` sheet tab via google_sheets_query) usually has the line items."
+        )
 
     return FPAChatResponse(answer=answer)
 
@@ -7099,6 +7155,9 @@ async def post_agent_chat(body: AgentChatRequest, db: AsyncSession = Depends(get
             "3. `google_sheets_query` — read live data from the Dazos Google Sheets financial model. "
             "Use for any financial detail not in the pre-loaded context: specific P&L line items, G&A breakdown, "
             "budget rows, headcount, or any tab/range. Call list_sheets first if unsure which tab to read.\n\n"
+            "Pre-loaded context already includes **P&L** and **operating expenses by department** (same database as the "
+            "Financials app after sync). Line items such as legal or professional fees are usually under "
+            "`General & Administrative` in that section or on that sheet tab — search there before calling tools.\n\n"
             "Always answer from the pre-loaded context first; only call a tool when the context lacks the data. "
             "Salesforce: include a LIMIT clause. Chargebee: amounts are in cents (÷100 for dollars)."
         )
@@ -7163,9 +7222,11 @@ async def post_agent_chat(body: AgentChatRequest, db: AsyncSession = Depends(get
     try:
         client = _anthropic_mod.AsyncAnthropic(api_key=anthropic_key)
         answer = "No response from agent."
+        last_stop: str | None = None
+        last_content_types: list[str] = []
 
-        # Agentic loop — up to 6 rounds (Sheets may need list_sheets + read_range)
-        for _round in range(6):
+        # Agentic loop — SF + Sheets can need many steps (list_sheets + multiple reads)
+        for _round in range(_AGENT_MAX_TOOL_ROUNDS):
             response = await client.messages.create(
                 model="claude-sonnet-4-5",
                 max_tokens=4096,
@@ -7173,13 +7234,16 @@ async def post_agent_chat(body: AgentChatRequest, db: AsyncSession = Depends(get
                 tools=sf_tools,
                 messages=messages,
             )
+            last_stop = getattr(response, "stop_reason", None)
+            last_content_types = [getattr(b, "type", "?") for b in response.content]
 
             tool_use_blocks = [b for b in response.content if b.type == "tool_use"]
 
             if not tool_use_blocks or response.stop_reason == "end_turn":
-                # Final answer — extract first text block
-                text_blocks = [b for b in response.content if b.type == "text"]
-                answer = text_blocks[0].text if text_blocks else answer
+                # Final answer — concatenate all text blocks (some models split across blocks)
+                answer = _anthropic_response_text(response.content) or answer
+                if (not answer or answer == "No response from agent.") and response.stop_reason == "max_tokens":
+                    answer = "The reply was cut off (token limit). Please ask a narrower question or split it into parts."
                 break
 
             # Append assistant turn (may include text + tool_use blocks)
@@ -7210,6 +7274,20 @@ async def post_agent_chat(body: AgentChatRequest, db: AsyncSession = Depends(get
                 )
 
             messages.append({"role": "user", "content": tool_results})
+
+        if not answer or answer == "No response from agent.":
+            _logger.warning(
+                "post_agent_chat: no assistant text after loop (stop=%s content_types=%s)",
+                last_stop,
+                last_content_types,
+            )
+            answer = (
+                "I could not finish a reply — this usually means the step limit for reading data was hit "
+                "without a final answer, or the model returned no text. Please try again. "
+                "Financials from your app sync are in context (P&L and **operating expenses by department**); "
+                "legal-type spend is usually under **General & Administrative**. I can also read the live "
+                "sheet via google_sheets_query if a line is missing from context."
+            )
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Agent error: {e}")

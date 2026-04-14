@@ -360,11 +360,12 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Dazos CFO Cockpit API", version="1.0.0", lifespan=lifespan)
-_cors_origins = os.getenv("CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").strip().split(",")
+_cors_origins_env = os.getenv("CORS_ORIGINS", "").strip()
+_cors_origins = [o.strip() for o in _cors_origins_env.split(",") if o.strip()] if _cors_origins_env else ["*"]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[o.strip() for o in _cors_origins if o.strip()],
-    allow_credentials=True,
+    allow_origins=_cors_origins,
+    allow_credentials=False if "*" in _cors_origins else True,
     allow_methods=["*"],
     allow_headers=["*"],
 )

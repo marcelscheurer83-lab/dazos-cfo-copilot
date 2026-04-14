@@ -1288,15 +1288,18 @@ async def _build_fpa_context(db: AsyncSession) -> str:
                 f"{str(p):>12} actual  {str(p):>12} plan" for p in periods
             )
             lines = [header, "-" * len(header)]
+            # One cell per (category, period): same merge as Financials UI — plan-only rows must not overwrite actuals
+            by_cat: dict = {}
             cats: list[str] = []
             seen_c: set = set()
-            for r in pnl_rows:
+            for r in sorted(pnl_rows, key=lambda x: (x.period_end, x.sort_order)):
+                d = by_cat.setdefault(r.category, {})
+                if bool(r.is_plan_only) and r.period_end in d:
+                    continue
+                d[r.period_end] = r
                 if r.category not in seen_c:
                     seen_c.add(r.category)
                     cats.append(r.category)
-            by_cat: dict = {}
-            for r in pnl_rows:
-                by_cat.setdefault(r.category, {})[r.period_end] = r
             for cat in cats:
                 cells = []
                 for p in periods:
@@ -1317,10 +1320,18 @@ async def _build_fpa_context(db: AsyncSession) -> str:
         dept_rows = dept_r.scalars().all()
         if dept_rows:
             periods = sorted(set(r.period_end for r in dept_rows), reverse=True)[:6]
-            lines_d: list[str] = []
-            for r in dept_rows:
-                if r.period_end not in periods:
+            period_set = set(periods)
+            # One line per (period, dept, category) — matches Financials UI (do not list plan-only duplicates)
+            merged_dept: dict[tuple, DeptDetailLine] = {}
+            for r in sorted(dept_rows, key=lambda x: (x.period_end, x.sort_order)):
+                if r.period_end not in period_set:
                     continue
+                k = (r.period_end, r.dept, r.category)
+                if bool(r.is_plan_only) and k in merged_dept:
+                    continue
+                merged_dept[k] = r
+            lines_d: list[str] = []
+            for r in sorted(merged_dept.values(), key=lambda x: (x.period_end, x.sort_order)):
                 plan_str = f" | plan ${r.plan_amount:,.0f}" if r.plan_amount is not None else ""
                 sub = " (subtotal)" if r.is_subtotal else ""
                 lines_d.append(
@@ -1332,7 +1343,8 @@ async def _build_fpa_context(db: AsyncSession) -> str:
                     body += f"\n… and {len(lines_d) - 350} more rows (use google_sheets_query for full detail)"
                 sections.append((
                     498,
-                    "## Operating expenses by department — structured (from financials sync; last 6 periods)",
+                    "## Operating expenses by department — structured (from financials sync; last 6 periods; "
+                    "one row per line — actuals take precedence over plan-only sheet copies)",
                     body,
                 ))
     except Exception:
@@ -3062,7 +3074,9 @@ _SHEETS_TOOL: dict = {
         "Use this when the pre-loaded context doesn't have the specific detail needed — "
         "e.g. individual G&A line items, a specific row or range, custom formulas, or data "
         "from a tab not included in the snapshot. "
-        "Call list_sheets first if you're unsure which tab or range to read."
+        "Call list_sheets first if you're unsure which tab or range to read. "
+        "When a tab has separate **actual** vs **plan / forecast** month columns, use the actual column "
+        "for closed months — do not add plan + actual for the same line and month."
     ),
     "input_schema": {
         "type": "object",

@@ -11,7 +11,7 @@ import {
   Tooltip,
   Legend,
 } from 'recharts'
-import { getPnL, getBalanceSheet, getCashFlow, getDeptDetail, getOverviewObservations, type PnLLine, type BalanceSheetLine, type CashFlowLine, type DeptDetailLine } from '../api'
+import { getPnL, getBalanceSheet, getDeptDetail, getOverviewObservations, type PnLLine, type BalanceSheetLine, type DeptDetailLine } from '../api'
 
 const YEAR = 2026
 const ACCENT = '#6366f1'
@@ -39,9 +39,6 @@ function fmtK(n: number) {
 function fmtUSD(n: number) {
   return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 }).format(n)
 }
-function fmtPct(n: number | null) {
-  return n == null || !Number.isFinite(n) ? '—' : `${n.toFixed(1)}%`
-}
 function fmtVar(n: number, pctMode = false) {
   if (!Number.isFinite(n)) return '—'
   const sign = n >= 0 ? '+' : ''
@@ -55,21 +52,15 @@ const isGrossProfit = (c: string) => /gross\s+profit/i.test(c)
 const isOpEx = (c: string) => /^total\s+op.?ex$/i.test(c.trim()) || /^total\s+operating/i.test(c.trim()) || /^operating\s+exp/i.test(c.trim())
 const isNetIncome = (c: string) => /^net\s+income$/i.test(c.trim()) || /^net\s+(income|loss)/i.test(c.trim())
 
-function varColor(v: number) {
-  if (Math.abs(v) < 0.5) return 'var(--text-muted)'
-  return v > 0 ? POSITIVE_COLOR : NEGATIVE_COLOR
-}
-
 // ── KPI Card ─────────────────────────────────────────────────────────────────
 function KPICard({
-  label, actual, plan, variance, pctMode = false, isCurrency = true, suffix = '', invertVariance = false,
+  label, actual, plan, variance, pctMode = false, suffix = '', invertVariance = false,
 }: {
   label: string
   actual: number | null
   plan: number | null
   variance: number | null
   pctMode?: boolean
-  isCurrency?: boolean
   suffix?: string
   invertVariance?: boolean
 }) {
@@ -215,14 +206,12 @@ function DeptTable({ title, rows, monthName, ytdLabel, monthShort }: {
 }
 
 // ── Chart tooltip formatters ──────────────────────────────────────────────────
-const currencyTooltip = (value: number) => fmtK(value)
 const pctTooltip = (value: number) => `${value.toFixed(1)}%`
 
 // ── Main component ────────────────────────────────────────────────────────────
 export default function YTDOverview() {
   const [pnlLines, setPnlLines] = useState<PnLLine[]>([])
   const [bsLines, setBsLines] = useState<BalanceSheetLine[]>([])
-  const [cfLines, setCfLines] = useState<CashFlowLine[]>([])
   const [deptLines, setDeptLines] = useState<DeptDetailLine[]>([])
   const [loading, setLoading] = useState(true)
   const [err, setErr] = useState<string | null>(null)
@@ -250,10 +239,9 @@ export default function YTDOverview() {
     Promise.all([
       getPnL(anchorMonth, 12),
       getBalanceSheet(anchorMonth, 12),
-      getCashFlow(anchorMonth, 12),
       getDeptDetail(anchorMonth, 12),
     ])
-      .then(([pnl, bs, cf, dept]) => { setPnlLines(pnl); setBsLines(bs); setCfLines(cf); setDeptLines(dept) })
+      .then(([pnl, bs, dept]) => { setPnlLines(pnl); setBsLines(bs); setDeptLines(dept) })
       .catch((e) => setErr(e.message))
       .finally(() => setLoading(false))
   }, [anchorMonth])
@@ -285,15 +273,6 @@ export default function YTDOverview() {
     }
     return m
   }, [bsLines])
-
-  const cfByPeriod = useMemo(() => {
-    const m: Record<string, Record<string, { actual: number; plan: number | null; section: string }>> = {}
-    for (const l of cfLines) {
-      if (!m[l.period_end]) m[l.period_end] = {}
-      m[l.period_end][l.category] = { actual: l.amount, plan: l.plan_amount ?? null, section: l.section }
-    }
-    return m
-  }, [cfLines])
 
   // Find canonical category names
   const catNames = useMemo(() => {
@@ -337,23 +316,9 @@ export default function YTDOverview() {
     return { actual: a, plan: anyPlan ? p : null }
   }
 
-  function ytdCfSum(cat: string): { actual: number; plan: number | null } {
-    let a = 0; let p: number | null = null; let anyPlan = false
-    for (const pe of availMonths) {
-      const c = cfByPeriod[pe]?.[cat]
-      if (c) { a += c.actual; if (c.plan != null) { anyPlan = true; p = (p ?? 0) + c.plan } }
-    }
-    return { actual: a, plan: anyPlan ? p : null }
-  }
-
   function getLatestBs(cat: string): { actual: number; plan: number | null } {
     if (!latestMonth) return { actual: 0, plan: null }
     return bsByPeriod[latestMonth]?.[cat] ?? { actual: 0, plan: null }
-  }
-
-  function getLatestCf(cat: string): { actual: number; plan: number | null } {
-    if (!latestMonth) return { actual: 0, plan: null }
-    return cfByPeriod[latestMonth]?.[cat] ?? { actual: 0, plan: null }
   }
 
   // Build a DeptRow from a PnL category
@@ -361,12 +326,6 @@ export default function YTDOverview() {
     const m = latestMonth ? byPeriod[latestMonth]?.[cat] ?? { actual: 0, plan: null } : { actual: 0, plan: null }
     const ytd = ytdSum(cat)
     return { label: cat, mAct: m.actual, mPlan: m.plan, ytdAct: ytd.actual, ytdPlan: ytd.plan, isSubtotal, invertVar }
-  }
-
-  function cfRow(cat: string, isSubtotal = false): DeptRow {
-    const m = getLatestCf(cat)
-    const ytd = ytdCfSum(cat)
-    return { label: cat, mAct: m.actual, mPlan: m.plan, ytdAct: ytd.actual, ytdPlan: ytd.plan, isSubtotal }
   }
 
   function bsRow(cat: string, isSubtotal = false): DeptRow {
@@ -491,29 +450,6 @@ export default function YTDOverview() {
     const opexCats = [...new Set(sorted.filter((l) => l.line_type === 'opex').map((l) => l.category))]
     return opexCats.map((cat) => pnlRow(cat, /^(total|operating exp)/i.test(cat), true))
   }, [pnlLines, latestMonth, byPeriod, availMonths])
-
-  // Selected CF items
-  const cfSectionRows: DeptRow[] = useMemo(() => {
-    const cfCats = [...new Set(cfLines.map((l) => l.category))]
-    const operatingNet = cfCats.find((c) => /net cash.*operat/i.test(c)) ?? null
-    const investingNet = cfCats.find((c) => /net cash.*invest/i.test(c)) ?? null
-    const financingNet = cfCats.find((c) => /net cash.*financ/i.test(c)) ?? null
-    const netIncrease = cfCats.find((c) => /net cash increase/i.test(c)) ?? null
-
-    const workingCapital = cfCats.filter((c) =>
-      !/net cash|net income/i.test(c) &&
-      cfLines.find((l) => l.category === c)?.section === 'operating'
-    )
-
-    const rows: DeptRow[] = []
-    // Working capital movements
-    workingCapital.forEach((cat) => rows.push(cfRow(cat)))
-    if (operatingNet) rows.push(cfRow(operatingNet, true))
-    if (investingNet) rows.push({ ...cfRow(investingNet, true) })
-    if (financingNet) rows.push({ ...cfRow(financingNet, true) })
-    if (netIncrease) rows.push({ ...cfRow(netIncrease, true) })
-    return rows
-  }, [cfLines, latestMonth, cfByPeriod, availMonths])
 
   // Selected BS items
   const bsSummaryRows: DeptRow[] = useMemo(() => {
@@ -738,7 +674,7 @@ export default function YTDOverview() {
               <XAxis dataKey="month" tick={{ fill: 'var(--text-muted)', fontSize: 11 }} axisLine={false} tickLine={false} />
               <YAxis tickFormatter={(v) => fmtK(v)} tick={{ fill: 'var(--text-muted)', fontSize: 11 }} axisLine={false} tickLine={false} width={55} />
               <Tooltip
-                formatter={(value: number, name: string) => [fmtK(value), name === 'revenueActual' ? 'Actual' : 'Plan']}
+                formatter={(value: unknown, name: unknown) => [fmtK(Number(value)), String(name) === 'revenueActual' ? 'Actual' : 'Plan']}
                 contentStyle={{ background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 8, fontSize: 12 }}
                 labelStyle={{ color: 'var(--text)', fontWeight: 600 }}
               />
@@ -758,7 +694,7 @@ export default function YTDOverview() {
               <XAxis dataKey="month" tick={{ fill: 'var(--text-muted)', fontSize: 11 }} axisLine={false} tickLine={false} />
               <YAxis tickFormatter={(v) => `${v.toFixed(0)}%`} tick={{ fill: 'var(--text-muted)', fontSize: 11 }} axisLine={false} tickLine={false} width={40} domain={['auto', 'auto']} />
               <Tooltip
-                formatter={(value: number, name: string) => [pctTooltip(value), name === 'gmActual' ? 'Actual' : 'Plan']}
+                formatter={(value: unknown, name: unknown) => [pctTooltip(Number(value)), String(name) === 'gmActual' ? 'Actual' : 'Plan']}
                 contentStyle={{ background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 8, fontSize: 12 }}
                 labelStyle={{ color: 'var(--text)', fontWeight: 600 }}
               />
@@ -781,7 +717,7 @@ export default function YTDOverview() {
               <XAxis dataKey="month" tick={{ fill: 'var(--text-muted)', fontSize: 11 }} axisLine={false} tickLine={false} />
               <YAxis tickFormatter={(v) => fmtK(v)} tick={{ fill: 'var(--text-muted)', fontSize: 11 }} axisLine={false} tickLine={false} width={55} />
               <Tooltip
-                formatter={(value: number, name: string) => [fmtK(value), name === 'niActual' ? 'Actual' : 'Plan']}
+                formatter={(value: unknown, name: unknown) => [fmtK(Number(value)), String(name) === 'niActual' ? 'Actual' : 'Plan']}
                 contentStyle={{ background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 8, fontSize: 12 }}
                 labelStyle={{ color: 'var(--text)', fontWeight: 600 }}
               />
@@ -801,7 +737,7 @@ export default function YTDOverview() {
               <XAxis dataKey="month" tick={{ fill: 'var(--text-muted)', fontSize: 11 }} axisLine={false} tickLine={false} />
               <YAxis tickFormatter={(v) => fmtK(v)} tick={{ fill: 'var(--text-muted)', fontSize: 11 }} axisLine={false} tickLine={false} width={55} />
               <Tooltip
-                formatter={(value: number, name: string) => [fmtK(value), name === 'cashActual' ? 'Actual' : 'Plan']}
+                formatter={(value: unknown, name: unknown) => [fmtK(Number(value)), String(name) === 'cashActual' ? 'Actual' : 'Plan']}
                 contentStyle={{ background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 8, fontSize: 12 }}
                 labelStyle={{ color: 'var(--text)', fontWeight: 600 }}
               />

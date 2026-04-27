@@ -6633,12 +6633,14 @@ async def get_forecast_current_quarter(db: AsyncSession = Depends(get_db)):
         return round(sum(vals) / len(vals), 1) if vals else None
 
     base = os.getenv("SALESFORCE_BASE_URL", "").strip().rstrip("/")
+    ai_backtest = await _compute_ai_backtest_against_snapshots(db)
     return {
         "quarter": q_label,
         "months": months,
         "new_business": nb_months,
         "expansion": exp_months,
         "renewals": renewal_months,
+        "ai_backtest": ai_backtest,
         "quarter_totals": {
             "nb_actuals":              _sum(nb_months,  "actuals"),
             "nb_forecast":             _sum(nb_months,  "forecast"),
@@ -6875,6 +6877,111 @@ async def get_forecast_observations(
     }
 
 
+def _earliest_backtest_snapshot_for_month(month_snaps: list[ForecastSnapshot]) -> Optional[ForecastSnapshot]:
+    """Chronological first snapshot; prefer the first with total_ai_adjusted_forecast (matches UI Forecast (AI))."""
+    if not month_snaps:
+        return None
+    sn = sorted(month_snaps, key=lambda s: s.snapshot_date)
+    for s in sn:
+        if s.total_ai_adjusted_forecast is not None:
+            return s
+    return sn[0]
+
+
+async def _bookings_total_closed_won_for_month(
+    db: AsyncSession, d_start: date, actuals_end: date
+) -> tuple[float, float, float]:
+    """NB ARR, Expansion ARR (incl. upon-renewal), and total — same as forecast `current-quarter` actuals."""
+    _total, nb_actual, _exp = await _closed_won_arr_in_range(db, d_start, actuals_end)
+    _exp_total, _nb2, exp_mid = await _closed_won_arr_in_range(db, d_start, actuals_end)
+    exp_upon = await _closed_won_renewal_expansion_arr_in_range(db, d_start, actuals_end)
+    exp_actual = round(exp_mid + exp_upon, 2)
+    return round(nb_actual, 2), exp_actual, round(nb_actual + exp_actual, 2)
+
+
+async def _compute_ai_backtest_against_snapshots(db: AsyncSession) -> dict:
+    """
+    For each completed month: earliest DB snapshot with total_ai_adjusted_forecast (when present)
+    vs final Closed Won NB+Expansion. Used for deal-level LLM calibration and Current Quarter UI.
+    """
+    today = datetime.now(EST).date()
+    snaps_r = await db.execute(select(ForecastSnapshot).order_by(ForecastSnapshot.snapshot_date))
+    all_snaps: list[ForecastSnapshot] = list(snaps_r.scalars().all())
+    if not all_snaps:
+        return {"n": 0, "mean_signed_error_pct": None, "mean_abs_error_pct": None, "rows": []}
+    by_t: dict[str, list[ForecastSnapshot]] = {}
+    for s in all_snaps:
+        by_t.setdefault(s.target_month, []).append(s)
+    completed: list[str] = []
+    for mk in by_t:
+        y, m = int(mk[:4]), int(mk[5:])
+        d_e = date(y, m, calendar.monthrange(y, m)[1])
+        if d_e < today:
+            completed.append(mk)
+    completed.sort(reverse=True)
+    signed: list[float] = []
+    abs_e: list[float] = []
+    rows: list[dict] = []
+    for mk in completed[:12]:
+        earliest = _earliest_backtest_snapshot_for_month(by_t[mk])
+        if not earliest or earliest.total_ai_adjusted_forecast is None:
+            continue
+        pred = float(earliest.total_ai_adjusted_forecast)
+        if pred <= 0:
+            continue
+        y, m = int(mk[:4]), int(mk[5:])
+        d_s = date(y, m, 1)
+        d_e = date(y, m, calendar.monthrange(y, m)[1])
+        _nb, _ex, tot = await _bookings_total_closed_won_for_month(db, d_s, d_e)
+        err_pct = (tot - pred) / pred * 100.0
+        signed.append(err_pct)
+        abs_e.append(abs(err_pct))
+        rows.append(
+            {
+                "month": mk,
+                "predicted": round(pred, 2),
+                "actual": tot,
+                "error_pct": round(err_pct, 1),
+                "earliest_snapshot": earliest.snapshot_date.isoformat(),
+            }
+        )
+    n = len(signed)
+    return {
+        "n": n,
+        "mean_signed_error_pct": round(sum(signed) / n, 1) if n else None,
+        "mean_abs_error_pct": round(sum(abs_e) / n, 1) if n else None,
+        "rows": rows,
+    }
+
+
+async def _ai_forecast_calibration_block(db: AsyncSession) -> str:
+    """Markdown for the deal-scoring LLM: recent AI-adjusted month forecast vs realized bookings."""
+    d = await _compute_ai_backtest_against_snapshots(db)
+    if d["n"] == 0:
+        return ""
+    lines = [
+        "## Out-of-sample AI forecast (bookings) vs realized closes",
+        "Each line compares the **earliest** saved *Forecast (AI) — adjusted* in our DB for that month to **final** Closed Won NB+Expansion ARR. "
+        "If mean signed error is **negative**, we have been **over-forecasting** on average; if positive, **under-forecasting**.",
+    ]
+    for r in d["rows"][:8]:
+        lines.append(
+            f"- {r['month']}: AI adjusted ${r['predicted']:,.0f} → closed ${r['actual']:,.0f} "
+            f"({r['error_pct']:+.0f}% vs forecast); first snapshot {r['earliest_snapshot']}"
+        )
+    bias = d.get("mean_signed_error_pct")
+    mae = d.get("mean_abs_error_pct")
+    lines.append(
+        f"**Blended mean signed error:** {bias:+.0f}%  ·  **MAE:** {mae:.0f}%  (n={d['n']} completed month(s) with data)."
+    )
+    lines.append(
+        "**Use as a prior on win-probability** — if we over-forecast, reduce confidence on shaky *Best Case* / high-category deals; "
+        "if we under-forecast, avoid crushing implied probability on well-supported late-stage opps. "
+        "Staleness, close-date pushes, and few activities must still lower scores."
+    )
+    return "\n".join(lines)
+
+
 @app.get("/api/forecast/accuracy")
 async def get_forecast_accuracy(db: AsyncSession = Depends(get_db)):
     """
@@ -6907,11 +7014,7 @@ async def get_forecast_accuracy(db: AsyncSession = Depends(get_db)):
         is_complete = d_end < today
         actuals_end = d_end if is_complete else today
 
-        _total, nb_actual, _exp = await _closed_won_arr_in_range(db, d_start, actuals_end)
-        _exp_total, _nb2, exp_mid = await _closed_won_arr_in_range(db, d_start, actuals_end)
-        exp_upon = await _closed_won_renewal_expansion_arr_in_range(db, d_start, actuals_end)
-        exp_actual = round(exp_mid + exp_upon, 2)
-        total_actual = round(nb_actual + exp_actual, 2)
+        nb_actual, exp_actual, total_actual = await _bookings_total_closed_won_for_month(db, d_start, actuals_end)
 
         # Group snapshots for this month by snapshot_date
         month_snaps = [s for s in all_snaps if s.target_month == mk]
@@ -6929,13 +7032,19 @@ async def get_forecast_accuracy(db: AsyncSession = Depends(get_db)):
                 "exp_ai_forecast": s.exp_ai_forecast,
                 "total_forecast": s.total_forecast,
                 "total_adjusted_forecast": s.total_adjusted_forecast,
+                "total_ai_adjusted_forecast": s.total_ai_adjusted_forecast,
             })
 
-        # Accuracy vs. earliest snapshot (start-of-month forecast)
-        earliest = month_snaps[0] if month_snaps else None
+        # Accuracy vs. earliest snapshot (chronological first; prefer one with full AI total)
+        earliest = _earliest_backtest_snapshot_for_month(month_snaps) if month_snaps else None
         acc_weighted = round(total_actual / earliest.total_forecast * 100, 1) if (earliest and earliest.total_forecast and earliest.total_forecast > 0 and is_complete) else None
         acc_adjusted = round(total_actual / earliest.total_adjusted_forecast * 100, 1) if (earliest and earliest.total_adjusted_forecast and earliest.total_adjusted_forecast > 0 and is_complete) else None
-        acc_ai = round(total_actual / (earliest.nb_ai_forecast or 0 + earliest.exp_ai_forecast or 0) * 100, 1) if (earliest and earliest.nb_ai_forecast and earliest.exp_ai_forecast and is_complete) else None
+        pred_ai: float | None = None
+        if earliest and earliest.total_ai_adjusted_forecast is not None:
+            pred_ai = float(earliest.total_ai_adjusted_forecast)
+        elif earliest and (earliest.nb_ai_forecast is not None or earliest.exp_ai_forecast is not None):
+            pred_ai = (earliest.nb_ai_forecast or 0) + (earliest.exp_ai_forecast or 0)
+        acc_ai = round(total_actual / pred_ai * 100, 1) if (pred_ai and pred_ai > 0 and is_complete) else None
 
         rows.append({
             "month": mk,
@@ -6947,6 +7056,7 @@ async def get_forecast_accuracy(db: AsyncSession = Depends(get_db)):
             "earliest_snapshot_date": earliest.snapshot_date.isoformat() if earliest else None,
             "weighted_forecast_at_snap": earliest.total_forecast if earliest else None,
             "adjusted_forecast_at_snap": earliest.total_adjusted_forecast if earliest else None,
+            "ai_adjusted_forecast_at_snap": earliest.total_ai_adjusted_forecast if earliest else None,
             "accuracy_weighted_pct": acc_weighted,
             "accuracy_adjusted_pct": acc_adjusted,
             "accuracy_ai_pct": acc_ai,
@@ -9078,6 +9188,7 @@ async def _run_ai_forecast_scoring(db: AsyncSession) -> dict:
     scored_total = 0
     scored_at = datetime.now(EST)
     logger = logging.getLogger(__name__)
+    cal_block = await _ai_forecast_calibration_block(db)
 
     # ── Process in batches ────────────────────────────────────────────────────
     for batch_start in range(0, len(open_opps), _AI_SCORING_MAX_BATCH):
@@ -9090,13 +9201,16 @@ async def _run_ai_forecast_scoring(db: AsyncSession) -> dict:
             "with stage history, close-date changes, deal size, next steps, recent activity, and notes. "
             "For each deal, assign a win probability (0.0 to 1.0) representing the likelihood "
             "the deal closes as Closed Won within 90 days of its current close date. "
-            "Consider: stage velocity, close-date stability (fewer pushes = better), "
-            "forecast category alignment, days until close, recency of activity (stale = lower), "
-            "next step clarity (specific action = higher), and note content (positive signals like pricing "
-            "discussions or scheduled demos = higher; concerns or silence = lower). "
+            "These probabilities × ARR roll up to the **Current Quarter Forecast (AI)** in the app; "
+            "calibrate against the backtest section below when it is present. "
+            "Consider: stage velocity, close-date stability (penalize repeated pushes), "
+            "forecast category vs. evidence (empty *Best Case* pipeline = lower), days until close, "
+            "recency of activity (stale = lower), next-step specificity, and note tone. "
             "Return ONLY valid JSON in this exact schema with no extra text:\n"
             '"scores": [{"sf_opp_id": "<id>", "probability": <float 0-1>, "reasoning": "<1-2 sentences>"}]}'
         )
+        if cal_block:
+            scoring_task = scoring_task + "\n\n" + cal_block
 
         user_content = _json.dumps({"opportunities": contexts}, default=str)
 
@@ -9193,13 +9307,24 @@ async def _run_ai_forecast_scoring(db: AsyncSession) -> dict:
 
         obs_task = (
             f"Generate a forecast health briefing for the executive team for {q_label2}. "
-            "Based on the AI-scored pipeline data below, write 4-6 concise bullet-point observations. "
-            "Cover: overall forecast confidence, month-by-month risk, concentration risk (few large deals), "
-            "deal velocity signals, and any notable patterns from high/at-risk deals. "
-            "Be specific with numbers. Write for a CFO/CEO audience — direct, no fluff. "
+            "Based on the AI-scored pipeline and `ai_forecast_backtest` (snapshots vs final closed won), write 4-6 bullet points. "
+            "When backtest has n>0, mention whether the team has been over- or under-forecasting vs realized bookings and what that "
+            "implies for confidence in the current quarter AI number. Also cover: month risk, large-deal concentration, "
+            "velocity, and at-risk / high-confidence deals. Be specific with numbers. No fluff. "
             "Return ONLY valid JSON: \"observations\": [\"bullet 1\", \"bullet 2\", ...]}"
         )
-        obs_raw = await _anth_json(obs_task, _json2.dumps({"quarter": q_label2, "months": month_summaries}, default=str), max_tokens=1000, temperature=0.3)
+        _bt = await _compute_ai_backtest_against_snapshots(db)
+        obs_payload = {
+            "quarter": q_label2,
+            "months": month_summaries,
+            "ai_forecast_backtest": {
+                "n": _bt["n"],
+                "mean_signed_error_pct": _bt["mean_signed_error_pct"],
+                "mean_abs_error_pct": _bt["mean_abs_error_pct"],
+                "recent_months": _bt["rows"][:6],
+            },
+        }
+        obs_raw = await _anth_json(obs_task, _json2.dumps(obs_payload, default=str), max_tokens=1000, temperature=0.3)
         observations = _json2.loads(obs_raw).get("observations", [])
 
         # Replace forecast observations (keep only the latest run)

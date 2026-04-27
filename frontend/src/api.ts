@@ -1391,12 +1391,30 @@ export type ForecastQuarterTotals = {
   rate_target: number | null
 }
 
+/** Earliest-snapshot AI month forecast vs final closed won (backtest) */
+export type AIForecastBacktestRow = {
+  month: string
+  predicted: number
+  actual: number
+  error_pct: number
+  earliest_snapshot: string
+}
+
+export type AIForecastBacktestSummary = {
+  n: number
+  mean_signed_error_pct: number | null
+  mean_abs_error_pct: number | null
+  rows: AIForecastBacktestRow[]
+}
+
 export type ForecastResponse = {
   quarter: string
   months: string[]
   new_business: ForecastMonthNB[]
   expansion: ForecastMonthExp[]
   renewals: ForecastMonthRenewal[]
+  /** Snapshot vs actual closed bookings — sharpens AI scoring; absent on older backends */
+  ai_backtest?: AIForecastBacktestSummary | null
   quarter_totals: ForecastQuarterTotals
   in_quarter_quarters_used: number
   salesforce_base_url: string | null
@@ -1408,9 +1426,12 @@ export type ForecastAccuracyRow = {
   nb_actual: number
   exp_actual: number
   total_actual: number
+  snapshots?: { snapshot_date: string; total_forecast: number | null; total_adjusted_forecast: number | null; total_ai_adjusted_forecast?: number | null }[]
   earliest_snapshot_date: string | null
   weighted_forecast_at_snap: number | null
   adjusted_forecast_at_snap: number | null
+  /** Earliest-snapshot *Forecast (AI) adjusted* (NB+Exp+IQ), for apples-to-apples vs `accuracy_ai_pct` */
+  ai_adjusted_forecast_at_snap: number | null
   accuracy_weighted_pct: number | null
   accuracy_adjusted_pct: number | null
   accuracy_ai_pct: number | null

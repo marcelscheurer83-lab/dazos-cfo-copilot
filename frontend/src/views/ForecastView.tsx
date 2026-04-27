@@ -720,7 +720,7 @@ export default function ForecastView() {
   if (error)   return <div style={{ color: '#ef4444' }}>Error: {error}</div>
   if (!data)   return null
 
-  const { quarter, months, new_business: nb, expansion: exp, renewals, quarter_totals: qt, in_quarter_quarters_used: iqQtrs } = data
+  const { quarter, months, new_business: nb, expansion: exp, renewals, quarter_totals: qt, in_quarter_quarters_used: iqQtrs, ai_backtest } = data
 
   // ── KPI values ─────────────────────────────────────────────────────────────
   const totalBookingsForecast     = qt.total_adjusted_forecast
@@ -764,6 +764,34 @@ export default function ForecastView() {
       <h1 style={{ margin: '0 0 1.25rem', fontSize: '1.5rem', fontWeight: 600, color: 'var(--text)' }}>
         {quarter} Forecast
       </h1>
+
+      {ai_backtest && ai_backtest.n > 0 && (
+        <div
+          style={{
+            marginBottom: '1rem',
+            padding: '0.65rem 0.9rem',
+            borderRadius: 8,
+            border: '1px solid var(--border)',
+            background: 'rgba(56, 189, 248, 0.06)',
+            fontSize: '0.82rem',
+            lineHeight: 1.5,
+            color: 'var(--text-muted)',
+          }}
+        >
+          <span style={{ fontWeight: 600, color: 'var(--text)' }}>AI calibration (snapshots vs closed won)</span>
+          {' — '}
+          Mean signed error{' '}
+          <span style={{ color: C_AI, fontWeight: 600 }}>
+            {ai_backtest.mean_signed_error_pct != null
+              ? `${ai_backtest.mean_signed_error_pct > 0 ? '+' : ''}${ai_backtest.mean_signed_error_pct}%`
+              : '—'}
+          </span>
+          {' '}(+ = under-forecast){' · '}
+          MAE {ai_backtest.mean_abs_error_pct != null ? `${ai_backtest.mean_abs_error_pct}%` : '—'}
+          {' · '}
+          last {ai_backtest.n} completed month{ai_backtest.n === 1 ? '' : 's'} with snapshot data. Deal scores are nudged using this bias.
+        </div>
+      )}
 
       {/* Two-column layout: Bookings | Renewals */}
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '2rem', alignItems: 'start' }}>

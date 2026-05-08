@@ -10224,8 +10224,14 @@ def _renewals_plan_bundle_qtd(
 def _aggregate_renewals_actuals(
     renewal_opps: list,
     period_filter,
+    expansion_opps: list | None = None,
 ) -> tuple[float, float, float, float, float, Optional[float], float]:
-    """Returns (ufr, open_ufr, churn_ufr, contraction_mag, renewed, rate_or_none, cancelled_ufr). Excludes mid-term from main metrics."""
+    """Returns (ufr, open_ufr, churn_ufr, contraction_mag, renewed, rate_or_none, cancelled_ufr). Excludes mid-term from main metrics.
+
+    cancelled_ufr includes:
+    - Renewal opps with midterm_cancellation=1 that are Closed Lost (bucketed by renewal_date or close_date).
+    - Expansion opps that are Closed Won with negative opportunity_arr / ARR__c (bucketed by close_date).
+    """
     ufr = 0.0
     open_ufr = 0.0
     churn_ufr = 0.0
@@ -10256,6 +10262,16 @@ def _aggregate_renewals_actuals(
                 contraction_mag += -float(delta)
         else:
             open_ufr += float(up)
+
+    for o in (expansion_opps or []):
+        cd = o.close_date
+        if cd is None or not period_filter(cd):
+            continue
+        if not _is_closed_won_stage((o.stage_name or "").strip()):
+            continue
+        opp_arr = getattr(o, "opportunity_arr", None)
+        if opp_arr is not None and float(opp_arr) < 0:
+            cancelled_ufr += -float(opp_arr)
 
     rate: Optional[float] = None
     if ufr > 0:
@@ -11197,6 +11213,7 @@ async def _renewals_mtd_q1_2026(db: AsyncSession) -> RenewalsMTDResponse:
     r = await db.execute(q)
     all_opps = [o for o in r.scalars().all() if not _is_excluded_from_bookings_nb_only(o, _effective_record_type(o))]
     renewal_opps = [o for o in all_opps if _is_renewal_record_type(_effective_record_type(o))]
+    expansion_opps = [o for o in all_opps if _is_expansion_record_type(_effective_record_type(o))]
 
     def _pf_prev2(rd: date) -> bool:
         return prev2_first <= rd <= prev2_last
@@ -11210,10 +11227,10 @@ async def _renewals_mtd_q1_2026(db: AsyncSession) -> RenewalsMTDResponse:
     def _pf_qtd(rd: date) -> bool:
         return qtd_first <= rd <= last_day_quarter
 
-    a_prev2 = _aggregate_renewals_actuals(renewal_opps, _pf_prev2)
-    a_prev = _aggregate_renewals_actuals(renewal_opps, _pf_prev)
-    a_mtd = _aggregate_renewals_actuals(renewal_opps, _pf_mtd)
-    a_qtd = _aggregate_renewals_actuals(renewal_opps, _pf_qtd)
+    a_prev2 = _aggregate_renewals_actuals(renewal_opps, _pf_prev2, expansion_opps)
+    a_prev = _aggregate_renewals_actuals(renewal_opps, _pf_prev, expansion_opps)
+    a_mtd = _aggregate_renewals_actuals(renewal_opps, _pf_mtd, expansion_opps)
+    a_qtd = _aggregate_renewals_actuals(renewal_opps, _pf_qtd, expansion_opps)
 
     sheet_range = "ARR_Calculations_2026P!A1:ZZ1000"
     r_snap = await db.execute(
@@ -11320,6 +11337,7 @@ async def _renewals_mtd_q2_2026(db: AsyncSession) -> RenewalsMTDResponse:
     r = await db.execute(q)
     all_opps = [o for o in r.scalars().all() if not _is_excluded_from_bookings_nb_only(o, _effective_record_type(o))]
     renewal_opps = [o for o in all_opps if _is_renewal_record_type(_effective_record_type(o))]
+    expansion_opps = [o for o in all_opps if _is_expansion_record_type(_effective_record_type(o))]
 
     def _pf_prev2(rd: date) -> bool:
         return prev2_first <= rd <= prev2_last
@@ -11333,10 +11351,10 @@ async def _renewals_mtd_q2_2026(db: AsyncSession) -> RenewalsMTDResponse:
     def _pf_qtd(rd: date) -> bool:
         return qtd_first <= rd <= last_day_quarter
 
-    a_prev2 = _aggregate_renewals_actuals(renewal_opps, _pf_prev2)
-    a_prev = _aggregate_renewals_actuals(renewal_opps, _pf_prev)
-    a_mtd = _aggregate_renewals_actuals(renewal_opps, _pf_mtd)
-    a_qtd = _aggregate_renewals_actuals(renewal_opps, _pf_qtd)
+    a_prev2 = _aggregate_renewals_actuals(renewal_opps, _pf_prev2, expansion_opps)
+    a_prev = _aggregate_renewals_actuals(renewal_opps, _pf_prev, expansion_opps)
+    a_mtd = _aggregate_renewals_actuals(renewal_opps, _pf_mtd, expansion_opps)
+    a_qtd = _aggregate_renewals_actuals(renewal_opps, _pf_qtd, expansion_opps)
 
     sheet_range = "ARR_Calculations_2026P!A1:ZZ1000"
     r_snap = await db.execute(
@@ -11464,6 +11482,7 @@ async def _get_dashboard_renewals_mtd_impl(db: AsyncSession, *, fixed_periods: O
     r = await db.execute(q)
     all_opps = [o for o in r.scalars().all() if not _is_excluded_from_bookings_nb_only(o, _effective_record_type(o))]
     renewal_opps = [o for o in all_opps if _is_renewal_record_type(_effective_record_type(o))]
+    expansion_opps = [o for o in all_opps if _is_expansion_record_type(_effective_record_type(o))]
 
     def _pf_prev2(rd: date) -> bool:
         return prev2_first <= rd <= prev2_last
@@ -11478,10 +11497,10 @@ async def _get_dashboard_renewals_mtd_impl(db: AsyncSession, *, fixed_periods: O
     def _pf_qtd(rd: date) -> bool:
         return qtd_first <= rd <= last_day_quarter
 
-    a_prev2 = _aggregate_renewals_actuals(renewal_opps, _pf_prev2)
-    a_prev = _aggregate_renewals_actuals(renewal_opps, _pf_prev)
-    a_mtd = _aggregate_renewals_actuals(renewal_opps, _pf_mtd)
-    a_qtd = _aggregate_renewals_actuals(renewal_opps, _pf_qtd)
+    a_prev2 = _aggregate_renewals_actuals(renewal_opps, _pf_prev2, expansion_opps)
+    a_prev = _aggregate_renewals_actuals(renewal_opps, _pf_prev, expansion_opps)
+    a_mtd = _aggregate_renewals_actuals(renewal_opps, _pf_mtd, expansion_opps)
+    a_qtd = _aggregate_renewals_actuals(renewal_opps, _pf_qtd, expansion_opps)
 
     sheet_range = "ARR_Calculations_2026P!A1:ZZ1000"
     r_snap = await db.execute(

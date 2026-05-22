@@ -1,5 +1,5 @@
 import { useEffect, useState, useMemo } from 'react'
-import { getArrCohortChurn, getDatasetStatus, refreshAppDataset, formatLastUpdated, ArrCohortChurnResponse, CohortRow, type DatasetStatus } from '../api'
+import { getArrCohortChurn, getDatasetStatus, refreshAppDataset, formatLastUpdated, exportCohortRetentionToSheet, ArrCohortChurnResponse, CohortRow, type DatasetStatus } from '../api'
 
 // ── colour helpers ────────────────────────────────────────────────────────────
 
@@ -47,6 +47,9 @@ export default function ARRCohortChurn() {
   const [datasetStatus, setDatasetStatus] = useState<DatasetStatus | null>(null)
   const [refreshLoading, setRefreshLoading] = useState(false)
   const [refreshMessage, setRefreshMessage] = useState<string | null>(null)
+  const [exportStatus, setExportStatus] = useState<'idle' | 'loading' | 'ok' | 'error'>('idle')
+  const [exportMessage, setExportMessage] = useState<string | null>(null)
+  const [exportUrl, setExportUrl] = useState<string | null>(null)
 
   useEffect(() => {
     setLoading(true)
@@ -69,6 +72,27 @@ export default function ARRCohortChurn() {
     }
   }
 
+  const handleExportToSheet = () => {
+    setExportStatus('loading')
+    setExportMessage(null)
+    setExportUrl(null)
+    exportCohortRetentionToSheet()
+      .then((res) => {
+        if (res.ok) {
+          setExportStatus('ok')
+          setExportUrl(res.spreadsheet_url ?? null)
+          setExportMessage(res.message ?? `Exported ${res.rows_written ?? ''} rows to "ARR_Cohort retention export" sheet.`)
+        } else {
+          setExportStatus('error')
+          setExportMessage(res.error ?? 'Export failed')
+        }
+      })
+      .catch((e: unknown) => {
+        setExportStatus('error')
+        setExportMessage(e instanceof Error ? e.message : 'Export failed')
+      })
+  }
+
   const visibleOffsets = useMemo(() => {
     if (!data) return []
     return Array.from({ length: data.max_offset + 1 }, (_, i) => i)
@@ -89,6 +113,14 @@ export default function ARRCohortChurn() {
         <button type="button" onClick={handleRefreshAppData} disabled={refreshLoading} style={{ padding: '0.5rem 1rem', fontSize: '0.9rem', fontWeight: 600, cursor: refreshLoading ? 'wait' : 'pointer', background: 'var(--accent)', color: 'var(--accent-contrast, #fff)', border: 'none', borderRadius: 6 }}>
           {refreshLoading ? 'Refreshing…' : 'Refresh app data'}
         </button>
+        <button
+          type="button"
+          onClick={handleExportToSheet}
+          disabled={exportStatus === 'loading'}
+          style={{ padding: '0.5rem 1rem', fontSize: '0.9rem', fontWeight: 600, cursor: exportStatus === 'loading' ? 'wait' : 'pointer', background: 'var(--surface-2, #2a2a3a)', color: 'var(--text)', border: '1px solid var(--border)', borderRadius: 6 }}
+        >
+          {exportStatus === 'loading' ? 'Exporting…' : 'Export to Google Sheet'}
+        </button>
         <span style={{ fontSize: '0.85rem', color: 'var(--text-muted)' }}>
           {datasetStatus?.updated_at ? `Last updated: ${formatLastUpdated(datasetStatus.updated_at)}` : 'Click Refresh app data to load latest data.'}
         </span>
@@ -97,6 +129,14 @@ export default function ARRCohortChurn() {
         )}
       </div>
       {refreshMessage && <p style={{ fontSize: '0.9rem', color: refreshMessage.includes('failed') || refreshMessage.includes('error') ? 'var(--negative)' : 'var(--text-muted)', margin: '0 0 0.75rem' }}>{refreshMessage}</p>}
+      {exportMessage && (
+        <p style={{ fontSize: '0.9rem', color: exportStatus === 'error' ? 'var(--negative)' : 'var(--text-muted)', margin: '0 0 0.75rem' }}>
+          {exportMessage}
+          {exportUrl && exportStatus === 'ok' && (
+            <> — <a href={exportUrl} target="_blank" rel="noopener noreferrer" style={{ color: 'var(--accent)' }}>Open sheet</a></>
+          )}
+        </p>
+      )}
 
       <p style={{ margin: '0 0 1.25rem', fontSize: '0.85rem', color: 'var(--text-muted)', maxWidth: 640 }}>
         Each row = accounts whose first ARR month is the cohort month. Values show % of Month 0 ARR still active

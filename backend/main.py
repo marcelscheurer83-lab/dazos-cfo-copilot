@@ -13086,6 +13086,9 @@ async def export_copilot_arr_schedule_to_google_sheet(db: AsyncSession = Depends
 NEW_SCHEDULE_EXPORT_SHEET = "ARR_Cockpit export"
 NEW_SCHEDULE_EXPORT_RANGE_ENV = "GOOGLE_SHEET_NEW_SCHEDULE_EXPORT_RANGE"
 
+COHORT_RETENTION_EXPORT_SHEET = "ARR_Cohort retention export"
+COHORT_RETENTION_EXPORT_RANGE_ENV = "GOOGLE_SHEET_COHORT_RETENTION_EXPORT_RANGE"
+
 
 @app.post("/api/export/new-schedule-to-google-sheet")
 async def export_new_schedule_to_google_sheet(db: AsyncSession = Depends(get_db)):
@@ -13207,6 +13210,132 @@ async def export_new_schedule_to_google_sheet(db: AsyncSession = Depends(get_db)
             f'Exported {len(values)} rows (header, Total, {account_count} accounts) to "{NEW_SCHEDULE_EXPORT_SHEET}" tab.'
             + (" No account data yet — sync from Salesforce first." if account_count == 0 else "")
         ),
+    }
+
+
+@app.post("/api/export/cohort-retention-to-google-sheet")
+async def export_cohort_retention_to_google_sheet(db: AsyncSession = Depends(get_db)):
+    """
+    Export the ARR Cohort Retention table to the "ARR_Cohort retention export" tab in the
+    financial model (GOOGLE_SHEET_ID).
+    Layout: header row (Cohort, Accounts, Start ARR, M0, M1, …), then one row per cohort.
+    Percentage values are plain numbers (e.g. 87.5), not "87.5%" strings, so the model can
+    use them directly. Start ARR is dollar-formatted (matches other exports).
+    """
+    from connectors.google_sheets import GoogleSheetsConnector
+
+    # ── rebuild cohort data (same logic as GET /api/arr-cohort-churn) ────────────
+    history_data = await _build_arr_history_data(db)
+    rows = history_data["rows"]
+    all_months: list[str] = history_data["month_columns"]
+    month_to_idx: dict[str, int] = {mk: i for i, mk in enumerate(all_months)}
+    arr_lookup: dict[str, dict[str, float]] = {r["account_name"]: r["arr_by_month"] for r in rows}
+
+    cohort_accounts: dict[str, list[str]] = {}
+    for row in rows:
+        name = row["account_name"]
+        abm = row["arr_by_month"]
+        cohort_month: Optional[str] = None
+        for mk in all_months:
+            if abm.get(mk, 0.0) > 0:
+                cohort_month = mk
+                break
+        if cohort_month is None:
+            continue
+        cohort_accounts.setdefault(cohort_month, []).append(name)
+
+    result_cohorts: list[dict] = []
+    max_offset = 0
+    for _cm in sorted(cohort_accounts.keys()):
+        _names = cohort_accounts[_cm]
+        _cidx = month_to_idx[_cm]
+        _num_periods = len(all_months) - _cidx
+        _monthly_arr: list[float] = []
+        for _offset in range(_num_periods):
+            _tmk = all_months[_cidx + _offset]
+            _monthly_arr.append(round(sum(arr_lookup[n].get(_tmk, 0.0) for n in _names), 2))
+        _starting_arr = _monthly_arr[0] if _monthly_arr else 0.0
+        max_offset = max(max_offset, _num_periods - 1)
+        _months_list = []
+        for _offset, _arr in enumerate(_monthly_arr):
+            _pct = round(_arr / _starting_arr * 100, 1) if _starting_arr > 0 else None
+            _months_list.append({"offset": _offset, "arr": _arr, "pct": _pct})
+        result_cohorts.append({
+            "cohort_month": _cm,
+            "starting_arr": round(_starting_arr, 2),
+            "account_count": len(_names),
+            "months": _months_list,
+        })
+
+    # ── build sheet rows ──────────────────────────────────────────────────────────
+    header = ["Cohort", "Accounts", "Start ARR"] + [f"M{i}" for i in range(max_offset + 1)]
+    values: list[list] = [header]
+    for c in result_cohorts:
+        pct_by_offset = {m["offset"]: m["pct"] for m in c["months"]}
+        values.append(
+            [
+                _short_month_label(c["cohort_month"]),
+                c["account_count"],
+                _fmt_money_export(c["starting_arr"]),
+            ]
+            + [
+                (pct_by_offset[i] if pct_by_offset.get(i) is not None else "")
+                for i in range(max_offset + 1)
+            ]
+        )
+
+    # ── write to sheet ────────────────────────────────────────────────────────────
+    sheet_id = os.getenv("GOOGLE_SHEET_ID")
+    if not sheet_id:
+        return {"ok": False, "error": "GOOGLE_SHEET_ID is not set. Set it in backend/.env to the financial model spreadsheet ID."}
+    backend_dir = Path(__file__).resolve().parent
+    cred_env = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+    cred_path = cred_env
+    if cred_path and not os.path.isabs(cred_path):
+        cred_path = str(backend_dir / cred_path)
+    connector = GoogleSheetsConnector(credentials_path=cred_path or cred_env)
+    connector.set_base_path(backend_dir)
+    if not connector.is_configured():
+        return {"ok": False, "error": "Google Sheets not configured. Set GOOGLE_APPLICATION_CREDENTIALS (or GOOGLE_SHEETS_CREDENTIALS_JSON) in .env."}
+    try:
+        await asyncio.to_thread(connector.ensure_sheet_exists, COHORT_RETENTION_EXPORT_SHEET, spreadsheet_id=sheet_id)
+        exact_title = await asyncio.to_thread(connector.get_sheet_exact_title, COHORT_RETENTION_EXPORT_SHEET, sheet_id)
+        if not exact_title:
+            return {"ok": False, "error": f'Tab "{COHORT_RETENTION_EXPORT_SHEET}" not found after ensure. Check the spreadsheet.'}
+        sheet_ref = "'" + exact_title.replace("'", "''") + "'"
+        num_cols = len(header)
+        num_rows = len(values)
+        end_col = _index_to_a1_col(num_cols - 1)
+        range_a1 = os.getenv(COHORT_RETENTION_EXPORT_RANGE_ENV) or f"{sheet_ref}!A1:{end_col}{num_rows}"
+        await asyncio.to_thread(connector.update_range, range_a1, values, spreadsheet_id=sheet_id)
+    except Exception as e:
+        err_msg = str(e)
+        if "403" in err_msg or "does not have permission" in err_msg.lower():
+            sa_email = connector.get_service_account_email()
+            err_msg = (
+                "Permission denied. Share the Google Sheet with the service account as Editor: "
+                + (sa_email or "see client_email in your JSON key")
+                + ". "
+                + err_msg[:200]
+            )
+        elif "404" in err_msg or "Unable to parse range" in err_msg or "not found" in err_msg.lower():
+            err_msg = f'Sheet tab not found. Create a tab named "{COHORT_RETENTION_EXPORT_SHEET}" in your financial model. ' + err_msg[:200]
+        return {"ok": False, "error": err_msg}
+
+    url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/edit"
+    sheet_gid = await asyncio.to_thread(connector.get_sheet_gid_by_title, COHORT_RETENTION_EXPORT_SHEET, sheet_id)
+    if sheet_gid is not None:
+        url = f"{url}#gid={sheet_gid}"
+    cohort_count = len(result_cohorts)
+    return {
+        "ok": True,
+        "spreadsheet_url": url,
+        "spreadsheet_id": sheet_id,
+        "sheet_gid": sheet_gid,
+        "rows_written": len(values),
+        "cohort_count": cohort_count,
+        "range_used": range_a1,
+        "message": f'Exported {len(values)} rows ({cohort_count} cohorts) to "{COHORT_RETENTION_EXPORT_SHEET}" tab.',
     }
 
 

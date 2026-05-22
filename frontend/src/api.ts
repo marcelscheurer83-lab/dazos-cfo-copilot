@@ -767,6 +767,33 @@ export async function exportCopilotARRScheduleToSheet(): Promise<ExportCopilotAR
   }
 }
 
+export type ExportCohortRetentionResult = {
+  ok: boolean
+  spreadsheet_url?: string
+  spreadsheet_id?: string
+  rows_written?: number
+  cohort_count?: number
+  range_used?: string
+  message?: string
+  error?: string
+}
+
+export async function exportCohortRetentionToSheet(): Promise<ExportCohortRetentionResult> {
+  const r = await apiFetch('/export/cohort-retention-to-google-sheet', { method: 'POST' })
+  const data = await r.json()
+  if (!r.ok) return { ok: false, error: data.error ?? data.detail ?? 'Export failed' }
+  return {
+    ok: true,
+    spreadsheet_url: data.spreadsheet_url,
+    spreadsheet_id: data.spreadsheet_id,
+    rows_written: data.rows_written,
+    cohort_count: data.cohort_count,
+    range_used: data.range_used,
+    message: data.message,
+    error: data.error,
+  }
+}
+
 /** Pipeline overview: open opportunities (not Closed Won/Lost). One row per opportunity. */
 export type PipelineOverviewRow = {
   account_id: string | null

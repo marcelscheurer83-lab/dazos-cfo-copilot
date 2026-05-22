@@ -333,6 +333,21 @@ class GoogleSheetsConnector:
         url = result.get("webViewLink") or f"https://docs.google.com/spreadsheets/d/{sid}/edit"
         return {"spreadsheet_id": sid, "spreadsheet_url": url, "_delegated_creds": creds}
 
+    def batch_update(self, requests: list[dict], spreadsheet_id: str | None = None) -> dict:
+        """
+        Execute a list of raw Sheets API batchUpdate requests (e.g. formatting, freeze rows).
+        Returns the API response dict.
+        """
+        sid = spreadsheet_id or self.sheet_id
+        if not sid:
+            raise ValueError("spreadsheet_id or GOOGLE_SHEET_ID is required for batch_update")
+        service = self._get_service()
+        result = service.spreadsheets().batchUpdate(
+            spreadsheetId=sid,
+            body={"requests": requests},
+        ).execute()
+        return result
+
     def is_configured(self) -> bool:
         """True if at least one credential source is set (sheet_id required only for read, not for create)."""
         cred_path = self._credentials_path

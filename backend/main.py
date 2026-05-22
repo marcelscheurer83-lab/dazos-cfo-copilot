@@ -13326,6 +13326,163 @@ async def export_cohort_retention_to_google_sheet(db: AsyncSession = Depends(get
     sheet_gid = await asyncio.to_thread(connector.get_sheet_gid_by_title, COHORT_RETENTION_EXPORT_SHEET, sheet_id)
     if sheet_gid is not None:
         url = f"{url}#gid={sheet_gid}"
+
+    # ── apply formatting (mirrors frontend retentionBg / retentionColor) ─────────
+    if sheet_gid is not None:
+        def _hex_rgb(h: str) -> dict:
+            h = h.lstrip("#")
+            return {
+                "red":   round(int(h[0:2], 16) / 255, 4),
+                "green": round(int(h[2:4], 16) / 255, 4),
+                "blue":  round(int(h[4:6], 16) / 255, 4),
+            }
+
+        def _ret_colors(pct: float) -> tuple[str, str]:
+            """(bg_hex, text_hex) matching frontend retentionBg / retentionColor."""
+            if pct >= 110: return "#1a4a2a", "#7ee8a0"
+            if pct >= 100: return "#1e5c30", "#7ee8a0"
+            if pct >= 90:  return "#1a4020", "#7ee8a0"
+            if pct >= 75:  return "#3a3a10", "#d4d46a"
+            if pct >= 50:  return "#4a2a08", "#e0a060"
+            return "#4a1010", "#e07070"
+
+        _WHITE = {"red": 1.0, "green": 1.0, "blue": 1.0}
+        _HEADER_BG = _hex_rgb("#1e1e2e")
+        _M0_BG     = _hex_rgb("#2a2a3a")
+        _MUTED_TXT = _hex_rgb("#a0a0b8")   # muted for Accounts / non-M columns
+
+        fmt_requests: list[dict] = []
+
+        # 1. Clear all existing formatting in the used range first
+        fmt_requests.append({
+            "repeatCell": {
+                "range": {
+                    "sheetId": sheet_gid,
+                    "startRowIndex": 0,
+                    "endRowIndex": num_rows,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": num_cols,
+                },
+                "cell": {"userEnteredFormat": {}},
+                "fields": "userEnteredFormat",
+            }
+        })
+
+        # 2. Header row: dark bg, white bold text, centred
+        fmt_requests.append({
+            "repeatCell": {
+                "range": {
+                    "sheetId": sheet_gid,
+                    "startRowIndex": 0,
+                    "endRowIndex": 1,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": num_cols,
+                },
+                "cell": {
+                    "userEnteredFormat": {
+                        "backgroundColor": _HEADER_BG,
+                        "textFormat": {"bold": True, "foregroundColor": _WHITE},
+                        "horizontalAlignment": "CENTER",
+                    }
+                },
+                "fields": "userEnteredFormat(backgroundColor,textFormat,horizontalAlignment)",
+            }
+        })
+        # Header col A left-aligned (matches Cohort column)
+        fmt_requests.append({
+            "repeatCell": {
+                "range": {
+                    "sheetId": sheet_gid,
+                    "startRowIndex": 0,
+                    "endRowIndex": 1,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": 1,
+                },
+                "cell": {
+                    "userEnteredFormat": {
+                        "backgroundColor": _HEADER_BG,
+                        "textFormat": {"bold": True, "foregroundColor": _WHITE},
+                        "horizontalAlignment": "LEFT",
+                    }
+                },
+                "fields": "userEnteredFormat(backgroundColor,textFormat,horizontalAlignment)",
+            }
+        })
+
+        # 3. Data rows: per-cell formatting
+        body_rows = []
+        for _c in result_cohorts:
+            _pct_by_offset = {_m["offset"]: _m["pct"] for _m in _c["months"]}
+            _cells: list[dict] = []
+
+            # Col A – Cohort label: bold, left-aligned
+            _cells.append({"userEnteredFormat": {
+                "textFormat": {"bold": True, "foregroundColor": _WHITE},
+                "horizontalAlignment": "LEFT",
+            }})
+            # Col B – Accounts: muted, right-aligned
+            _cells.append({"userEnteredFormat": {
+                "textFormat": {"foregroundColor": _MUTED_TXT},
+                "horizontalAlignment": "RIGHT",
+            }})
+            # Col C – Start ARR: muted, right-aligned
+            _cells.append({"userEnteredFormat": {
+                "textFormat": {"foregroundColor": _MUTED_TXT},
+                "horizontalAlignment": "RIGHT",
+            }})
+            # Col D – M0: dark bg, white bold, centred
+            _cells.append({"userEnteredFormat": {
+                "backgroundColor": _M0_BG,
+                "textFormat": {"bold": True, "foregroundColor": _WHITE},
+                "horizontalAlignment": "CENTER",
+            }})
+            # Cols E+ – M1…Mn: heatmap based on pct
+            for _i in range(1, max_offset + 1):
+                _pct = _pct_by_offset.get(_i)
+                if _pct is not None:
+                    _bg_h, _fg_h = _ret_colors(_pct)
+                    _cells.append({"userEnteredFormat": {
+                        "backgroundColor": _hex_rgb(_bg_h),
+                        "textFormat": {"foregroundColor": _hex_rgb(_fg_h)},
+                        "horizontalAlignment": "CENTER",
+                    }})
+                else:
+                    # No data yet for this cohort/period — neutral empty cell
+                    _cells.append({"userEnteredFormat": {"horizontalAlignment": "CENTER"}})
+
+            body_rows.append({"values": _cells})
+
+        if body_rows:
+            fmt_requests.append({
+                "updateCells": {
+                    "rows": body_rows,
+                    "fields": "userEnteredFormat(backgroundColor,textFormat,horizontalAlignment)",
+                    "range": {
+                        "sheetId": sheet_gid,
+                        "startRowIndex": 1,
+                        "endRowIndex": 1 + len(result_cohorts),
+                        "startColumnIndex": 0,
+                        "endColumnIndex": num_cols,
+                    },
+                }
+            })
+
+        # 4. Freeze header row + Cohort column
+        fmt_requests.append({
+            "updateSheetProperties": {
+                "properties": {
+                    "sheetId": sheet_gid,
+                    "gridProperties": {"frozenRowCount": 1, "frozenColumnCount": 1},
+                },
+                "fields": "gridProperties(frozenRowCount,frozenColumnCount)",
+            }
+        })
+
+        try:
+            await asyncio.to_thread(connector.batch_update, fmt_requests, sheet_id)
+        except Exception:
+            pass  # formatting is best-effort; the data write already succeeded
+
     cohort_count = len(result_cohorts)
     return {
         "ok": True,

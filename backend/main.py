@@ -13276,10 +13276,12 @@ async def export_cohort_retention_to_google_sheet(db: AsyncSession = Depends(get
             [
                 _short_month_label(c["cohort_month"]),
                 c["account_count"],
-                _fmt_money_export(c["starting_arr"]),
+                # Dollar, no decimal (e.g. $214,850)
+                f"${int(round(float(c['starting_arr'] or 0))):,}",
             ]
             + [
-                (pct_by_offset[i] if pct_by_offset.get(i) is not None else "")
+                # Divide by 100 so Sheets % format (0.0%) displays correctly (1.0 → 100.0%)
+                (round(pct_by_offset[i] / 100, 5) if pct_by_offset.get(i) is not None else "")
                 for i in range(max_offset + 1)
             ]
         )
@@ -13430,13 +13432,15 @@ async def export_cohort_retention_to_google_sheet(db: AsyncSession = Depends(get
                 "textFormat": {"foregroundColor": _MUTED_TXT},
                 "horizontalAlignment": "RIGHT",
             }})
-            # Col D – M0: dark bg, white bold, centred
+            _PCT_FMT = {"type": "PERCENT", "pattern": "0.0%"}
+            # Col D – M0: dark bg, white bold, centred, % format
             _cells.append({"userEnteredFormat": {
                 "backgroundColor": _M0_BG,
                 "textFormat": {"bold": True, "foregroundColor": _WHITE},
                 "horizontalAlignment": "CENTER",
+                "numberFormat": _PCT_FMT,
             }})
-            # Cols E+ – M1…Mn: heatmap based on pct
+            # Cols E+ – M1…Mn: heatmap based on pct + % format
             for _i in range(1, max_offset + 1):
                 _pct = _pct_by_offset.get(_i)
                 if _pct is not None:
@@ -13445,10 +13449,14 @@ async def export_cohort_retention_to_google_sheet(db: AsyncSession = Depends(get
                         "backgroundColor": _hex_rgb(_bg_h),
                         "textFormat": {"foregroundColor": _hex_rgb(_fg_h)},
                         "horizontalAlignment": "CENTER",
+                        "numberFormat": _PCT_FMT,
                     }})
                 else:
                     # No data yet for this cohort/period — neutral empty cell
-                    _cells.append({"userEnteredFormat": {"horizontalAlignment": "CENTER"}})
+                    _cells.append({"userEnteredFormat": {
+                        "horizontalAlignment": "CENTER",
+                        "numberFormat": _PCT_FMT,
+                    }})
 
             body_rows.append({"values": _cells})
 
@@ -13456,7 +13464,7 @@ async def export_cohort_retention_to_google_sheet(db: AsyncSession = Depends(get
             fmt_requests.append({
                 "updateCells": {
                     "rows": body_rows,
-                    "fields": "userEnteredFormat(backgroundColor,textFormat,horizontalAlignment)",
+                    "fields": "userEnteredFormat(backgroundColor,textFormat,horizontalAlignment,numberFormat)",
                     "range": {
                         "sheetId": sheet_gid,
                         "startRowIndex": 1,

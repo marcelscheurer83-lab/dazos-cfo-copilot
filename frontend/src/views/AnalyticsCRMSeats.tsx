@@ -27,6 +27,16 @@ function fmtNumber(n: number) {
   return new Intl.NumberFormat('en-US', { maximumFractionDigits: 0 }).format(n)
 }
 
+/** Previous calendar month end (e.g. on Jun 9 → May 31). Mirrors the analytics/active-arr-by-product default as-of. */
+function previousMonthEnd(): { key: string; label: string } {
+  const now = new Date()
+  // Day 0 of the current month = last day of the previous month.
+  const lastDayPrev = new Date(now.getFullYear(), now.getMonth(), 0)
+  const key = `${lastDayPrev.getFullYear()}-${String(lastDayPrev.getMonth() + 1).padStart(2, '0')}`
+  const label = lastDayPrev.toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' })
+  return { key, label }
+}
+
 function productKeyMatchesCrm(k: string) {
   const s = (k || '').toLowerCase()
   return s.includes('crm')
@@ -121,9 +131,16 @@ export default function AnalyticsCRMSeats() {
       .finally(() => setLoading(false))
   }, [])
 
+  const { key: prevMonthKey, label: prevMonthLabel } = useMemo(() => previousMonthEnd(), [])
+
   const rows: Row[] = useMemo(() => {
+    // Use the previous month-end ARR column when available (same as-of as the Product Penetration analysis);
+    // fall back to today's active ARR if that month is outside the schedule range.
+    const arrAtPrev = (r: ActiveARRByMonthRow) => r.by_month?.[prevMonthKey] ?? 0
+    const usePrevMonthEnd = (scheduleRows ?? []).some((r) => arrAtPrev(r) > 0)
+    const activeArrFor = (r: ActiveARRByMonthRow) => (usePrevMonthEnd ? arrAtPrev(r) : r.active_arr ?? 0)
     return (scheduleRows ?? [])
-      .filter((r) => (r.active_arr ?? 0) > 0)
+      .filter((r) => activeArrFor(r) > 0)
       .map((r) => {
         const byProduct = r.by_product ?? {}
         // Prefer backend-provided CRM metrics when present; fall back to heuristic from by_product.
@@ -155,7 +172,7 @@ export default function AnalyticsCRMSeats() {
         }
       })
       .filter((r) => r.crm_arr > 0)
-  }, [scheduleRows])
+  }, [scheduleRows, prevMonthKey])
 
   const sortedRows: Row[] = useMemo(() => {
     const dir = sortDir === 'asc' ? 1 : -1
@@ -354,7 +371,7 @@ export default function AnalyticsCRMSeats() {
       <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: '1rem', flexWrap: 'wrap' }}>
         <div>
           <h2 style={{ marginTop: 0, marginBottom: '0.25rem' }}>CRM Seat Pricing Analysis</h2>
-          <div style={{ fontSize: '0.85rem', color: 'var(--text-muted)' }}>Accounts with active ARR today that have CRM-related ARR.</div>
+          <div style={{ fontSize: '0.85rem', color: 'var(--text-muted)' }}>Accounts with active ARR as of {prevMonthLabel} (previous month end) that have CRM-related ARR.</div>
         </div>
         <div style={{ fontSize: '0.85rem', color: 'var(--text-muted)' }}>
           Total CRM ARR: <span style={{ color: 'var(--text)', fontWeight: 600 }}>{fmtMoney(totals.crmArr)}</span>

@@ -54,10 +54,12 @@ class GoogleSheetsConnector:
         if self._service is not None:
             return self._service
         credentials = None
-        # spreadsheets = read/write; drive.file = create files owned by the app (often fewer org restrictions than full drive)
+        # spreadsheets = read/write; drive.file = create files owned by the app (often fewer org restrictions than full drive);
+        # presentations = read/write Google Slides decks shared with the service account.
         scopes = [
             "https://www.googleapis.com/auth/spreadsheets",
             "https://www.googleapis.com/auth/drive.file",
+            "https://www.googleapis.com/auth/presentations",
         ]
         cred_path = self._credentials_path
         if cred_path and self._base_path and not os.path.isabs(cred_path):
@@ -90,6 +92,7 @@ class GoogleSheetsConnector:
         scopes = [
             "https://www.googleapis.com/auth/spreadsheets",
             "https://www.googleapis.com/auth/drive.file",
+            "https://www.googleapis.com/auth/presentations",
         ]
         cred_path = self._credentials_path
         if cred_path and self._base_path and not os.path.isabs(cred_path):
@@ -332,6 +335,50 @@ class GoogleSheetsConnector:
         sid = result["id"]
         url = result.get("webViewLink") or f"https://docs.google.com/spreadsheets/d/{sid}/edit"
         return {"spreadsheet_id": sid, "spreadsheet_url": url, "_delegated_creds": creds}
+
+    # ── Google Slides ─────────────────────────────────────────────────────────
+    def _get_slides_service(self):
+        """Build the Slides API service (same service-account credentials as Sheets)."""
+        if not _sheets_available:
+            raise RuntimeError("Google API libraries not installed.")
+        if getattr(self, "_slides_service", None) is not None:
+            return self._slides_service
+        if getattr(self, "_credentials", None) is None:
+            self._get_service()  # populates self._credentials with all scopes
+        self._slides_service = build("slides", "v1", credentials=self._credentials)
+        return self._slides_service
+
+    def get_presentation(self, presentation_id: str) -> dict:
+        """Return the presentation resource (slides, pageSize, etc.)."""
+        service = self._get_slides_service()
+        return service.presentations().get(presentationId=presentation_id).execute()
+
+    def slides_batch_update(self, presentation_id: str, requests: list[dict]) -> dict:
+        """Execute a list of raw Slides API batchUpdate requests."""
+        service = self._get_slides_service()
+        return service.presentations().batchUpdate(
+            presentationId=presentation_id,
+            body={"requests": requests},
+        ).execute()
+
+    def get_slide_thumbnail_url(self, presentation_id: str, page_object_id: str) -> str | None:
+        """Return a temporary contentUrl image of the given slide page (PNG)."""
+        service = self._get_slides_service()
+        try:
+            resp = service.presentations().pages().getThumbnail(
+                presentationId=presentation_id,
+                pageObjectId=page_object_id,
+                thumbnailProperties_mimeType="PNG",
+                thumbnailProperties_thumbnailSize="LARGE",
+            ).execute()
+            return resp.get("contentUrl")
+        except TypeError:
+            # Older client signature: pass nested dict is not supported; fall back without size.
+            resp = service.presentations().pages().getThumbnail(
+                presentationId=presentation_id,
+                pageObjectId=page_object_id,
+            ).execute()
+            return resp.get("contentUrl")
 
     def batch_update(self, requests: list[dict], spreadsheet_id: str | None = None) -> dict:
         """

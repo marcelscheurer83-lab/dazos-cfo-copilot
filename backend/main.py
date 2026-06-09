@@ -7692,6 +7692,423 @@ async def get_arr_bridge(db: AsyncSession = Depends(get_db)):
     }
 
 
+# ── ARR bridge for a single month + Contracted ARR (for board-deck slide) ──────
+# Plan ARR bridge lives in ARR_Calculations_2026P rows 10–15 (top "blended" section):
+# row 15 (0-based 14) = "ARR EoP" plan series. Columns are 2026 months (BU = Jan 2026).
+_ARR_PLAN_EOP_ROW_IDX = 14
+_ARR_PLAN_SHEET_RANGE = "ARR_Calculations_2026P!A1:ZZ1000"
+
+
+async def _eop_arr_plan_for_month(db: AsyncSession, month_key: str) -> Optional[float]:
+    """End-of-period ARR plan for a 2026 month from ARR_Calculations_2026P row 15 ('ARR EoP').
+
+    Returns None if the month is outside 2026 or the sheet snapshot is unavailable.
+    """
+    try:
+        y, m = int(month_key[:4]), int(month_key[5:7])
+    except (TypeError, ValueError):
+        return None
+    if y != 2026 or not (1 <= m <= 12):
+        return None
+    snap = (
+        await db.execute(
+            select(SheetSnapshot)
+            .where(SheetSnapshot.range_name == _ARR_PLAN_SHEET_RANGE)
+            .order_by(SheetSnapshot.as_of.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if not snap or not snap.data_json:
+        return None
+    try:
+        data = json.loads(snap.data_json)
+        row = data[_ARR_PLAN_EOP_ROW_IDX] if len(data) > _ARR_PLAN_EOP_ROW_IDX else []
+        col_idx = _a1_col_to_index(ARR_2026P_MONTH_COLUMNS[m - 1])
+        return _to_float_sheet(row[col_idx] if col_idx < len(row) else None)
+    except (TypeError, ValueError, IndexError):
+        return None
+
+
+async def _arr_bridge_month_data(db: AsyncSession, month_key: str) -> dict:
+    """Single-month ARR bridge + Contracted ARR, matching the board-deck 'ARR bridge and contracted ARR' slide.
+
+    Bars: BoP ARR, New business, Expansion, Churn, Contraction, EoP ARR actual (= movement of MonthlyArrSnapshot),
+    Future start date (closed-won NB/Expansion starting after month-end), EoP CARR actual (= EoP ARR + future start),
+    Delta (= EoP ARR plan − EoP CARR actual), EoP ARR plan (ARR_Calculations_2026P 'ARR EoP').
+    """
+    prior_mk = _mk_offset(month_key, -1)
+    snap_rows = (
+        await db.execute(
+            select(MonthlyArrSnapshot).where(MonthlyArrSnapshot.month_key.in_([prior_mk, month_key]))
+        )
+    ).scalars().all()
+    arr_map: dict[str, dict[str, float]] = {}
+    for s in snap_rows:
+        arr_map.setdefault(s.account_name, {})[s.month_key] = s.arr
+    accounts = list(arr_map.keys())
+
+    def ga(acc: str, mk: str) -> float:
+        return arr_map.get(acc, {}).get(mk, 0.0)
+
+    beg = round(sum(ga(a, prior_mk) for a in accounts), 2)
+    end = round(sum(ga(a, month_key) for a in accounts), 2)
+    new_biz = exp = ctr = churn = 0.0
+    for acc in accounts:
+        p, c = ga(acc, prior_mk), ga(acc, month_key)
+        if p == 0.0 and c > 0.0:
+            new_biz += c
+        elif p > 0.0 and c > p:
+            exp += c - p
+        elif p > 0.0 and 0.0 < c < p:
+            ctr += p - c
+        elif p > 0.0 and c == 0.0:
+            churn += p
+
+    y, m = int(month_key[:4]), int(month_key[5:7])
+    month_end = date(y, m, calendar.monthrange(y, m)[1])
+    future_start_total, _ = await _future_start_closed_won_nb_exp_arr_by_account(db, month_end)
+    eop_plan = await _eop_arr_plan_for_month(db, month_key)
+    carr = round(end + future_start_total, 2)
+
+    return {
+        "month": month_key,
+        "month_end": month_end.isoformat(),
+        "month_label": _short_month_label(month_key),
+        "beginning_arr": beg,
+        "new_business": round(new_biz, 2),
+        "expansion": round(exp, 2),
+        "churn": round(churn, 2),
+        "contraction": round(ctr, 2),
+        "ending_arr_actual": end,
+        "future_start_arr": round(future_start_total, 2),
+        "ending_carr_actual": carr,
+        "ending_arr_plan": round(eop_plan, 2) if eop_plan is not None else None,
+        "delta_plan_vs_carr": round(eop_plan - carr, 2) if eop_plan is not None else None,
+        "has_data": len(snap_rows) > 0,
+    }
+
+
+@app.get("/api/slides/arr-bridge-month")
+async def get_slides_arr_bridge_month(
+    month: Optional[str] = Query(
+        None,
+        description="Target month YYYY-MM. Defaults to the previous calendar month (EST).",
+    ),
+    db: AsyncSession = Depends(get_db),
+):
+    """ARR bridge + contracted ARR for one month, used by the board-deck slide preview/export."""
+    if not month:
+        today = datetime.now(EST).date()
+        y, m = today.year, today.month
+        if m == 1:
+            y, m = y - 1, 12
+        else:
+            m -= 1
+        month = f"{y}-{m:02d}"
+    data = await _arr_bridge_month_data(db, month)
+    if not data.get("has_data"):
+        data["message"] = "Monthly ARR snapshot not yet built for this month. Run 'Refresh app data' to populate it."
+    return data
+
+
+# ── Render the ARR-bridge slide into the Google Slides board deck ──────────────
+_SLIDE_COLORS = {
+    "total": "#1f9bd6",  # BoP / EoP actual / EoP CARR
+    "up": "#7ac043",     # New business / Expansion / Future start
+    "down": "#f5c542",   # Churn / Contraction
+    "delta": "#e0584b",  # Delta vs plan
+    "plan": "#c7ccd1",   # EoP ARR plan
+    "title": "#1f9bd6",
+}
+_EMU_PER_INCH = 914400
+
+
+def _hex_to_rgb01(hexstr: str) -> dict:
+    h = hexstr.lstrip("#")
+    return {
+        "red": int(h[0:2], 16) / 255.0,
+        "green": int(h[2:4], 16) / 255.0,
+        "blue": int(h[4:6], 16) / 255.0,
+    }
+
+
+def _arr_bridge_waterfall_bars(data: dict) -> tuple[list[tuple], float, float]:
+    """Return (bars, y_min, y_max) in $K. Each bar = (name, base, value, color_hex, label, is_total)."""
+    K = 1000.0
+    bop = data["beginning_arr"] / K
+    nb = data["new_business"] / K
+    exp = data["expansion"] / K
+    churn = data["churn"] / K
+    ctr = data["contraction"] / K
+    eop = data["ending_arr_actual"] / K
+    fs = data["future_start_arr"] / K
+    carr = data["ending_carr_actual"] / K
+    has_plan = data.get("ending_arr_plan") is not None
+    plan = (data.get("ending_arr_plan") or 0) / K
+    delta = (data.get("delta_plan_vs_carr") or 0) / K
+
+    r1 = bop + nb
+    r2 = r1 + exp
+    r3 = r2 - churn
+    r4 = r3 - ctr
+
+    bars: list[tuple] = [
+        ("BoP ARR", 0.0, bop, _SLIDE_COLORS["total"], bop, True),
+        ("New business", bop, nb, _SLIDE_COLORS["up"], nb, False),
+        ("Expansion", r1, exp, _SLIDE_COLORS["up"], exp, False),
+        ("Churn", r3, churn, _SLIDE_COLORS["down"], churn, False),
+        ("Contraction", r4, ctr, _SLIDE_COLORS["down"], ctr, False),
+        ("EoP ARR actual", 0.0, eop, _SLIDE_COLORS["total"], eop, True),
+        ("Future start date", eop, fs, _SLIDE_COLORS["up"], fs, False),
+        ("EoP CARR actual", 0.0, carr, _SLIDE_COLORS["total"], carr, True),
+    ]
+    if has_plan:
+        if delta >= 0:
+            bars.append(("Delta", carr, delta, _SLIDE_COLORS["delta"], delta, False))
+        else:
+            bars.append(("Delta", plan, -delta, _SLIDE_COLORS["delta"], -delta, False))
+        bars.append(("EoP ARR plan", 0.0, plan, _SLIDE_COLORS["plan"], plan, True))
+
+    tops = [b[1] + b[2] for b in bars]
+    max_top = max(tops + [1.0])
+    totals = [b[2] for b in bars if b[5]]
+    min_total = min(totals) if totals else 0.0
+    y_min = max(0.0, float(int((min_total - 1200) // 500) * 500))
+    y_max = float(int((max_top + 300 + 499) // 500) * 500)
+    if y_max <= y_min:
+        y_max = y_min + 500
+    return bars, y_min, y_max
+
+
+# Object-id prefixes for slides this app generates (used to keep generated slides as a contiguous block).
+_GENERATED_SLIDE_PREFIXES = ("arrbridge_",)
+
+
+def _arr_bridge_slide_requests(
+    page_id: str, page_w: int, page_h: int, data: dict, insertion_index: Optional[int] = None
+) -> list[dict]:
+    """Build Slides batchUpdate requests that create a blank slide and draw the ARR-bridge waterfall on it."""
+    bars, y_min, y_max = _arr_bridge_waterfall_bars(data)
+    n = len(bars)
+    create_slide: dict = {"objectId": page_id, "slideLayoutReference": {"predefinedLayout": "BLANK"}}
+    if insertion_index is not None:
+        create_slide["insertionIndex"] = insertion_index
+    reqs: list[dict] = [{"createSlide": create_slide}]
+
+    def text_box(obj_id: str, x: int, y: int, w: int, h: int, text: str,
+                 size_pt: float, color_hex: str | None = None, bold: bool = False,
+                 align: str = "CENTER") -> None:
+        reqs.append({
+            "createShape": {
+                "objectId": obj_id,
+                "shapeType": "TEXT_BOX",
+                "elementProperties": {
+                    "pageObjectId": page_id,
+                    "size": {"height": {"magnitude": h, "unit": "EMU"}, "width": {"magnitude": w, "unit": "EMU"}},
+                    "transform": {"scaleX": 1, "scaleY": 1, "translateX": x, "translateY": y, "unit": "EMU"},
+                },
+            }
+        })
+        reqs.append({"insertText": {"objectId": obj_id, "insertionIndex": 0, "text": text}})
+        style: dict = {"fontSize": {"magnitude": size_pt, "unit": "PT"}, "bold": bold}
+        fields = "fontSize,bold"
+        if color_hex:
+            style["foregroundColor"] = {"opaqueColor": {"rgbColor": _hex_to_rgb01(color_hex)}}
+            fields += ",foregroundColor"
+        reqs.append({"updateTextStyle": {"objectId": obj_id, "style": style, "fields": fields, "textRange": {"type": "ALL"}}})
+        reqs.append({"updateParagraphStyle": {"objectId": obj_id, "style": {"alignment": align}, "fields": "alignment", "textRange": {"type": "ALL"}}})
+
+    margin = int(0.55 * _EMU_PER_INCH)
+    # Title + APPENDIX
+    text_box(f"{page_id}_title", margin, int(0.32 * _EMU_PER_INCH), page_w - 2 * margin, int(0.6 * _EMU_PER_INCH),
+             f"{data['month_label']} ARR bridge and contracted ARR", 22, _SLIDE_COLORS["title"], bold=True, align="START")
+    text_box(f"{page_id}_appendix", page_w - margin - int(1.6 * _EMU_PER_INCH), int(0.34 * _EMU_PER_INCH),
+             int(1.6 * _EMU_PER_INCH), int(0.3 * _EMU_PER_INCH), "APPENDIX", 10, _SLIDE_COLORS["title"], bold=True, align="END")
+
+    # Chart geometry
+    chart_left = int(0.7 * _EMU_PER_INCH)
+    chart_top = int(1.35 * _EMU_PER_INCH)
+    chart_right = page_w - int(0.5 * _EMU_PER_INCH)
+    bottom_reserve = int(1.05 * _EMU_PER_INCH)
+    chart_w = chart_right - chart_left
+    chart_h = page_h - chart_top - bottom_reserve
+    span = (y_max - y_min) or 1.0
+
+    def y_emu(val_k: float) -> int:
+        return int(chart_top + (y_max - val_k) / span * chart_h)
+
+    slot_w = chart_w / n
+    bar_w = int(slot_w * 0.62)
+    chart_bottom = chart_top + chart_h
+
+    # Horizontal gridlines + y-axis tick labels (every 500K), drawn before bars so bars sit on top.
+    gi = 0
+    v = y_min
+    while v <= y_max + 1e-6:
+        gy = y_emu(v)
+        grid_id = f"{page_id}_grid{gi}"
+        reqs.append({
+            "createShape": {
+                "objectId": grid_id,
+                "shapeType": "RECTANGLE",
+                "elementProperties": {
+                    "pageObjectId": page_id,
+                    "size": {"height": {"magnitude": int(0.008 * _EMU_PER_INCH), "unit": "EMU"}, "width": {"magnitude": chart_w, "unit": "EMU"}},
+                    "transform": {"scaleX": 1, "scaleY": 1, "translateX": chart_left, "translateY": gy, "unit": "EMU"},
+                },
+            }
+        })
+        reqs.append({
+            "updateShapeProperties": {
+                "objectId": grid_id,
+                "fields": "shapeBackgroundFill.solidFill.color,outline.propertyState",
+                "shapeProperties": {
+                    "shapeBackgroundFill": {"solidFill": {"color": {"rgbColor": _hex_to_rgb01("#e8eaed")}}},
+                    "outline": {"propertyState": "NOT_RENDERED"},
+                },
+            }
+        })
+        text_box(f"{page_id}_yt{gi}", chart_left - int(0.72 * _EMU_PER_INCH), gy - int(0.09 * _EMU_PER_INCH),
+                 int(0.62 * _EMU_PER_INCH), int(0.2 * _EMU_PER_INCH), f"{int(v):,}", 7, "#999999", bold=False, align="END")
+        v += 500
+        gi += 1
+
+    for i, (name, base, value, color_hex, label, _is_total) in enumerate(bars):
+        slot_x = chart_left + int(i * slot_w)
+        bar_x = slot_x + int((slot_w - bar_w) / 2)
+        top_val = base + value
+        y_top = max(y_emu(top_val), chart_top)
+        y_bot = min(y_emu(base), chart_bottom)  # totals start at value 0 → clamp to the axis floor
+        bar_h = max(y_bot - y_top, int(0.02 * _EMU_PER_INCH))  # min visible sliver
+        # Rectangle
+        rect_id = f"{page_id}_bar{i}"
+        reqs.append({
+            "createShape": {
+                "objectId": rect_id,
+                "shapeType": "RECTANGLE",
+                "elementProperties": {
+                    "pageObjectId": page_id,
+                    "size": {"height": {"magnitude": bar_h, "unit": "EMU"}, "width": {"magnitude": bar_w, "unit": "EMU"}},
+                    "transform": {"scaleX": 1, "scaleY": 1, "translateX": bar_x, "translateY": y_top, "unit": "EMU"},
+                },
+            }
+        })
+        reqs.append({
+            "updateShapeProperties": {
+                "objectId": rect_id,
+                "fields": "shapeBackgroundFill.solidFill.color,outline.propertyState",
+                "shapeProperties": {
+                    "shapeBackgroundFill": {"solidFill": {"color": {"rgbColor": _hex_to_rgb01(color_hex)}}},
+                    "outline": {"propertyState": "NOT_RENDERED"},
+                },
+            }
+        })
+        # Value label above the bar
+        text_box(f"{page_id}_lbl{i}", slot_x, y_top - int(0.26 * _EMU_PER_INCH), int(slot_w), int(0.24 * _EMU_PER_INCH),
+                 f"{round(label):,}", 9, "#333333", bold=True, align="CENTER")
+        # X-axis label below the chart
+        text_box(f"{page_id}_xlbl{i}", slot_x, chart_top + chart_h + int(0.05 * _EMU_PER_INCH), int(slot_w), int(0.5 * _EMU_PER_INCH),
+                 name, 8, "#555555", bold=False, align="CENTER")
+
+    # Source footnote
+    text_box(f"{page_id}_src", margin, page_h - int(0.4 * _EMU_PER_INCH), int(4 * _EMU_PER_INCH), int(0.25 * _EMU_PER_INCH),
+             "Source: SFDC and Alleva reporting", 7, "#999999", bold=False, align="START")
+    return reqs
+
+
+@app.post("/api/slides/generate-arr-bridge")
+async def generate_arr_bridge_slide(
+    month: Optional[str] = Query(None, description="Target month YYYY-MM. Defaults to previous calendar month (EST)."),
+    deck_id: Optional[str] = Query(None, description="Override the target Google Slides deck id (else GOOGLE_SLIDE_DECK_ID)."),
+    db: AsyncSession = Depends(get_db),
+):
+    """Create/replace the ARR-bridge slide for a month in the board-deck Google Slides presentation (native shapes)."""
+    if not month:
+        today = datetime.now(EST).date()
+        y, m = today.year, today.month
+        if m == 1:
+            y, m = y - 1, 12
+        else:
+            m -= 1
+        month = f"{y}-{m:02d}"
+
+    presentation_id = (deck_id or os.getenv("GOOGLE_SLIDE_DECK_ID") or "").strip()
+    if not presentation_id:
+        return {"ok": False, "error": "GOOGLE_SLIDE_DECK_ID is not set. Add the Google Slides deck id to the backend env."}
+
+    data = await _arr_bridge_month_data(db, month)
+    if not data.get("has_data"):
+        return {"ok": False, "error": "No monthly ARR snapshot for this month. Run 'Refresh app data' first."}
+
+    backend_dir = os.path.dirname(os.path.abspath(__file__))
+    connector = GoogleSheetsConnector()
+    connector.set_base_path(backend_dir)
+    if not connector.is_configured():
+        return {"ok": False, "error": "Google credentials not configured on the server."}
+
+    page_id = f"arrbridge_{month.replace('-', '_')}"
+    try:
+        pres = connector.get_presentation(presentation_id)
+        page_w = ((pres.get("pageSize") or {}).get("width") or {}).get("magnitude") or (10 * _EMU_PER_INCH)
+        page_h = ((pres.get("pageSize") or {}).get("height") or {}).get("magnitude") or int(5.625 * _EMU_PER_INCH)
+        page_w, page_h = int(page_w), int(page_h)
+
+        slides_list = pres.get("slides") or []
+        existing_ids = [s.get("objectId") for s in slides_list]
+        existing_idx = existing_ids.index(page_id) if page_id in existing_ids else None
+
+        if existing_idx is not None:
+            # Regenerate in place: delete then reinsert at the same position.
+            connector.slides_batch_update(presentation_id, [{"deleteObject": {"objectId": page_id}}])
+            insertion_index = existing_idx
+        else:
+            # New slide: keep generated slides as a contiguous block starting at page 2 (index 1).
+            generated_indices = [
+                i for i, oid in enumerate(existing_ids)
+                if oid and oid.startswith(_GENERATED_SLIDE_PREFIXES)
+            ]
+            insertion_index = (max(generated_indices) + 1) if generated_indices else 1
+            insertion_index = min(insertion_index, len(existing_ids))
+
+        reqs = _arr_bridge_slide_requests(page_id, page_w, page_h, data, insertion_index=insertion_index)
+        connector.slides_batch_update(presentation_id, reqs)
+
+        thumbnail_url = None
+        try:
+            thumbnail_url = connector.get_slide_thumbnail_url(presentation_id, page_id)
+        except Exception:
+            thumbnail_url = None
+
+        deck_url = f"https://docs.google.com/presentation/d/{presentation_id}/edit#slide=id.{page_id}"
+        return {
+            "ok": True,
+            "deck_url": deck_url,
+            "slide_object_id": page_id,
+            "thumbnail_url": thumbnail_url,
+            "month": month,
+            "replaced": existing_idx is not None,
+        }
+    except Exception as e:
+        detail = str(e)
+        low = detail.lower()
+        sa_email = connector.get_service_account_email() or "the service account"
+        if "403" in detail or "permission" in low or "forbidden" in low:
+            msg = (
+                f"Permission denied. Share the deck with {sa_email} as Editor, and make sure the "
+                f"Google Slides API is enabled in the project. {detail[:240]}"
+            )
+        elif ("not supported" in low or "not a google" in low) or ("400" in detail and "presentation" in low):
+            msg = (
+                "This file may not be a native Google Slides deck (e.g. an uploaded .pptx). "
+                f"Convert it via File → Save as Google Slides. {detail[:240]}"
+            )
+        elif "has not been used" in low or "is disabled" in low or "slides.googleapis.com" in low:
+            msg = f"The Google Slides API is not enabled for this project yet. Enable it, then retry. {detail[:240]}"
+        else:
+            msg = f"Failed to generate slide: {detail[:280]}"
+        return {"ok": False, "error": msg}
+
+
 @app.get("/api/analytics/active-arr-by-product")
 async def get_active_arr_by_product(
     as_of: Optional[date] = Query(

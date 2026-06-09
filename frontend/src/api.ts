@@ -1318,6 +1318,54 @@ export async function getBridgeAccounts(month: string, component: string): Promi
   return r.json()
 }
 
+// ── Single-month ARR bridge + Contracted ARR (board-deck slide) ──────────────
+export type SlidesArrBridgeMonth = {
+  month: string          // YYYY-MM
+  month_end: string      // YYYY-MM-DD
+  month_label: string    // e.g. "May '26"
+  beginning_arr: number
+  new_business: number
+  expansion: number
+  churn: number
+  contraction: number
+  ending_arr_actual: number
+  future_start_arr: number
+  ending_carr_actual: number
+  ending_arr_plan: number | null
+  delta_plan_vs_carr: number | null
+  has_data: boolean
+  message?: string | null
+}
+
+export async function getSlidesArrBridgeMonth(month?: string): Promise<SlidesArrBridgeMonth> {
+  const qs = month ? `?month=${encodeURIComponent(month)}` : ''
+  const r = await apiFetch(`/slides/arr-bridge-month${qs}`)
+  if (!r.ok) throw new Error(`Slide ARR bridge fetch failed: HTTP ${r.status}`)
+  return r.json()
+}
+
+export type GenerateArrBridgeSlideResult = {
+  ok: boolean
+  error?: string
+  deck_url?: string
+  slide_object_id?: string
+  thumbnail_url?: string | null
+  month?: string
+  replaced?: boolean
+}
+
+export async function generateArrBridgeSlide(month?: string): Promise<GenerateArrBridgeSlideResult> {
+  const qs = month ? `?month=${encodeURIComponent(month)}` : ''
+  const r = await apiFetch(`/slides/generate-arr-bridge${qs}`, { method: 'POST' })
+  if (!r.ok && r.status !== 400) {
+    // backend returns {ok:false,error} with 200; only surface true transport errors here
+    let detail = ''
+    try { detail = (await r.json())?.error ?? '' } catch { /* ignore */ }
+    throw new Error(detail || `Slide generation failed: HTTP ${r.status}`)
+  }
+  return r.json()
+}
+
 // ── ARR Cohort Churn ─────────────────────────────────────────────────────────
 export type CohortMonth = {
   offset: number

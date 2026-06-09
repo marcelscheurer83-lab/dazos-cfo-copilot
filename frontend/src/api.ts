@@ -629,6 +629,10 @@ export type ActiveARRRow = {
   crm_seats?: number | null
   /** ARR from CRM SKUs only (Additional CRM Seats, CRM Platform (Includes 5 Seats), CRM Platform (Legacy)), same period as active_arr. */
   crm_arr?: number | null
+  /** CRM seats as of each month-end (YYYY-MM), using the closed-won period active that month-end. */
+  crm_seats_by_month?: Record<string, number>
+  /** CRM-SKU ARR as of each month-end (YYYY-MM), using the closed-won period active that month-end. */
+  crm_arr_by_month?: Record<string, number>
   /** ARR from anchor (renewal/NB) only; used for ARR history over time. */
   anchor_arr?: number
   /** Expansions after anchor: close_date + arr; used for by-month ARR. */

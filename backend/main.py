@@ -5138,6 +5138,44 @@ async def _compute_active_arr_rows(
         if total_arr:
             crm_arr_by_account[key] = round(total_arr, 2)
 
+    # CRM ARR and CRM seats as of each month-end (true point-in-time snapshot). Same period logic as
+    # current_period_opp_sf_ids, but evaluated at each month-end instead of today: take the closed-won
+    # period (NB/renewal term) that contains the month-end, plus expansions that closed on/before that
+    # month-end and within the period. Powers the Seat Pricing "previous month end" view.
+    _schedule_months = _default_schedule_by_month_keys()
+    _month_end_dates: list[tuple[str, date]] = []
+    for _mk in _schedule_months:
+        _y, _m = int(_mk[:4]), int(_mk[5:7])
+        _month_end_dates.append((_mk, date(_y, _m, calendar.monthrange(_y, _m)[1])))
+
+    crm_seats_by_account_by_month: dict[tuple[str | None, str | None], dict[str, int]] = {}
+    crm_arr_by_account_by_month: dict[tuple[str | None, str | None], dict[str, float]] = {}
+    for key in account_keys:
+        periods = account_period_opps.get(key, [])
+        cw_for_account = [o for o in closed_won_opps if (o.account_id, o.account_name or None) == key]
+        closed_expansions_key = [o for o in cw_for_account if _is_expansion(o)]
+        seats_bm: dict[str, int] = {}
+        arr_bm: dict[str, float] = {}
+        for _mk, _me in _month_end_dates:
+            p_hit = next((p for p in periods if p["start"] <= _me <= p["end"]), None)
+            if p_hit is None:
+                seats_bm[_mk] = 0
+                arr_bm[_mk] = 0.0
+                continue
+            opp_ids_me: set[str] = {p_hit["opp"].sf_id} if p_hit["opp"].sf_id else set()
+            for o in closed_expansions_key:
+                if (
+                    o.sf_id
+                    and o.close_date
+                    and p_hit["start"] <= o.close_date <= p_hit["end"]
+                    and o.close_date <= _me
+                ):
+                    opp_ids_me.add(o.sf_id)
+            seats_bm[_mk] = sum(seats_by_opp.get(oid, 0) for oid in opp_ids_me)
+            arr_bm[_mk] = round(sum(crm_arr_by_opp.get(oid, 0.0) for oid in opp_ids_me), 2)
+        crm_seats_by_account_by_month[key] = seats_bm
+        crm_arr_by_account_by_month[key] = arr_bm
+
     out_rows = []
     for (aid, aname), by_product in by_account_product.items():
         key = (aid, aname)
@@ -5360,6 +5398,14 @@ async def _compute_active_arr_rows(
             )
         crm_seats = crm_seats_by_account.get(key)
         crm_arr_val = crm_arr_by_account.get(key)
+        # Per-month CRM snapshot; apply the Alleva retained factor to ARR (seats are raw counts), to stay
+        # consistent with how by_month total ARR is scaled for Alleva Customer accounts.
+        crm_seats_bm = crm_seats_by_account_by_month.get(key, {})
+        crm_arr_bm_raw = crm_arr_by_account_by_month.get(key, {})
+        if alleva_retained_factor is not None:
+            crm_arr_bm = {mk: round(v * alleva_retained_factor, 2) for mk, v in crm_arr_bm_raw.items()}
+        else:
+            crm_arr_bm = dict(crm_arr_bm_raw)
         out_rows.append({
             "account_id": aid,
             "account_name": aname or "—",
@@ -5372,6 +5418,8 @@ async def _compute_active_arr_rows(
             "alleva_retained_factor": alleva_retained_factor,
             "crm_seats": crm_seats,
             "crm_arr": crm_arr_val,
+            "crm_seats_by_month": crm_seats_bm,
+            "crm_arr_by_month": crm_arr_bm,
             "anchor_arr": anchor_arr,
             "expansions": expansions,
             "by_product": {p: by_product_arr.get(p, 0) for p in products},

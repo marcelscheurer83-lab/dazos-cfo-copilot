@@ -143,18 +143,24 @@ export default function AnalyticsCRMSeats() {
       .filter((r) => activeArrFor(r) > 0)
       .map((r) => {
         const byProduct = r.by_product ?? {}
-        // Prefer backend-provided CRM metrics when present; fall back to heuristic from by_product.
+        // True previous-month-end CRM snapshot from the backend when available; otherwise fall back to
+        // today's backend CRM metrics, then to a heuristic from by_product.
+        const crmArrByMonth = r.crm_arr_by_month
+        const crmSeatsByMonth = r.crm_seats_by_month
+        const useMonthEnd = usePrevMonthEnd && crmArrByMonth != null
         const backendCrmArr = (r as any).crm_arr as number | null | undefined
         const backendCrmSeats = (r as any).crm_seats as number | null | undefined
-        const inferredCrmArr =
-          backendCrmArr ??
-          Object.entries(byProduct).reduce((sum, [k, v]) => (productKeyMatchesCrm(k) ? sum + (v ?? 0) : sum), 0)
         const seatArr = Object.entries(byProduct).reduce(
           (sum, [k, v]) => (productKeyMatchesSeats(k) ? sum + (v ?? 0) : sum),
           0,
         )
-        const inferredSeats =
-          backendCrmSeats != null
+        const inferredCrmArr = useMonthEnd
+          ? crmArrByMonth?.[prevMonthKey] ?? 0
+          : backendCrmArr ??
+            Object.entries(byProduct).reduce((sum, [k, v]) => (productKeyMatchesCrm(k) ? sum + (v ?? 0) : sum), 0)
+        const inferredSeats = useMonthEnd
+          ? crmSeatsByMonth?.[prevMonthKey] ?? null
+          : backendCrmSeats != null
             ? backendCrmSeats
             : seatArr > 0
               ? Math.round(seatArr / 1200)

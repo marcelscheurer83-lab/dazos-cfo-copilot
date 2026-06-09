@@ -42,6 +42,8 @@ function getOrCreateSessionId(): string {
 function dashboardFixedPeriodsForTitle(title: string): DashboardFixedPeriods | undefined {
   if (title === 'Q1 2026') return 'q1_2026'
   if (title === 'Q2 2026') return 'q2_2026'
+  if (title === 'Q3 2026') return 'q3_2026'
+  if (title === 'Q4 2026') return 'q4_2026'
   return undefined
 }
 

@@ -2,8 +2,10 @@ import { NavLink, Outlet } from 'react-router-dom'
 
 const tabs = [
   { to: '/dashboard/current-overview', label: 'Current Performance' },
-  { to: '/dashboard/q2-2026', label: 'Q2 2026' },
   { to: '/dashboard/q1-2026', label: 'Q1 2026' },
+  { to: '/dashboard/q2-2026', label: 'Q2 2026' },
+  { to: '/dashboard/q3-2026', label: 'Q3 2026' },
+  { to: '/dashboard/q4-2026', label: 'Q4 2026' },
 ]
 
 export default function DashboardLayout() {

@@ -117,6 +117,8 @@ export default function App() {
           <Route path="forecast" element={<Navigate to="/go-to-market/forecast" replace />} />
           <Route path="q1-2026" element={<DashboardCurrentSummary title="Q1 2026" />} />
           <Route path="q2-2026" element={<DashboardCurrentSummary title="Q2 2026" />} />
+          <Route path="q3-2026" element={<DashboardCurrentSummary title="Q3 2026" />} />
+          <Route path="q4-2026" element={<DashboardCurrentSummary title="Q4 2026" />} />
         </Route>
         <Route path="go-to-market" element={<GoToMarketLayout />}>
           <Route index element={<Navigate to="/go-to-market/bookings" replace />} />

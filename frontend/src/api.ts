@@ -384,12 +384,11 @@ export type RenewalsMTDResponse = {
   plan_message: string | null
 }
 
-/** When set, MTD columns use fixed labels (Q1 2026 → Jan–Mar + Q1 26; Q2 2026 → Apr–Jun + Q2 26). */
-export type DashboardFixedPeriods = 'q1_2026' | 'q2_2026'
+/** When set, MTD columns use fixed labels (e.g. Q1 2026 → Jan–Mar; Q4 2026 → Oct–Dec). */
+export type DashboardFixedPeriods = 'q1_2026' | 'q2_2026' | 'q3_2026' | 'q4_2026'
 
 function dashboardMtdQuery(fixedPeriods?: DashboardFixedPeriods): string {
-  if (fixedPeriods === 'q1_2026') return '?fixed_periods=q1_2026'
-  if (fixedPeriods === 'q2_2026') return '?fixed_periods=q2_2026'
+  if (fixedPeriods) return `?fixed_periods=${fixedPeriods}`
   return ''
 }
 

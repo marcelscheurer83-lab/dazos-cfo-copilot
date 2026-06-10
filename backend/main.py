@@ -3605,8 +3605,6 @@ ARR_PRODUCT_EXCLUDE = frozenset({
     "kipu api set up",
     "customer integration development",
     "agent implementation fee",
-    # Support / non-ARR
-    "premium support",
 })
 
 # Canonical ARR product columns: order = display order (Account, Segment, then these, then Other).
@@ -3714,12 +3712,20 @@ def _is_crm_platform_legacy(product_name: str | None) -> bool:
 # Each predicate takes the raw Salesforce product name. Lines are pre-filtered by
 # _include_line_item_in_arr (so excluded SKUs like implementation services never reach here).
 
+def _is_premium_support(product_name: str | None) -> bool:
+    """True if this is a 'Premium Support' SKU (recurring ARR; grouped under the CRM family)."""
+    if not product_name or not product_name.strip():
+        return False
+    return "premium support" in _arr_product_key(product_name)
+
+
 def _is_crm_product(product_name: str | None) -> bool:
-    """CRM family (Seat Pricing definition): CRM Platform Legacy + Includes-5-Seats + Additional CRM Seats."""
+    """CRM family: CRM Platform Legacy + Includes-5-Seats + Additional CRM Seats, plus Premium Support."""
     return (
         _is_additional_crm_seats(product_name)
         or _is_crm_platform_includes_5_seats(product_name)
         or _is_crm_platform_legacy(product_name)
+        or _is_premium_support(product_name)
     )
 
 

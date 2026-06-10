@@ -1,25 +1,16 @@
 import { useEffect, useState } from 'react'
-import { getActiveARRAnalytics, getARRScheduleActiveARRByMonth, type ActiveARRAnalyticsGroup } from '../api'
-import ProductPenetration, { KeyTakeaways, accountsFromByProduct, accountsFromByProductWithArr } from '../components/ProductPenetration'
+import { getActiveARRAnalytics, type ActiveARRAnalyticsGroup } from '../api'
+import ProductPenetration, { KeyTakeaways, accountsFromByGroup } from '../components/ProductPenetration'
 
 function fmtMoney0(n: number) {
   return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 }).format(n)
 }
 
-/** From as_of date "YYYY-MM-DD" return month key "YYYY-MM" for by_month lookups. */
-function monthKeyFromAsOf(asOf: string): string {
-  if (!asOf || asOf.length < 7) return ''
-  return asOf.slice(0, 7)
-}
-
-/** The four product lines that add up to the table total; Other/Unmapped are excluded from total. */
-const MAIN_PRODUCT_LABELS = ['CRM (Platform + Seats)', 'IQ', 'iCampaign', 'Marketing reports']
-
 export default function AnalyticsView() {
   const [asOf, setAsOf] = useState<string | null>(null)
   const [groups, setGroups] = useState<ActiveARRAnalyticsGroup[]>([])
   const [grandTotal, setGrandTotal] = useState(0)
-  const [penetrationAccounts, setPenetrationAccounts] = useState<ReturnType<typeof accountsFromByProduct>>([])
+  const [penetrationAccounts, setPenetrationAccounts] = useState<ReturnType<typeof accountsFromByGroup>>([])
   const [salesforceBaseUrl, setSalesforceBaseUrl] = useState<string | null>(null)
   const [err, setErr] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
@@ -27,31 +18,17 @@ export default function AnalyticsView() {
   useEffect(() => {
     setLoading(true)
     setErr(null)
-    Promise.all([getActiveARRAnalytics(), getARRScheduleActiveARRByMonth()])
-      .then(([arrRes, byMonthRes]) => {
+    getActiveARRAnalytics()
+      .then((arrRes) => {
         setAsOf(arrRes.as_of)
-        setGroups(
-          (arrRes.groups || []).filter(
-            (g) =>
-              (g.label || '').toLowerCase() !== 'other' &&
-              !(g.label || '').toLowerCase().includes('premium support')
-          )
-        )
+        setGroups(arrRes.groups || [])
         setGrandTotal(arrRes.grand_total ?? 0)
-        setSalesforceBaseUrl(byMonthRes.salesforce_base_url ?? null)
+        setSalesforceBaseUrl(arrRes.salesforce_base_url ?? null)
 
-        const monthKey = monthKeyFromAsOf(arrRes.as_of ?? '')
-        const rows = byMonthRes.rows ?? []
-        const withActiveARR =
-          monthKey === ''
-            ? rows
-            : rows.filter((row) => (row.by_month?.[monthKey] ?? 0) > 0)
-        const allAccounts =
-          monthKey
-            ? accountsFromByProductWithArr(withActiveARR, monthKey)
-            : accountsFromByProduct(withActiveARR)
+        // Per-account reconciled family ARR (same accounts/ARR as the bridges, Alleva included).
+        const allAccounts = accountsFromByGroup(arrRes.accounts ?? [])
         const withAtLeastOneProduct = allAccounts.filter(
-          (a) => a.hasCrm || a.hasIq || a.hasICampaign || a.hasMr
+          (a) => a.hasCrm || a.hasICampaign || a.hasIqMr || a.hasRvk
         )
         setPenetrationAccounts(withAtLeastOneProduct)
       })
@@ -112,7 +89,7 @@ export default function AnalyticsView() {
           >
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: '0.5rem' }}>
               <div style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text-muted)' }}>
-                Active ARR by product line (excl. Alleva)
+                Active ARR by product line (incl. Alleva)
               </div>
               {asOfLabel && (
                 <div style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>
@@ -120,15 +97,13 @@ export default function AnalyticsView() {
                 </div>
               )}
             </div>
+            <p style={{ margin: '0 0 0.5rem', fontSize: '0.78rem', color: 'var(--text-muted)' }}>
+              Reconciled to the Total ARR bridge.
+            </p>
 
             {groups.length === 0 ? (
               <p style={{ fontSize: '0.85rem', color: 'var(--text-muted)' }}>No ARR schedule data found.</p>
             ) : (
-              (() => {
-                const totalFour = groups
-                  .filter((g) => MAIN_PRODUCT_LABELS.includes(g.label))
-                  .reduce((s, g) => s + g.arr, 0)
-                return (
               <table
                 style={{
                   width: '100%',
@@ -151,30 +126,24 @@ export default function AnalyticsView() {
                   </tr>
                 </thead>
                 <tbody>
-                  {groups.map((g) => {
-                    const isMain = MAIN_PRODUCT_LABELS.includes(g.label)
-                    const pct = isMain && totalFour > 0 ? (g.arr / totalFour) * 100 : 0
-                    return (
-                      <tr key={g.label} style={{ borderBottom: '1px solid var(--border)' }}>
-                        <td style={{ padding: '0.5rem 0.75rem', color: 'var(--text)' }}>{g.label}</td>
-                        <td style={{ padding: '0.5rem 0.75rem', textAlign: 'right', color: 'var(--text)' }}>{fmtMoney0(g.arr)}</td>
-                        <td style={{ padding: '0.5rem 0.75rem', textAlign: 'right', color: 'var(--text-muted)' }}>
-                          {isMain && totalFour > 0 ? `${pct.toFixed(1)}%` : '—'}
-                        </td>
-                      </tr>
-                    )
-                  })}
+                  {groups.map((g) => (
+                    <tr key={g.key} style={{ borderBottom: '1px solid var(--border)' }}>
+                      <td style={{ padding: '0.5rem 0.75rem', color: 'var(--text)' }}>{g.label}</td>
+                      <td style={{ padding: '0.5rem 0.75rem', textAlign: 'right', color: 'var(--text)' }}>{fmtMoney0(g.arr)}</td>
+                      <td style={{ padding: '0.5rem 0.75rem', textAlign: 'right', color: 'var(--text-muted)' }}>
+                        {g.arr > 0 ? `${g.mix.toFixed(1)}%` : '—'}
+                      </td>
+                    </tr>
+                  ))}
                 </tbody>
                 <tfoot>
                   <tr style={{ borderTop: '2px solid var(--border)', fontWeight: 600 }}>
                     <td style={{ padding: '0.5rem 0.75rem', textAlign: 'right', color: 'var(--text-muted)' }}>Total</td>
-                    <td style={{ padding: '0.5rem 0.75rem', textAlign: 'right', color: 'var(--text)' }}>{fmtMoney0(totalFour)}</td>
+                    <td style={{ padding: '0.5rem 0.75rem', textAlign: 'right', color: 'var(--text)' }}>{fmtMoney0(grandTotal)}</td>
                     <td style={{ padding: '0.5rem 0.75rem', textAlign: 'right', color: 'var(--text-muted)' }}>100%</td>
                   </tr>
                 </tfoot>
               </table>
-                )
-              })()
             )}
           </div>
 

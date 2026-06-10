@@ -5343,9 +5343,31 @@ async def _compute_active_arr_rows(
                     opp_ids_me.add(o.sf_id)
             seats_bm[_mk] = sum(seats_by_opp.get(oid, 0) for oid in opp_ids_me)
             arr_bm[_mk] = round(sum(crm_arr_by_opp.get(oid, 0.0) for oid in opp_ids_me), 2)
+            # Product mix uses each expansion's OWN contract window (the same basis as the snapshot
+            # Total) rather than close-date, so the per-product split always reflects what is actually
+            # live at month-end. This prevents (a) a superseded mid-term line being carried past a
+            # renewal that already reflects the change (e.g. a negative ARR contraction double-counted,
+            # which otherwise inverts the proportional mix), and (b) a future-start expansion leaking
+            # into the mix before its term begins. Seats/CRM totals above are intentionally left on the
+            # original close-date basis to avoid disturbing Seat Pricing.
+            opp_ids_me_prod: set[str] = {p_hit["opp"].sf_id} if p_hit["opp"].sf_id else set()
+            for o in closed_expansions_key:
+                if not o.sf_id:
+                    continue
+                cs = o.contract_start_date
+                ce = o.contract_end_date
+                if cs is not None:
+                    if cs <= _me and (ce is None or _me <= ce):
+                        opp_ids_me_prod.add(o.sf_id)
+                elif (
+                    o.close_date
+                    and p_hit["start"] <= o.close_date <= p_hit["end"]
+                    and o.close_date <= _me
+                ):
+                    opp_ids_me_prod.add(o.sf_id)
             for g in _req_groups:
                 gmap = product_arr_by_opp[g]
-                prod_bm[g][_mk] = round(sum(gmap.get(oid, 0.0) for oid in opp_ids_me), 2)
+                prod_bm[g][_mk] = round(sum(gmap.get(oid, 0.0) for oid in opp_ids_me_prod), 2)
         crm_seats_by_account_by_month[key] = seats_bm
         crm_arr_by_account_by_month[key] = arr_bm
         for g in _req_groups:
@@ -8010,6 +8032,86 @@ async def _product_arr_map(db: AsyncSession, group_key: str, month_keys: list[st
     return arr_map
 
 
+async def _reconciled_product_alloc(
+    db: AsyncSession,
+    *,
+    month_keys: list[str],
+    snap_from: str,
+    snap_to: str,
+    named_groups: list[str],
+) -> tuple[dict[str, dict[str, float]], dict[str, dict[str, dict[str, float]]]]:
+    """Per-account reconciled product allocation shared by the ARR bridges and the product-line
+    analytics so both tell the same story.
+
+    Returns ``(snap, alloc)``:
+      • ``snap[account][month_key]``         = authoritative Total ARR (MonthlyArrSnapshot, same source
+                                               as /api/arr-bridge — includes every account incl. Alleva).
+      • ``alloc[group][account][month_key]`` = that Total split across ``named_groups`` plus ``"other"``
+                                               by the account's Salesforce line-item mix. Σ groups =
+                                               snap each month (Other absorbs the unmapped share + the
+                                               rounding residue). Negative line signals are clamped so a
+                                               superseded mid-term line can't invert the split.
+    """
+    groups = list(named_groups) + ["other"]
+    snap_rows = (
+        await db.execute(
+            select(MonthlyArrSnapshot)
+            .where(MonthlyArrSnapshot.month_key >= snap_from)
+            .where(MonthlyArrSnapshot.month_key <= snap_to)
+        )
+    ).scalars().all()
+    snap: dict[str, dict[str, float]] = {}
+    for s in snap_rows:
+        snap.setdefault(s.account_name, {})[s.month_key] = float(s.arr or 0.0)
+
+    rows, _msg = await _compute_active_arr_rows(
+        db, apply_alleva_retained_arr_adjustment=True, crm_month_keys=month_keys, product_month_groups=groups
+    )
+    li: dict[str, dict[str, dict[str, float]]] = {}
+    for r in rows:
+        name = r.get("account_name") or "—"
+        pbm = r.get("product_arr_by_month") or {}
+        acc_li = li.setdefault(name, {})
+        for g in groups:
+            gm = pbm.get(g) or {}
+            if not gm:
+                continue
+            dst = acc_li.setdefault(g, {})
+            for mk, v in gm.items():
+                fv = float(v or 0.0)
+                if fv:
+                    dst[mk] = round(dst.get(mk, 0.0) + fv, 2)
+
+    alloc: dict[str, dict[str, dict[str, float]]] = {g: {} for g in groups}
+    for acc, months in snap.items():
+        acc_li = li.get(acc, {})
+        for mk, tot in months.items():
+            if not tot:
+                continue
+            # Clamp negative line-group signals to 0 before weighting: a net-negative group would be a
+            # mid-term removal whose offsetting base sits on a superseded opp; allowing it through would
+            # invert the proportional split. The snapshot Total already reflects the reduced ARR, so the
+            # drop is captured by the product's level falling toward 0.
+            li_g = {g: max(0.0, acc_li.get(g, {}).get(mk, 0.0)) for g in groups}
+            li_total = sum(li_g.values())
+            parts: dict[str, float] = {}
+            if li_total > 0:
+                assigned = 0.0
+                for g in named_groups:
+                    val = round(tot * li_g[g] / li_total, 2)
+                    parts[g] = val
+                    assigned += val
+                parts["other"] = round(tot - assigned, 2)  # Other's mix share + rounding residue
+            else:
+                for g in named_groups:
+                    parts[g] = 0.0
+                parts["other"] = round(float(tot), 2)
+            for g in groups:
+                if parts.get(g):
+                    alloc[g].setdefault(acc, {})[mk] = parts[g]
+    return snap, alloc
+
+
 async def _compute_all_product_bridges(db: AsyncSession) -> dict:
     """Reconciled per-product ARR bridges that sum exactly to the Total bridge each month.
 
@@ -8034,65 +8136,14 @@ async def _compute_all_product_bridges(db: AsyncSession) -> dict:
         month_keys.append(_cur)
         _cur = _mk_offset(_cur, 1)
 
-    # Authoritative per-account monthly Total ARR (same source as /api/arr-bridge).
-    snap_rows = (
-        await db.execute(
-            select(MonthlyArrSnapshot)
-            .where(MonthlyArrSnapshot.month_key >= fetch_from)
-            .where(MonthlyArrSnapshot.month_key <= current_mk)
-        )
-    ).scalars().all()
-    snap: dict[str, dict[str, float]] = {}
-    for s in snap_rows:
-        snap.setdefault(s.account_name, {})[s.month_key] = float(s.arr or 0.0)
-
     groups = list(_PRODUCT_BRIDGE_DEFS.keys())  # crm, icampaign, iq_mr, rvk, other
     named_groups = [g for g in groups if g != "other"]
 
-    # Salesforce line-item product ARR per account per month, for the product mix.
-    rows, _msg = await _compute_active_arr_rows(
-        db, apply_alleva_retained_arr_adjustment=True, crm_month_keys=month_keys, product_month_groups=groups
+    # Authoritative per-account Total ARR (snapshot) split by line-item mix — shared with the
+    # product-line analytics so both reconcile to the Total bridge.
+    snap, alloc = await _reconciled_product_alloc(
+        db, month_keys=month_keys, snap_from=fetch_from, snap_to=current_mk, named_groups=named_groups
     )
-    li: dict[str, dict[str, dict[str, float]]] = {}
-    for r in rows:
-        name = r.get("account_name") or "—"
-        pbm = r.get("product_arr_by_month") or {}
-        acc_li = li.setdefault(name, {})
-        for g in groups:
-            gm = pbm.get(g) or {}
-            if not gm:
-                continue
-            dst = acc_li.setdefault(g, {})
-            for mk, v in gm.items():
-                fv = float(v or 0.0)
-                if fv:
-                    dst[mk] = round(dst.get(mk, 0.0) + fv, 2)
-
-    # Allocate each account's monthly Total across families by line-item mix (residue → Other).
-    alloc: dict[str, dict[str, dict[str, float]]] = {g: {} for g in groups}
-    for acc, months in snap.items():
-        acc_li = li.get(acc, {})
-        for mk, tot in months.items():
-            if not tot:
-                continue
-            li_g = {g: acc_li.get(g, {}).get(mk, 0.0) for g in groups}
-            li_total = sum(li_g.values())
-            parts: dict[str, float] = {}
-            if li_total > 0:
-                assigned = 0.0
-                for g in named_groups:
-                    val = round(tot * li_g[g] / li_total, 2)
-                    parts[g] = val
-                    assigned += val
-                parts["other"] = round(tot - assigned, 2)  # Other's mix share + rounding residue
-            else:
-                # Account has Total ARR but no classifiable line items → all to Other.
-                for g in named_groups:
-                    parts[g] = 0.0
-                parts["other"] = round(float(tot), 2)
-            for g in groups:
-                if parts.get(g):
-                    alloc[g].setdefault(acc, {})[mk] = parts[g]
 
     # Per-product bridges anchor at the Dec-2025 year-end ARR and build forward; 2025 product-level
     # cleanup is out of scope (the Total bridge keeps full 2025 history). Dec 2025 is shown as an
@@ -8100,14 +8151,34 @@ async def _compute_all_product_bridges(db: AsyncSession) -> dict:
     product_anchor_mk = _PRODUCT_BRIDGE_ANCHOR_MK
     product_display_months = [mk for mk in display_months if mk >= product_anchor_mk] or list(display_months)
 
+    # Reclassification-aware components: classify each account's movement at the ACCOUNT level (like the
+    # Total), so within-account product swaps (e.g. CRM→IQ in a flat account) become a 'reclassification'
+    # that nets to $0 across products instead of phantom expansion+contraction. With this, Σ products'
+    # New Business / Expansion / Contraction / Churn equal the Total exactly, every per-product row still
+    # balances (Beginning + moves + reclassification = Ending), and reclassification sums to $0.
+    comp = _product_bridge_components(alloc, snap, groups, product_display_months)
+
     products_out: list[dict] = []
     for g in groups:
         built = _build_bridge_from_arr_map(alloc[g], product_display_months, month_keys, logo_totals=snap)
         bridge_rows = built["bridge"]
+        for row in bridge_rows:
+            c = comp.get(g, {}).get(row["month"])
+            if c is None:
+                continue
+            row["new_business"] = c["new_business"]
+            row["expansion"] = c["expansion"]
+            row["contraction"] = c["contraction"]
+            row["churn"] = c["churn"]
+            row["reclassification"] = c["reclassification"]
+            row["net_change"] = round(
+                c["new_business"] + c["expansion"] - c["contraction"] - c["churn"] + c["reclassification"], 2
+            )
         if bridge_rows and bridge_rows[0]["month"] == product_anchor_mk:
             anchor = bridge_rows[0]
             anchor["beginning_arr"] = anchor["ending_arr"]
             anchor["new_business"] = anchor["expansion"] = anchor["contraction"] = anchor["churn"] = 0.0
+            anchor["reclassification"] = 0.0
             anchor["net_change"] = 0.0
         products_out.append({
             "product": g,
@@ -8116,7 +8187,81 @@ async def _compute_all_product_bridges(db: AsyncSession) -> dict:
             "retention": built["retention"],
             "yoy": built["yoy"],
         })
-    return {"display_months": product_display_months, "products": products_out, "has_data": bool(snap_rows)}
+    return {"display_months": product_display_months, "products": products_out, "has_data": bool(snap)}
+
+
+def _product_bridge_components(
+    alloc: dict[str, dict[str, dict[str, float]]],
+    snap: dict[str, dict[str, float]],
+    groups: list[str],
+    display_months: list[str],
+) -> dict[str, dict[str, dict[str, float]]]:
+    """Reconciled per-product bridge components keyed comp[group][month] = {new_business, expansion,
+    contraction, churn, reclassification}.
+
+    Each account's month-over-month movement is classified at the account (logo) level — exactly like
+    the Total bridge — and then attributed to products:
+      • New logo  → New Business per product (current product ARR).
+      • Churned   → Churn per product (prior product ARR).
+      • Existing, net up   → account net is Expansion, allocated across products that grew.
+      • Existing, net down → account net is Contraction, allocated across products that shrank.
+    The leftover within-account offset (a product up while another is down) is 'Reclassification',
+    which sums to $0 across products so the Total is untouched and Σ products = Total for every
+    component. Per-product: Beginning + NB + Exp − Ctr − Churn + Reclassification = Ending.
+    """
+    accounts = set(snap.keys())
+    for g in groups:
+        accounts.update(alloc.get(g, {}).keys())
+
+    def aval(g: str, acc: str, mk: str) -> float:
+        return alloc.get(g, {}).get(acc, {}).get(mk, 0.0)
+
+    def logo(acc: str, mk: str) -> float:
+        return snap.get(acc, {}).get(mk, 0.0)
+
+    comp: dict[str, dict[str, dict[str, float]]] = {
+        g: {mk: {"new_business": 0.0, "expansion": 0.0, "contraction": 0.0, "churn": 0.0, "reclassification": 0.0}
+            for mk in display_months}
+        for g in groups
+    }
+
+    for mk in display_months:
+        prior = _mk_offset(mk, -1)
+        for acc in accounts:
+            lp, lc = logo(acc, prior), logo(acc, mk)
+            deltas = {g: round(aval(g, acc, mk) - aval(g, acc, prior), 2) for g in groups}
+            if lp <= 0.0 and lc > 0.0:
+                for g in groups:
+                    v = aval(g, acc, mk)
+                    if v:
+                        comp[g][mk]["new_business"] += v
+                continue
+            if lc <= 0.0 and lp > 0.0:
+                for g in groups:
+                    v = aval(g, acc, prior)
+                    if v:
+                        comp[g][mk]["churn"] += v
+                continue
+            # Existing account both months: classify by account net, reclass holds the offset.
+            net = round(lc - lp, 2)
+            pos = sum(d for d in deltas.values() if d > 0)
+            neg = -sum(d for d in deltas.values() if d < 0)
+            if net >= 0:
+                for g, d in deltas.items():
+                    exp_g = round(net * d / pos, 2) if (d > 0 and pos > 0) else 0.0
+                    comp[g][mk]["expansion"] += exp_g
+                    comp[g][mk]["reclassification"] += round(d - exp_g, 2)
+            else:
+                for g, d in deltas.items():
+                    ctr_g = round((-net) * (-d) / neg, 2) if (d < 0 and neg > 0) else 0.0
+                    comp[g][mk]["contraction"] += ctr_g
+                    comp[g][mk]["reclassification"] += round(d + ctr_g, 2)
+
+    for g in groups:
+        for mk in display_months:
+            for k in comp[g][mk]:
+                comp[g][mk][k] = round(comp[g][mk][k], 2)
+    return comp
 
 
 @app.get("/api/arr-bridge/products")
@@ -8575,13 +8720,14 @@ async def get_active_arr_by_product(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Active ARR by product line using the **same mechanics as the ARR schedule**.
+    Active ARR by product line, using the **same reconciled split as the ARR bridges** so the numbers
+    tie to the Total ARR bridge.
 
-    Logic:
-    - Uses _get_active_arr_by_month_data (anchor ARR + expansions, within subscription window) to compute
-      ARR as of a month-end per account.
-    - For each account, allocates that month-end ARR across products using the account's ARR-by-product mix.
-    - Aggregates into high-level product groups (CRM + seats, IQ, iCampaign, Marketing reports, Other).
+    For the requested month-end it takes each account's authoritative Total ARR (MonthlyArrSnapshot) and
+    splits it across the bridge product families — CRM, iCampaign, IQ & Marketing Reports, RVK Agents,
+    and an Other catch-all — by the account's Salesforce line-item mix. Σ families = the Total bridge
+    that month. Includes every account (Alleva included) and returns per-account family ARR for the
+    product-penetration / white-space panels. Defaults to the previous month-end.
     """
     # Default as-of = last day of previous month in EST (e.g. end of February when today is in March).
     if as_of is None:
@@ -8596,234 +8742,76 @@ async def get_active_arr_by_product(
         as_of = date(year, month, last_day)
 
     month_key = f"{as_of.year}-{as_of.month:02d}"
-    out_rows, months, _totals_by_month, base_url = await _get_active_arr_by_month_data(db)
 
-    if month_key not in months:
-        return {
-            "as_of": as_of.isoformat(),
-            "groups": [],
-            "grand_total": 0.0,
-        }
+    groups_keys = list(_PRODUCT_BRIDGE_DEFS.keys())          # crm, icampaign, iq_mr, rvk, other
+    named_groups = [g for g in groups_keys if g != "other"]
 
-    # Initialize groups (no "Other" — unmapped/other product names roll into CRM)
-    groups = {
-        "CRM (Platform + Seats)": 0.0,
-        "IQ": 0.0,
-        "iCampaign": 0.0,
-        "Marketing reports": 0.0,
-    }
-    # ARR per product group per segment (SMB/MM, Enterprise)
-    groups_by_segment: dict[str, dict[str, float]] = {
-        lbl: {"SMB/MM": 0.0, "Enterprise": 0.0} for lbl in groups
-    }
-    # Track which detailed product names rolled into CRM (formerly "Other" bucket)
-    other_breakdown: dict[str, float] = {}
-    # Track accounts whose ARR ends up in "Unmapped / no product breakdown"
-    unmapped_accounts: list[dict] = []
-    # Sum of unmapped ARR (no by_product) for table row
-    unmapped_total_container: list[float] = [0.0]
-    # Track all accounts contributing to the Other bucket (including unmapped)
-    other_accounts: list[dict] = []
-
-    # Active ARR by segment (SMB/MM vs Enterprise) — totals
-    segment_arr: dict[str, float] = {"SMB/MM": 0.0, "Enterprise": 0.0}
-
-    def _normalize_segment(seg: str) -> str:
-        s = (seg or "").strip()
-        if not s:
-            return "SMB/MM"
-        if "enterprise" in s.lower():
-            return "Enterprise"
-        return "SMB/MM"
-
-    def _add_to_group(product_name: str, amount: float, account: Optional[dict] = None, seg_key: Optional[str] = None) -> None:
-        name = (product_name or "").strip()
-        # Exclude Premium Support from by-product analysis (do not count toward ARR by product line).
-        if "premium support" in (name or "").lower():
-            return
-        if not name or amount == 0:
-            return
-        seg = seg_key or "SMB/MM"
-        if name in ("CRM Platform", "CRM Billing Platform", "Add. CRM Seats"):
-            groups["CRM (Platform + Seats)"] += amount
-            groups_by_segment["CRM (Platform + Seats)"][seg] = groups_by_segment["CRM (Platform + Seats)"].get(seg, 0.0) + amount
-            segment_arr[seg] = segment_arr.get(seg, 0.0) + amount
-        elif name in ("IQ Platform", "Add. MR/ IQ Locations"):
-            groups["IQ"] += amount
-            groups_by_segment["IQ"][seg] = groups_by_segment["IQ"].get(seg, 0.0) + amount
-            segment_arr[seg] = segment_arr.get(seg, 0.0) + amount
-        elif name == "iCampaign Platform":
-            groups["iCampaign"] += amount
-            groups_by_segment["iCampaign"][seg] = groups_by_segment["iCampaign"].get(seg, 0.0) + amount
-            segment_arr[seg] = segment_arr.get(seg, 0.0) + amount
-        elif name == "MR Platform":
-            groups["Marketing reports"] += amount
-            groups_by_segment["Marketing reports"][seg] = groups_by_segment["Marketing reports"].get(seg, 0.0) + amount
-            segment_arr[seg] = segment_arr.get(seg, 0.0) + amount
-        else:
-            # Exclude other/unmapped product ARR from CRM and from table totals (track for reference only).
-            other_breakdown[name] = other_breakdown.get(name, 0.0) + amount
-            if account is not None:
-                other_accounts.append(
-                    {
-                        "account_id": account.get("account_id"),
-                        "account_name": account.get("account_name") or "—",
-                        "product": name,
-                        "arr": float(amount),
-                    }
-                )
-
-    def _add_other_unmapped(amount: float, account: Optional[dict] = None, seg_key: Optional[str] = None) -> None:
-        # Exclude unmapped / no product breakdown from CRM; track for "Other / Unmapped" row.
-        unmapped_total_container[0] += amount
-        if account is not None and amount:
-            unmapped_accounts.append({
-                "account_id": account.get("account_id"),
-                "account_name": account.get("account_name") or "—",
-                "arr": float(amount),
-            })
-
-    for row in out_rows:
-        by_month = row.get("by_month") or {}
-        month_arr = float(by_month.get(month_key) or 0.0)
-        if month_arr <= 0:
-            continue
-
-        by_product = row.get("by_product") or {}
-        # Exclude accounts with 0 products (no CRM, IQ, iCampaign, MR)
-        def _p(name: str) -> float:
-            try:
-                return float(by_product.get(name) or 0.0)
-            except (TypeError, ValueError):
-                return 0.0
-        has_crm = (_p("CRM Platform") + _p("CRM Billing Platform") + _p("Add. CRM Seats")) > 0
-        has_iq = (_p("IQ Platform") + _p("Add. MR/ IQ Locations")) > 0
-        has_icampaign = _p("iCampaign Platform") > 0
-        has_mr = _p("MR Platform") > 0
-        if not (has_crm or has_iq or has_icampaign or has_mr):
-            continue
-
-        # Aggregate by segment (SMB/MM vs Enterprise); support both "segment" and "Segment"
-        raw_segment = row.get("segment") or row.get("Segment") or ""
-        seg_key = _normalize_segment(raw_segment if isinstance(raw_segment, str) else "")
-
-        # Use the same base as the schedule (anchor + expansions within term),
-        # but derive the product mix from by_product; if no product mix is
-        # available, do not add to table (exclude from ARR).
-        by_product = row.get("by_product") or {}
-        if not by_product:
-            _add_other_unmapped(month_arr, row, seg_key)
-            continue
-
-        # Exclude Premium Support from product mix and from total ARR in this analysis.
-        premium_arr = 0.0
-        for k, v in by_product.items():
-            if "premium support" in (str(k) or "").lower():
-                try:
-                    premium_arr += float(v or 0)
-                except (TypeError, ValueError):
-                    pass
-        amount_to_allocate = max(0.0, month_arr - premium_arr)
-
-        # Sum only positive product contributions to define the mix (skip Premium Support).
-        total_for_mix = 0.0
-        per_product_base: dict[str, float] = {}
-        for product_name, total_for_product in by_product.items():
-            if "premium support" in (str(product_name) or "").lower():
-                continue
-            try:
-                prod_base = float(total_for_product or 0.0)
-            except (TypeError, ValueError):
-                continue
-            if prod_base <= 0:
-                continue
-            per_product_base[str(product_name)] = prod_base
-            total_for_mix += prod_base
-
-        if total_for_mix <= 0:
-            if amount_to_allocate > 0:
-                _add_other_unmapped(amount_to_allocate, row, seg_key)
-            continue
-
-        # Allocate only the non-premium portion across non-premium products.
-        for product_name, prod_base in per_product_base.items():
-            share = prod_base / total_for_mix
-            _add_to_group(product_name, amount_to_allocate * share, row, seg_key)
-
-    # Round for presentation
-    groups = {k: round(v, 2) for k, v in groups.items()}
-    # Sorted breakdown of "Other" contents for analytics UI
-    other_items = sorted(
-        ((name, val) for name, val in other_breakdown.items() if val),
-        key=lambda x: -x[1],
+    # Same reconciled per-account product split that powers the ARR bridges, taken at this month-end,
+    # so the product-line totals tie to the Total ARR bridge, include RVK, and include Alleva.
+    snap, alloc = await _reconciled_product_alloc(
+        db, month_keys=[month_key], snap_from=month_key, snap_to=month_key, named_groups=named_groups
     )
-    other_total = round(sum(other_breakdown.values()), 2)
-    unmapped_total = round(unmapped_total_container[0], 2)
-    grand_total = round(sum(groups.values()), 2)
 
-    ordered_labels = [
-        "CRM (Platform + Seats)",
-        "IQ",
-        "iCampaign",
-        "Marketing reports",
-    ]
-    # If segment data wasn't on the rows (e.g. Account.segment not synced), put total in SMB/MM so columns show values
-    segment_total = segment_arr.get("SMB/MM", 0.0) + segment_arr.get("Enterprise", 0.0)
-    if grand_total > 0 and segment_total <= 0:
-        segment_arr["SMB/MM"] = grand_total
-        for lbl in ordered_labels:
-            groups_by_segment[lbl]["SMB/MM"] = groups[lbl]
-
-    group_list = []
-    for lbl in ordered_labels:
-        arr = groups[lbl]
-        smb = round(groups_by_segment[lbl].get("SMB/MM", 0.0), 2)
-        ent = round(groups_by_segment[lbl].get("Enterprise", 0.0), 2)
-        if smb == 0 and ent == 0 and arr > 0:
-            smb = arr
-        group_list.append({
-            "label": lbl,
-            "arr": arr,
-            "arr_smb_mm": smb,
-            "arr_enterprise": ent,
-        })
-    if other_total > 0:
-        group_list.append({
-            "label": "Other (product not mapped)",
-            "arr": other_total,
-            "arr_smb_mm": other_total,
-            "arr_enterprise": 0.0,
-        })
-    if unmapped_total > 0:
-        group_list.append({
-            "label": "Unmapped (no product breakdown)",
-            "arr": unmapped_total,
-            "arr_smb_mm": unmapped_total,
-            "arr_enterprise": 0.0,
+    acc_total: dict[str, float] = {
+        acc: round(months.get(month_key, 0.0), 2)
+        for acc, months in snap.items()
+        if months.get(month_key, 0.0)
+    }
+    if not acc_total:
+        return JSONResponse(content={
+            "as_of": as_of.isoformat(), "month_key": month_key,
+            "groups": [], "accounts": [], "grand_total": 0.0,
         })
 
-    seg_smb = round(segment_arr.get("SMB/MM", 0.0), 2)
-    seg_ent = round(segment_arr.get("Enterprise", 0.0), 2)
-    if grand_total > 0 and seg_smb == 0 and seg_ent == 0:
-        seg_smb = grand_total
-    by_segment = [
-        {"label": "SMB/MM", "arr": seg_smb},
-        {"label": "Enterprise", "arr": seg_ent},
+    grand_total = round(sum(acc_total.values()), 2)
+
+    group_arr: dict[str, float] = {
+        g: round(sum(alloc.get(g, {}).get(acc, {}).get(month_key, 0.0) for acc in acc_total), 2)
+        for g in groups_keys
+    }
+    group_list = [
+        {
+            "key": g,
+            "label": _PRODUCT_BRIDGE_DEFS[g],
+            "arr": group_arr[g],
+            "mix": round(group_arr[g] / grand_total * 100, 1) if grand_total > 0 else 0.0,
+        }
+        for g in groups_keys
     ]
 
+    # Salesforce account-id map for deep links on the penetration panels.
+    id_map: dict[str, str] = {}
+    id_r = await db.execute(
+        select(Opportunity.account_id, Opportunity.account_name)
+        .where(Opportunity.account_name.in_(list(acc_total.keys())))
+        .distinct()
+    )
+    for row in id_r:
+        if row.account_name and row.account_name not in id_map and row.account_id:
+            id_map[row.account_name] = row.account_id
+
+    # Per-account family ARR for the product-penetration / white-space panels (RVK + Alleva included).
+    accounts_out = [
+        {
+            "account_id": id_map.get(acc),
+            "account_name": acc,
+            "arr": tot,
+            "by_group": {g: round(alloc.get(g, {}).get(acc, {}).get(month_key, 0.0), 2) for g in groups_keys},
+        }
+        for acc, tot in acc_total.items()
+    ]
+    accounts_out.sort(key=lambda x: -x["arr"])
+
+    base = os.getenv("SALESFORCE_BASE_URL", "").strip().rstrip("/")
     resp: dict = {
         "as_of": as_of.isoformat(),
+        "month_key": month_key,
         "groups": group_list,
-        "by_segment": by_segment,
         "grand_total": grand_total,
-        "other_breakdown": [
-            {"product": name, "arr": round(val, 2)} for name, val in other_items
-        ],
-        "unmapped_accounts": unmapped_accounts,
-        "other_accounts": other_accounts,
+        "accounts": accounts_out,
     }
-    if base_url:
-        resp["salesforce_base_url"] = base_url
+    if base:
+        resp["salesforce_base_url"] = base
     return JSONResponse(content=resp)
 
 
@@ -14554,6 +14542,7 @@ async def export_arr_bridge_to_google_sheet(db: AsyncSession = Depends(get_db)):
         values.append(money_row("Expansion", "expansion"))
         values.append(money_row("Contraction", "contraction"))
         values.append(money_row("Churn", "churn"))
+        values.append(money_row("Reclassification", "reclassification"))
         values.append(money_row("Ending ARR", "ending_arr"))
         values.append(["YoY Growth"] + [_fmt_pct_export(yoy.get(m, {}).get("yoy_pct")) for m in display_months])
         values.append(["NRR (T12M)"] + [_fmt_pct_export(ret.get(m, {}).get("nrr_trailing_12m")) for m in display_months])

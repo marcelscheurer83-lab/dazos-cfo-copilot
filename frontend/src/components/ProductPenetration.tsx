@@ -13,9 +13,9 @@ import { useState } from 'react'
 
 const PRODUCT_ACCENTS: Record<string, string> = {
   CRM: '#00d4aa',
-  IQ: '#7c6af7',
   iCampaign: '#f5a623',
-  'Marketing Reports': '#3ecfff',
+  IQMR: '#7c6af7',
+  RVK: '#3ecfff',
 }
 
 /** Depth 0–4: muted/dark → bright. Index by depth (1–4 used when 0 is hidden). */
@@ -82,19 +82,19 @@ export function KeyTakeaways() {
 
 export type ProductPenetrationAccount = {
   hasCrm: boolean
-  hasIq: boolean
   hasICampaign: boolean
-  hasMr: boolean
+  hasIqMr: boolean
+  hasRvk: boolean
   /** Optional for listing accounts with 0 products. */
   accountName?: string | null
   accountId?: string | null
   /** Optional ARR for this account (same period as penetration). Enables revenue-by-depth. */
   arr?: number
-  /** Optional ARR for this account for each product only (from by_product). Used for Est. ARR/Customer in cross-sell. */
+  /** Optional ARR for this account for each product family only. Used for Est. ARR/Customer in cross-sell. */
   arrCrm?: number
-  arrIq?: number
   arrICampaign?: number
-  arrMr?: number
+  arrIqMr?: number
+  arrRvk?: number
 }
 
 type Props = {
@@ -107,15 +107,38 @@ type Props = {
   panelsOnly?: boolean
 }
 
+const PRODUCT_KEYS = ['CRM', 'iCampaign', 'IQMR', 'RVK'] as const
+const PRODUCT_LABELS: Record<string, string> = { CRM: 'CRM', iCampaign: 'iCampaign', IQMR: 'IQ & MR', RVK: 'RVK' }
+
+function getHas(a: ProductPenetrationAccount, key: string): boolean {
+  switch (key) {
+    case 'CRM': return a.hasCrm
+    case 'iCampaign': return a.hasICampaign
+    case 'IQMR': return a.hasIqMr
+    case 'RVK': return a.hasRvk
+    default: return false
+  }
+}
+
+/** ARR for this account for the given product family only (used for Est. ARR/Customer in cross-sell). */
+function getArrForProduct(a: ProductPenetrationAccount, key: string): number {
+  switch (key) {
+    case 'CRM': return a.arrCrm ?? 0
+    case 'iCampaign': return a.arrICampaign ?? 0
+    case 'IQMR': return a.arrIqMr ?? 0
+    case 'RVK': return a.arrRvk ?? 0
+    default: return 0
+  }
+}
+
+function getAccountDepth(a: ProductPenetrationAccount): number {
+  return PRODUCT_KEYS.reduce((n, k) => n + (getHas(a, k) ? 1 : 0), 0)
+}
+
 function depthDistribution(accounts: ProductPenetrationAccount[]) {
   const counts = [0, 0, 0, 0, 0]
   for (const a of accounts) {
-    const depth =
-      (a.hasCrm ? 1 : 0) +
-      (a.hasIq ? 1 : 0) +
-      (a.hasICampaign ? 1 : 0) +
-      (a.hasMr ? 1 : 0)
-    counts[depth] += 1
+    counts[getAccountDepth(a)] += 1
   }
   return [0, 1, 2, 3, 4].map((depth) => ({
     depth,
@@ -126,50 +149,16 @@ function depthDistribution(accounts: ProductPenetrationAccount[]) {
 
 function perProductStats(accounts: ProductPenetrationAccount[]) {
   const total = accounts.length
-  const products = [
-    { key: 'CRM', label: 'CRM', count: accounts.filter((a) => a.hasCrm).length },
-    { key: 'IQ', label: 'IQ', count: accounts.filter((a) => a.hasIq).length },
-    {
-      key: 'iCampaign',
-      label: 'iCampaign',
-      count: accounts.filter((a) => a.hasICampaign).length,
-    },
-    {
-      key: 'Marketing Reports',
-      label: 'Marketing Reports',
-      count: accounts.filter((a) => a.hasMr).length,
-    },
-  ]
-  return products
+  return PRODUCT_KEYS.map((key) => ({
+    key,
+    label: PRODUCT_LABELS[key],
+    count: accounts.filter((a) => getHas(a, key)).length,
+  }))
     .map((p) => ({
       ...p,
       pct: total > 0 ? (100 * p.count) / total : 0,
     }))
     .sort((a, b) => b.pct - a.pct)
-}
-
-const PRODUCT_KEYS = ['CRM', 'IQ', 'iCampaign', 'MR'] as const
-const PRODUCT_LABELS: Record<string, string> = { CRM: 'CRM', IQ: 'IQ', iCampaign: 'iCampaign', MR: 'Marketing Reports' }
-
-function getHas(a: ProductPenetrationAccount, key: string): boolean {
-  switch (key) {
-    case 'CRM': return a.hasCrm
-    case 'IQ': return a.hasIq
-    case 'iCampaign': return a.hasICampaign
-    case 'MR': return a.hasMr
-    default: return false
-  }
-}
-
-/** ARR for this account for the given product only (used for Est. ARR/Customer in cross-sell). */
-function getArrForProduct(a: ProductPenetrationAccount, key: string): number {
-  switch (key) {
-    case 'CRM': return a.arrCrm ?? 0
-    case 'IQ': return a.arrIq ?? 0
-    case 'iCampaign': return a.arrICampaign ?? 0
-    case 'MR': return a.arrMr ?? 0
-    default: return 0
-  }
 }
 
 function attachRateMatrix(accounts: ProductPenetrationAccount[]) {
@@ -189,7 +178,7 @@ function attachRateMatrix(accounts: ProductPenetrationAccount[]) {
 function revenueByDepth(accounts: ProductPenetrationAccount[]) {
   const byDepth: Record<number, { sum: number; count: number }> = { 1: { sum: 0, count: 0 }, 2: { sum: 0, count: 0 }, 3: { sum: 0, count: 0 }, 4: { sum: 0, count: 0 } }
   for (const a of accounts) {
-    const depth = (a.hasCrm ? 1 : 0) + (a.hasIq ? 1 : 0) + (a.hasICampaign ? 1 : 0) + (a.hasMr ? 1 : 0)
+    const depth = getAccountDepth(a)
     if (depth >= 1 && depth <= 4 && typeof a.arr === 'number') {
       byDepth[depth].sum += a.arr
       byDepth[depth].count += 1
@@ -233,8 +222,8 @@ function crossSellOpportunities(accounts: ProductPenetrationAccount[]) {
       const count = ws[x]?.[y] ?? 0
       const estArr = avgArrByProduct[y] ?? 0
       rows.push({
-        campaign: `${x} → ${y === 'MR' ? 'Marketing Reports' : y}`,
-        target: `${x} customers without ${y === 'MR' ? 'MR' : y}`,
+        campaign: `${PRODUCT_LABELS[x] ?? x} → ${PRODUCT_LABELS[y] ?? y}`,
+        target: `${PRODUCT_LABELS[x] ?? x} customers without ${PRODUCT_LABELS[y] ?? y}`,
         count,
         estArrPerCustomer: estArr,
         totalOpportunity: count * estArr,
@@ -242,10 +231,6 @@ function crossSellOpportunities(accounts: ProductPenetrationAccount[]) {
     }
   }
   return rows.filter((r) => r.count > 0).sort((a, b) => b.totalOpportunity - a.totalOpportunity)
-}
-
-function getAccountDepth(a: ProductPenetrationAccount): number {
-  return (a.hasCrm ? 1 : 0) + (a.hasIq ? 1 : 0) + (a.hasICampaign ? 1 : 0) + (a.hasMr ? 1 : 0)
 }
 
 export default function ProductPenetration({ accounts, salesforceBaseUrl, currentArrTotal, panelsOnly }: Props) {
@@ -345,7 +330,7 @@ export default function ProductPenetration({ accounts, salesforceBaseUrl, curren
             <thead>
               <tr>
                 <th style={{ ...panelThStyle, textAlign: 'left', padding: '6px 8px', verticalAlign: 'top' }}>Have \ Also have</th>
-                {PRODUCT_KEYS.map((k) => <th key={k} style={{ ...panelThStyle, padding: '6px 8px', verticalAlign: 'top' }}>{k}</th>)}
+                {PRODUCT_KEYS.map((k) => <th key={k} style={{ ...panelThStyle, padding: '6px 8px', verticalAlign: 'top' }}>{PRODUCT_LABELS[k]}</th>)}
               </tr>
             </thead>
             <tbody>
@@ -353,11 +338,11 @@ export default function ProductPenetration({ accounts, salesforceBaseUrl, curren
                 const matrix = attachRateMatrix(accounts)
                 return PRODUCT_KEYS.map((rowKey) => (
                   <tr key={rowKey}>
-                    <td style={{ padding: '6px 8px', color: 'var(--text)', fontWeight: 500, verticalAlign: 'top' }}>{rowKey}</td>
+                    <td style={{ padding: '6px 8px', color: 'var(--text)', fontWeight: 500, verticalAlign: 'top' }}>{PRODUCT_LABELS[rowKey]}</td>
                     {PRODUCT_KEYS.map((colKey) => {
                       const pct = matrix[rowKey]?.[colKey] ?? 0
                       const isDiag = rowKey === colKey
-                      const accent = PRODUCT_ACCENTS[PRODUCT_LABELS[colKey] ?? colKey] ?? '#888'
+                      const accent = PRODUCT_ACCENTS[colKey] ?? '#888'
                       return (
                         <td key={colKey} style={{ padding: '6px 8px', textAlign: 'center', verticalAlign: 'top' }}>
                           <span style={{ display: 'inline-block', padding: '2px 6px', borderRadius: 4, background: isDiag ? 'var(--border)' : (pct >= 50 ? `${accent}22` : 'transparent'), color: isDiag ? 'var(--text-muted)' : 'var(--text)', fontWeight: isDiag ? 600 : 500 }}>{pct}%</span>
@@ -415,7 +400,7 @@ export default function ProductPenetration({ accounts, salesforceBaseUrl, curren
             <thead>
               <tr>
                 <th style={{ ...panelThStyle, textAlign: 'left', padding: '6px 8px', verticalAlign: 'top' }}>Have</th>
-                {PRODUCT_KEYS.map((colKey) => <th key={colKey} style={{ ...panelThStyle, padding: '6px 8px', verticalAlign: 'top' }}>Missing {colKey}</th>)}
+                {PRODUCT_KEYS.map((colKey) => <th key={colKey} style={{ ...panelThStyle, padding: '6px 8px', verticalAlign: 'top' }}>Missing {PRODUCT_LABELS[colKey]}</th>)}
               </tr>
             </thead>
             <tbody>
@@ -424,11 +409,11 @@ export default function ProductPenetration({ accounts, salesforceBaseUrl, curren
                 const row = ws[rowKey] ?? {}
                 return (
                   <tr key={rowKey}>
-                    <td style={{ padding: '6px 8px', color: 'var(--text)', fontWeight: 500, verticalAlign: 'top' }}>{rowKey}</td>
+                    <td style={{ padding: '6px 8px', color: 'var(--text)', fontWeight: 500, verticalAlign: 'top' }}>{PRODUCT_LABELS[rowKey]}</td>
                     {PRODUCT_KEYS.map((colKey) => {
                       if (rowKey === colKey) return <td key={colKey} style={{ padding: '6px 8px', textAlign: 'center', color: 'var(--text-muted)', verticalAlign: 'top' }}>—</td>
                       const count = row[colKey] ?? 0
-                      const accent = PRODUCT_ACCENTS[PRODUCT_LABELS[colKey] ?? colKey] ?? '#888'
+                      const accent = PRODUCT_ACCENTS[colKey] ?? '#888'
                       return <td key={colKey} style={{ padding: '6px 8px', textAlign: 'center', verticalAlign: 'top' }}><span style={{ color: count > 0 ? accent : 'var(--text-muted)', fontWeight: count > 0 ? 600 : 400 }}>{count}</span></td>
                     })}
                   </tr>
@@ -717,7 +702,7 @@ export default function ProductPenetration({ accounts, salesforceBaseUrl, curren
                 <tr>
                   <th style={{ ...panelThStyle, textAlign: 'left', padding: '6px 8px', verticalAlign: 'top' }}>Have \ Also have</th>
                   {PRODUCT_KEYS.map((k) => (
-                    <th key={k} style={{ ...panelThStyle, padding: '6px 8px', verticalAlign: 'top' }}>{k}</th>
+                    <th key={k} style={{ ...panelThStyle, padding: '6px 8px', verticalAlign: 'top' }}>{PRODUCT_LABELS[k]}</th>
                   ))}
                 </tr>
               </thead>
@@ -726,11 +711,11 @@ export default function ProductPenetration({ accounts, salesforceBaseUrl, curren
                   const matrix = attachRateMatrix(accounts)
                   return PRODUCT_KEYS.map((rowKey) => (
                     <tr key={rowKey}>
-                      <td style={{ ...panelTdStyle, padding: '6px 8px', fontWeight: 500, verticalAlign: 'top' }}>{rowKey}</td>
+                      <td style={{ ...panelTdStyle, padding: '6px 8px', fontWeight: 500, verticalAlign: 'top' }}>{PRODUCT_LABELS[rowKey]}</td>
                       {PRODUCT_KEYS.map((colKey) => {
                         const pct = matrix[rowKey]?.[colKey] ?? 0
                         const isDiag = rowKey === colKey
-                        const accent = PRODUCT_ACCENTS[PRODUCT_LABELS[colKey] ?? colKey] ?? '#888'
+                        const accent = PRODUCT_ACCENTS[colKey] ?? '#888'
                         return (
                           <td key={colKey} style={{ padding: '6px 8px', textAlign: 'center', verticalAlign: 'top' }}>
                             <span
@@ -817,7 +802,7 @@ export default function ProductPenetration({ accounts, salesforceBaseUrl, curren
                 <tr>
                   <th style={{ ...panelThStyle, textAlign: 'left', padding: '6px 8px', verticalAlign: 'top' }}>Have</th>
                   {PRODUCT_KEYS.map((colKey) => (
-                    <th key={colKey} style={{ ...panelThStyle, padding: '6px 8px', verticalAlign: 'top' }}>Missing {colKey}</th>
+                    <th key={colKey} style={{ ...panelThStyle, padding: '6px 8px', verticalAlign: 'top' }}>Missing {PRODUCT_LABELS[colKey]}</th>
                   ))}
                 </tr>
               </thead>
@@ -827,13 +812,13 @@ export default function ProductPenetration({ accounts, salesforceBaseUrl, curren
                   const row = ws[rowKey] ?? {}
                   return (
                     <tr key={rowKey}>
-                      <td style={{ ...panelTdStyle, padding: '6px 8px', fontWeight: 500, verticalAlign: 'top' }}>{rowKey}</td>
+                      <td style={{ ...panelTdStyle, padding: '6px 8px', fontWeight: 500, verticalAlign: 'top' }}>{PRODUCT_LABELS[rowKey]}</td>
                       {PRODUCT_KEYS.map((colKey) => {
                         if (rowKey === colKey) {
                           return <td key={colKey} style={{ padding: '6px 8px', textAlign: 'center', color: 'var(--text-muted)', verticalAlign: 'top' }}>—</td>
                         }
                         const count = row[colKey] ?? 0
-                        const accent = PRODUCT_ACCENTS[PRODUCT_LABELS[colKey] ?? colKey] ?? '#888'
+                        const accent = PRODUCT_ACCENTS[colKey] ?? '#888'
                         return (
                           <td key={colKey} style={{ padding: '6px 8px', textAlign: 'center', verticalAlign: 'top' }}>
                             <span style={{ color: count > 0 ? accent : 'var(--text-muted)', fontWeight: count > 0 ? 600 : 400 }}>
@@ -1002,46 +987,31 @@ export default function ProductPenetration({ accounts, salesforceBaseUrl, curren
   )
 }
 
-/** Map backend by_product (product name → ARR) to the 4 product booleans and per-product ARR. Includes account_name/account_id when present. */
-export function accountsFromByProduct(
-  rows: { by_product: Record<string, number>; account_name?: string | null; account_id?: string | null }[]
+/** Map the analytics per-account reconciled family ARR (by_group: crm | icampaign | iq_mr | rvk | other)
+ *  to the product-penetration booleans + per-family ARR. Mirrors the ARR bridges, so the same accounts
+ *  and ARR appear here as in the bridges (Alleva included). `arr` is the account's total month-end ARR. */
+export function accountsFromByGroup(
+  rows: { by_group: Record<string, number>; arr?: number; account_name?: string | null; account_id?: string | null }[]
 ): ProductPenetrationAccount[] {
   return rows.map((row) => {
-    const bp = row.by_product || {}
-    const getVal = (name: string) => (typeof bp[name] === 'number' ? bp[name] : 0) as number
-    const p = (name: string) => getVal(name) > 0
-    const hasCrm =
-      p('CRM Platform') || p('CRM Billing Platform') || p('Add. CRM Seats')
-    const hasIq = p('IQ Platform') || p('Add. MR/ IQ Locations')
-    const hasICampaign = p('iCampaign Platform')
-    const hasMr = p('MR Platform')
-    const arrCrm = getVal('CRM Platform') + getVal('CRM Billing Platform') + getVal('Add. CRM Seats')
-    const arrIq = getVal('IQ Platform') + getVal('Add. MR/ IQ Locations')
-    const arrICampaign = getVal('iCampaign Platform')
-    const arrMr = getVal('MR Platform')
+    const g = row.by_group || {}
+    const val = (key: string) => (typeof g[key] === 'number' ? (g[key] as number) : 0)
+    const arrCrm = val('crm')
+    const arrICampaign = val('icampaign')
+    const arrIqMr = val('iq_mr')
+    const arrRvk = val('rvk')
     return {
-      hasCrm,
-      hasIq,
-      hasICampaign,
-      hasMr,
+      hasCrm: arrCrm > 0,
+      hasICampaign: arrICampaign > 0,
+      hasIqMr: arrIqMr > 0,
+      hasRvk: arrRvk > 0,
       accountName: row.account_name ?? null,
       accountId: row.account_id ?? null,
+      arr: typeof row.arr === 'number' ? row.arr : undefined,
       arrCrm: arrCrm > 0 ? arrCrm : undefined,
-      arrIq: arrIq > 0 ? arrIq : undefined,
       arrICampaign: arrICampaign > 0 ? arrICampaign : undefined,
-      arrMr: arrMr > 0 ? arrMr : undefined,
+      arrIqMr: arrIqMr > 0 ? arrIqMr : undefined,
+      arrRvk: arrRvk > 0 ? arrRvk : undefined,
     }
-  })
-}
-
-/** Like accountsFromByProduct but adds arr from by_month[monthKey] when present. Use for revenue-by-depth. */
-export function accountsFromByProductWithArr(
-  rows: { by_product: Record<string, number>; by_month?: Record<string, number>; account_name?: string | null; account_id?: string | null }[],
-  monthKey: string
-): ProductPenetrationAccount[] {
-  return rows.map((row) => {
-    const base = accountsFromByProduct([row])[0]
-    const arr = row.by_month && typeof row.by_month[monthKey] === 'number' ? row.by_month[monthKey] : undefined
-    return { ...base, arr }
   })
 }

@@ -526,6 +526,11 @@ function BridgeDetailTable({ bridge, retention, yoyByMonth }: {
             { key: 'expansion',      label: '+ Expansion',    color: C_EXPANSION,   bold: false },
             { key: 'contraction',    label: '− Contraction',  color: C_CONTRACTION, bold: false },
             { key: 'churn',          label: '− Churn',        color: C_CHURN,       bold: false },
+            // Reclassification only appears on the product bridges (within-account product swaps that
+            // net to $0 across products); hidden on the Total, which has no reclassification.
+            ...(bridge.some((b) => Math.round((b as any).reclassification ?? 0) !== 0)
+              ? [{ key: 'reclassification', label: '± Reclassification', color: 'var(--text-muted)', bold: false }]
+              : []),
             { key: 'ending_arr',     label: 'Ending ARR',     color: 'var(--text)', bold: true  },
           ].map(({ key, label, color, bold }) => (
             <tr key={key} style={{ borderBottom: key === 'ending_arr' ? '2px solid var(--border)' : '1px solid var(--border)' }}>

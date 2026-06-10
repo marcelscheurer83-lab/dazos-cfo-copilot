@@ -582,27 +582,32 @@ export async function exportARRToGoogleSheet(): Promise<{ ok: boolean; error?: s
   return data
 }
 
-/** Analytics: Active ARR by product group as of a specific date (default = last day of previous month). */
+/** Analytics: Active ARR by product line as of a month-end (default = last day of previous month).
+ *  Uses the same reconciled split as the ARR bridges, so the totals tie to the Total ARR bridge.
+ *  Product family keys: crm, icampaign, iq_mr, rvk, other. */
 export type ActiveARRAnalyticsGroup = {
+  /** Family key (crm | icampaign | iq_mr | rvk | other). */
+  key: string
   label: string
   arr: number
-  arr_smb_mm?: number
-  arr_enterprise?: number
+  /** Share of the grand total (%). */
+  mix: number
 }
 
-export type ActiveARRAnalyticsOtherItem = {
-  product: string
+/** Per-account reconciled family ARR for the penetration / white-space panels. */
+export type ActiveARRAnalyticsAccount = {
+  account_id: string | null
+  account_name: string
   arr: number
+  by_group: Record<string, number>
 }
 
 export type ActiveARRAnalyticsResponse = {
   as_of: string
+  month_key?: string
   groups: ActiveARRAnalyticsGroup[]
-  by_segment?: ActiveARRAnalyticsGroup[]
   grand_total: number
-  other_breakdown?: ActiveARRAnalyticsOtherItem[]
-  unmapped_accounts?: { account_id: string | null; account_name: string; arr: number }[]
-  other_accounts?: { account_id: string | null; account_name: string; product: string; arr: number }[]
+  accounts?: ActiveARRAnalyticsAccount[]
   salesforce_base_url?: string
 }
 
@@ -1265,6 +1270,8 @@ export type ArrBridgeMonth = {
   expansion: number
   contraction: number
   churn: number
+  /** Within-account product reclassification (product bridges only; nets to $0 across products) */
+  reclassification?: number
   net_change: number
   ending_arr: number
 }

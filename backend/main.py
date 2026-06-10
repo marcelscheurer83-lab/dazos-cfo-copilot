@@ -3783,7 +3783,8 @@ _PRODUCT_GROUP_PREDICATES: dict[str, Callable[[str | None], bool]] = {
 
 
 def _product_group_arr_by_opp(lines: list, predicate) -> dict[str, float]:
-    """ARR per opportunity for the subset of line items matching ``predicate`` (period-weighted by product)."""
+    """ARR per opportunity for the subset of line items matching ``predicate``, used as a product-mix
+    weight (ARR__c-preferred, MRR×12 fallback when ARR__c is blank — see _arr_mix_contribution_for_line_group)."""
     groups: dict[tuple[str, str], list] = {}
     for li in lines:
         raw = _normalized_product_name(li.product_name)
@@ -3797,7 +3798,7 @@ def _product_group_arr_by_opp(lines: list, predicate) -> dict[str, float]:
     for (opp_id, _pk), items in groups.items():
         if not opp_id:
             continue
-        out[opp_id] = out.get(opp_id, 0.0) + _arr_contribution_for_line_group(items)
+        out[opp_id] = out.get(opp_id, 0.0) + _arr_mix_contribution_for_line_group(items)
     return out
 
 
@@ -3938,9 +3939,16 @@ def _arr_contribution_for_line_group(items: list) -> float:
     arr_vals = [getattr(li, "arr", None) for li in items]
     if items and all(a is not None for a in arr_vals):
         return round(sum(float(a) for a in arr_vals), 2)
+    return _legacy_period_weighted_arr(items)
+
+
+def _legacy_period_weighted_arr(items: list) -> float:
+    """Legacy period-weighted MRR×12 ARR: (Σ term_i × monthly_i) / (Σ term_i) × 12.
+
+    Used as a fallback when the Salesforce ARR__c field isn't populated. ``total_price`` is monthly.
+    """
     total_revenue = 0.0
     total_months = 0.0
-    has_term = False
     for li in items:
         m = _line_item_effective_total(li)
         term = getattr(li, "term_months", None)
@@ -3953,7 +3961,6 @@ def _arr_contribution_for_line_group(items: list) -> float:
                 except (TypeError, ValueError):
                     term = None
         if term is not None and term > 0:
-            has_term = True
             total_revenue += term * m
             total_months += term
         else:
@@ -3963,6 +3970,20 @@ def _arr_contribution_for_line_group(items: list) -> float:
     if total_months <= 0:
         return sum(_line_item_effective_total(li) for li in items) * ARR_MULTIPLIER
     return (total_revenue / total_months) * 12
+
+
+def _arr_mix_contribution_for_line_group(items: list) -> float:
+    """ARR for a line group used **only as a product-mix weight** in the reconciled product bridges.
+
+    Prefers the ARR__c field, but falls back to period-weighted MRR×12 whenever ARR__c sums to 0
+    (e.g. the contract active at a given month-end has a blank ARR__c, while the populated value lives
+    on a future renewal opp). The mix only needs relative weights, and ``total_price`` (MRR) is always
+    present, so this keeps a product signal for those accounts instead of dumping them into 'Other'.
+    """
+    arr_sum = sum(float(getattr(li, "arr", 0.0) or 0.0) for li in items)
+    if arr_sum > 0:
+        return round(arr_sum, 2)
+    return _legacy_period_weighted_arr(items)
 
 
 def _arr_contribution_and_math_for_line_group(items: list) -> tuple[float, list[dict], str, float]:
@@ -5258,7 +5279,7 @@ async def _compute_active_arr_rows(
 
     crm_arr_by_opp: dict[str, float] = {}
     for (opp_id, _kind), items in crm_sku_groups.items():
-        arr = _arr_contribution_for_line_group(items)
+        arr = _arr_mix_contribution_for_line_group(items)
         crm_arr_by_opp[opp_id] = crm_arr_by_opp.get(opp_id, 0.0) + arr
 
     crm_arr_by_account: dict[tuple[str | None, str | None], float] = {}

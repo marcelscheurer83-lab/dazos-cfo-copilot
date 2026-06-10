@@ -3,7 +3,7 @@ import {
   ComposedChart, Bar, Line, XAxis, YAxis, CartesianGrid, Tooltip,
   Legend, ResponsiveContainer, LineChart, ReferenceLine,
 } from 'recharts'
-import { getArrBridge, getProductArrBridge, exportArrBridgeToSheet, getBridgeAccounts, getDatasetStatus, refreshAppDataset, formatLastUpdated, ArrBridgeResponse, ArrBridgeMonth, ArrRetentionMonth, ArrYoyMonth, BridgeAccountRow, type DatasetStatus } from '../api'
+import { getArrBridge, getAllProductArrBridges, exportArrBridgeToSheet, getBridgeAccounts, getDatasetStatus, refreshAppDataset, formatLastUpdated, ArrBridgeResponse, ArrBridgeMonth, ArrRetentionMonth, ArrYoyMonth, ProductBridge, BridgeAccountRow, type DatasetStatus } from '../api'
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -100,6 +100,9 @@ export default function ARRBridge() {
   const [exporting, setExporting] = useState(false)
   const [exportMsg, setExportMsg] = useState<{ ok: boolean; text: string; url?: string } | null>(null)
 
+  const [products, setProducts] = useState<ProductBridge[] | null>(null)
+  const [productsError, setProductsError] = useState<string | null>(null)
+
   const handleExportBridges = async () => {
     setExporting(true)
     setExportMsg(null)
@@ -120,6 +123,9 @@ export default function ARRBridge() {
     getArrBridge()
       .then((res) => { setData(res); setLoading(false) })
       .catch((e: unknown) => { setError(e instanceof Error ? e.message : String(e)); setLoading(false) })
+    getAllProductArrBridges()
+      .then((res) => { setProducts(res.products); setProductsError(res.message ?? null) })
+      .catch((e: unknown) => setProductsError(e instanceof Error ? e.message : String(e)))
     getDatasetStatus().then(setDatasetStatus).catch(() => {})
   }, [])
 
@@ -482,11 +488,17 @@ export default function ARRBridge() {
       </div>
       <BridgeDetailTable bridge={bridge} retention={retention} yoyByMonth={yoyByMonth} />
 
-      {/* ── per-product bridge tables ── */}
-      <ProductBridgeDetail product="crm" title="Bridge: CRM" />
-      <ProductBridgeDetail product="icampaign" title="Bridge: iCampaign" />
-      <ProductBridgeDetail product="iq_mr" title="Bridge: IQ & Marketing Reports" />
-      <ProductBridgeDetail product="rvk" title="Bridge: RVK Agents" />
+      {/* ── per-product bridge tables (reconciled: products sum to Total each month) ── */}
+      <p style={{ margin: '2.25rem 0 0', fontSize: '0.78rem', color: 'var(--text-muted)', paddingLeft: 64, paddingRight: 64 }}>
+        Each account's monthly Total ARR is split across product families by its Salesforce line-item mix,
+        so the product Ending ARR below sums exactly to the Total bridge every month.
+      </p>
+      {productsError && !products && (
+        <div style={{ padding: '1rem 64px', color: 'var(--text-muted)', fontSize: '0.85rem' }}>{productsError}</div>
+      )}
+      {(products ?? []).map((p) => (
+        <ProductBridgeDetail key={p.product} product={p} title={`Bridge: ${p.product_label}`} />
+      ))}
     </div>
   )
 }
@@ -562,38 +574,20 @@ function BridgeDetailTable({ bridge, retention, yoyByMonth }: {
   )
 }
 
-// ── per-product bridge detail (fetches its own data) ───────────────────────────
+// ── per-product bridge detail (data supplied by parent) ────────────────────────
 
-function ProductBridgeDetail({ product, title }: { product: string; title: string }) {
-  const [data, setData] = useState<ArrBridgeResponse | null>(null)
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState<string | null>(null)
-
-  useEffect(() => {
-    setLoading(true)
-    setError(null)
-    getProductArrBridge(product)
-      .then((res) => { setData(res); setLoading(false) })
-      .catch((e: unknown) => { setError(e instanceof Error ? e.message : String(e)); setLoading(false) })
-  }, [product])
-
-  const yoyByMonth = Object.fromEntries((data?.yoy ?? []).map((y) => [y.month, y.yoy_pct]))
+function ProductBridgeDetail({ product, title }: { product: ProductBridge; title: string }) {
+  const yoyByMonth = Object.fromEntries((product.yoy ?? []).map((y) => [y.month, y.yoy_pct]))
 
   return (
     <div style={{ marginTop: '2.5rem' }}>
       <h2 style={{ margin: '0 0 0.75rem', fontSize: '1rem', fontWeight: 600, color: 'var(--text)' }}>
         {title}
       </h2>
-      {loading ? (
-        <div style={{ padding: '1rem', color: 'var(--text-muted)', fontSize: '0.85rem' }}>Loading…</div>
-      ) : error ? (
-        <div style={{ padding: '1rem', color: 'var(--negative)', fontSize: '0.85rem' }}>Error: {error}</div>
-      ) : !data || data.bridge.length === 0 ? (
-        <div style={{ padding: '1rem', color: 'var(--text-muted)', fontSize: '0.85rem' }}>
-          {data?.message ?? 'No data.'}
-        </div>
+      {product.bridge.length === 0 ? (
+        <div style={{ padding: '1rem', color: 'var(--text-muted)', fontSize: '0.85rem' }}>No data.</div>
       ) : (
-        <BridgeDetailTable bridge={data.bridge} retention={data.retention} yoyByMonth={yoyByMonth} />
+        <BridgeDetailTable bridge={product.bridge} retention={product.retention} yoyByMonth={yoyByMonth} />
       )}
     </div>
   )

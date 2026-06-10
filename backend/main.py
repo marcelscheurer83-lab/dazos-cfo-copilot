@@ -3742,6 +3742,17 @@ def _is_iq_mr_product(product_name: str | None) -> bool:
     return _is_iq_product(product_name) or _is_marketing_reports_product(product_name)
 
 
+def _is_other_product(product_name: str | None) -> bool:
+    """'Other' family: any ARR-included SKU not in CRM / iCampaign / IQ&MR / RVK
+    (e.g. Billing Company CRM Platform). Lines are pre-filtered by _include_line_item_in_arr."""
+    return not (
+        _is_crm_product(product_name)
+        or _is_icampaign_product(product_name)
+        or _is_iq_mr_product(product_name)
+        or _is_rvk_agent_product(product_name)
+    )
+
+
 _RVK_AGENT_KEYS = frozenset({
     "dazos iconnect", "dazos iscreen", "dazos iassist", "dazos irecover", "dazos idirect",
 })
@@ -3760,6 +3771,7 @@ _PRODUCT_GROUP_PREDICATES: dict[str, Callable[[str | None], bool]] = {
     "marketing_reports": _is_marketing_reports_product,
     "iq_mr": _is_iq_mr_product,
     "rvk": _is_rvk_agent_product,
+    "other": _is_other_product,
 }
 
 
@@ -7805,11 +7817,19 @@ def _build_bridge_from_arr_map(
     arr_map: dict[str, dict[str, float]],
     display_months: list[str],
     yoy_months: list[str],
+    logo_totals: Optional[dict[str, dict[str, float]]] = None,
 ) -> dict:
     """Shared ARR-bridge / retention / YoY math, given arr_map[account][YYYY-MM] = arr.
 
-    Same component rules as /api/arr-bridge (month M vs M-1): New Business (0→>0), Expansion (up),
-    Contraction (down, still >0), Churn (>0→0). Trailing-12M NRR/GRR use the M-12 cohort.
+    Components for month M vs M-1: New Business, Expansion, Contraction, Churn. Trailing-12M NRR/GRR
+    use the M-12 cohort.
+
+    ``logo_totals`` (account → month → total account ARR) drives New-Business-vs-Expansion at the
+    product level: a product increase counts as New Business only when the *account* was new
+    (total ARR 0 in M-1); otherwise it's Expansion (e.g. cross-sell of a new product into an existing
+    account). On the down side, a product decrease is Churn only when the account fully churned
+    (total ARR 0 in M); otherwise it's Contraction. When ``logo_totals`` is None, the product's own
+    presence is used (legacy behaviour).
     """
     all_accounts = list(arr_map.keys())
 
@@ -7818,6 +7838,11 @@ def _build_bridge_from_arr_map(
 
     def total_arr(mk: str) -> float:
         return round(sum(arr_map.get(a, {}).get(mk, 0.0) for a in all_accounts), 2)
+
+    def logo_arr(account: str, mk: str) -> float:
+        if logo_totals is None:
+            return get_arr(account, mk)
+        return logo_totals.get(account, {}).get(mk, 0.0)
 
     bridge: list[dict] = []
     retention: list[dict] = []
@@ -7828,14 +7853,18 @@ def _build_bridge_from_arr_map(
         for acc in all_accounts:
             a_prior = get_arr(acc, prior_mk)
             a_curr = get_arr(acc, mk)
-            if a_prior == 0.0 and a_curr > 0.0:
-                new_biz += a_curr
-            elif a_prior > 0.0 and a_curr > a_prior:
-                exp += a_curr - a_prior
-            elif a_prior > 0.0 and 0.0 < a_curr < a_prior:
-                ctr += a_prior - a_curr
-            elif a_prior > 0.0 and a_curr == 0.0:
-                churn += a_prior
+            if a_curr > a_prior:
+                # Increase: New Business only for brand-new logos, else Expansion (incl. cross-sell).
+                if logo_arr(acc, prior_mk) <= 0.0:
+                    new_biz += a_curr - a_prior
+                else:
+                    exp += a_curr - a_prior
+            elif a_curr < a_prior:
+                # Decrease: Churn only when the whole logo churned, else Contraction.
+                if logo_arr(acc, mk) <= 0.0:
+                    churn += a_prior - a_curr
+                else:
+                    ctr += a_prior - a_curr
         end = total_arr(mk)
         bridge.append({
             "month": mk,
@@ -7881,11 +7910,14 @@ def _build_bridge_from_arr_map(
 # Per-product ARR bridges. Group key → display label. CRM = Seat-Pricing 'CRM ARR'
 # (CRM Platform Legacy + Includes-5-Seats + Additional CRM Seats; excludes Billing CRM).
 # Order here is the display/export order.
+# Product families for the reconciled bridges. These cover ALL ARR-included SKUs, so the
+# product bridges sum exactly to the Total bridge each month. Order = display/export order.
 _PRODUCT_BRIDGE_DEFS: dict[str, str] = {
     "crm": "CRM",
     "icampaign": "iCampaign",
     "iq_mr": "IQ & Marketing Reports",
     "rvk": "RVK Agents",
+    "other": "Other",
 }
 
 
@@ -7918,26 +7950,16 @@ async def _product_arr_map(db: AsyncSession, group_key: str, month_keys: list[st
     return arr_map
 
 
-@app.get("/api/arr-bridge/by-product")
-async def get_arr_bridge_by_product(
-    product: str = Query("crm", description="Product family key: crm | icampaign | iq_mr | rvk."),
-    db: AsyncSession = Depends(get_db),
-):
-    """ARR bridge (waterfall) + trailing-12M GRR/NRR for a single product family, last 13 months.
+async def _compute_all_product_bridges(db: AsyncSession) -> dict:
+    """Reconciled per-product ARR bridges that sum exactly to the Total bridge each month.
 
-    Uses the same per-account month-end product ARR as the Seat Pricing view (Salesforce line items,
-    point-in-time per month-end, Alleva-scaled), so per-product numbers reconcile with that view.
-    Because per-product history comes from Salesforce line items (the ARR_Schedule sheet that powers
-    the total bridge has no product split), product bridges need not sum exactly to the total bridge.
+    Method: take the authoritative per-account monthly Total ARR (the same MonthlyArrSnapshot that
+    powers /api/arr-bridge) and split it across product families using each account's Salesforce
+    line-item product mix for that month-end. Families cover every ARR-included SKU (CRM, iCampaign,
+    IQ & Marketing Reports, RVK Agents, and an 'Other' catch-all), and rounding residue lands in
+    'Other', so Σ products = Total to the cent. New Business vs Expansion is logo-based (a product
+    increase is New Business only for a brand-new account; otherwise Expansion, incl. cross-sell).
     """
-    key = (product or "").strip().lower()
-    label = _PRODUCT_BRIDGE_DEFS.get(key)
-    if not label:
-        return {
-            "bridge": [], "retention": [], "yoy": [], "display_months": [],
-            "message": f"Unknown product '{product}'. Available: {', '.join(_PRODUCT_BRIDGE_DEFS)}.",
-        }
-
     today_est = datetime.now(EST).date()
     current_mk = today_est.strftime("%Y-%m")
     display_months: list[str] = []
@@ -7945,8 +7967,6 @@ async def get_arr_bridge_by_product(
     for _ in range(13):
         display_months.insert(0, _m.strftime("%Y-%m"))
         _m = date(_m.year - 1 if _m.month == 1 else _m.year, 12 if _m.month == 1 else _m.month - 1, 1)
-
-    # Compute monthly product ARR from M-13 of the earliest shown month (for T12M / beginning ARR) → current.
     fetch_from = _mk_offset(display_months[0], -13)
     month_keys: list[str] = []
     _cur = fetch_from
@@ -7954,24 +7974,107 @@ async def get_arr_bridge_by_product(
         month_keys.append(_cur)
         _cur = _mk_offset(_cur, 1)
 
-    arr_map = await _product_arr_map(db, key, month_keys)
+    # Authoritative per-account monthly Total ARR (same source as /api/arr-bridge).
+    snap_rows = (
+        await db.execute(
+            select(MonthlyArrSnapshot)
+            .where(MonthlyArrSnapshot.month_key >= fetch_from)
+            .where(MonthlyArrSnapshot.month_key <= current_mk)
+        )
+    ).scalars().all()
+    snap: dict[str, dict[str, float]] = {}
+    for s in snap_rows:
+        snap.setdefault(s.account_name, {})[s.month_key] = float(s.arr or 0.0)
 
-    if not any(arr_map.values()):
-        return {
-            "bridge": [], "retention": [], "yoy": [], "display_months": display_months,
-            "message": f"No {label} ARR found. Run 'Refresh app data' to sync Salesforce first.",
-        }
+    groups = list(_PRODUCT_BRIDGE_DEFS.keys())  # crm, icampaign, iq_mr, rvk, other
+    named_groups = [g for g in groups if g != "other"]
 
-    built = _build_bridge_from_arr_map(arr_map, display_months, month_keys)
-    return {
-        "bridge": built["bridge"],
-        "retention": built["retention"],
-        "yoy": built["yoy"],
-        "display_months": display_months,
-        "product": key,
-        "product_label": label,
-        "message": None,
-    }
+    # Salesforce line-item product ARR per account per month, for the product mix.
+    rows, _msg = await _compute_active_arr_rows(
+        db, apply_alleva_retained_arr_adjustment=True, crm_month_keys=month_keys, product_month_groups=groups
+    )
+    li: dict[str, dict[str, dict[str, float]]] = {}
+    for r in rows:
+        name = r.get("account_name") or "—"
+        pbm = r.get("product_arr_by_month") or {}
+        acc_li = li.setdefault(name, {})
+        for g in groups:
+            gm = pbm.get(g) or {}
+            if not gm:
+                continue
+            dst = acc_li.setdefault(g, {})
+            for mk, v in gm.items():
+                fv = float(v or 0.0)
+                if fv:
+                    dst[mk] = round(dst.get(mk, 0.0) + fv, 2)
+
+    # Allocate each account's monthly Total across families by line-item mix (residue → Other).
+    alloc: dict[str, dict[str, dict[str, float]]] = {g: {} for g in groups}
+    for acc, months in snap.items():
+        acc_li = li.get(acc, {})
+        for mk, tot in months.items():
+            if not tot:
+                continue
+            li_g = {g: acc_li.get(g, {}).get(mk, 0.0) for g in groups}
+            li_total = sum(li_g.values())
+            parts: dict[str, float] = {}
+            if li_total > 0:
+                assigned = 0.0
+                for g in named_groups:
+                    val = round(tot * li_g[g] / li_total, 2)
+                    parts[g] = val
+                    assigned += val
+                parts["other"] = round(tot - assigned, 2)  # Other's mix share + rounding residue
+            else:
+                # Account has Total ARR but no classifiable line items → all to Other.
+                for g in named_groups:
+                    parts[g] = 0.0
+                parts["other"] = round(float(tot), 2)
+            for g in groups:
+                if parts.get(g):
+                    alloc[g].setdefault(acc, {})[mk] = parts[g]
+
+    products_out: list[dict] = []
+    for g in groups:
+        built = _build_bridge_from_arr_map(alloc[g], display_months, month_keys, logo_totals=snap)
+        products_out.append({
+            "product": g,
+            "product_label": _PRODUCT_BRIDGE_DEFS[g],
+            "bridge": built["bridge"],
+            "retention": built["retention"],
+            "yoy": built["yoy"],
+        })
+    return {"display_months": display_months, "products": products_out, "has_data": bool(snap_rows)}
+
+
+@app.get("/api/arr-bridge/products")
+async def get_arr_bridge_products(db: AsyncSession = Depends(get_db)):
+    """All reconciled per-product ARR bridges (CRM, iCampaign, IQ & Marketing Reports, RVK Agents,
+    Other) in one call. Product Ending ARR sums exactly to the Total bridge each month."""
+    result = await _compute_all_product_bridges(db)
+    if not result.get("has_data"):
+        return {"display_months": result["display_months"], "products": [],
+                "message": "Monthly ARR snapshot not yet built. Run 'Refresh app data' to populate it."}
+    return {"display_months": result["display_months"], "products": result["products"], "message": None}
+
+
+@app.get("/api/arr-bridge/by-product")
+async def get_arr_bridge_by_product(
+    product: str = Query("crm", description="Product family key: crm | icampaign | iq_mr | rvk | other."),
+    db: AsyncSession = Depends(get_db),
+):
+    """Reconciled ARR bridge for a single product family (see /api/arr-bridge/products)."""
+    key = (product or "").strip().lower()
+    label = _PRODUCT_BRIDGE_DEFS.get(key)
+    if not label:
+        return {"bridge": [], "retention": [], "yoy": [], "display_months": [],
+                "message": f"Unknown product '{product}'. Available: {', '.join(_PRODUCT_BRIDGE_DEFS)}."}
+    result = await _compute_all_product_bridges(db)
+    match = next((p for p in result["products"] if p["product"] == key), None)
+    if not match:
+        return {"bridge": [], "retention": [], "yoy": [], "display_months": result["display_months"],
+                "message": f"No {label} ARR found. Run 'Refresh app data' first."}
+    return {**match, "display_months": result["display_months"], "message": None}
 
 
 # ── ARR bridge for a single month + Contracted ARR (for board-deck slide) ──────
@@ -14352,9 +14455,9 @@ async def export_arr_bridge_to_google_sheet(db: AsyncSession = Depends(get_db)):
     display_months: list[str] = total["display_months"]
 
     blocks: list[tuple[str, dict]] = [("Bridge: Total", total)]
-    for key, label in _PRODUCT_BRIDGE_DEFS.items():
-        res = await get_arr_bridge_by_product(product=key, db=db)
-        blocks.append((f"Bridge: {label}", res))
+    product_result = await _compute_all_product_bridges(db)
+    for p in product_result.get("products", []):
+        blocks.append((f"Bridge: {p['product_label']}", p))
 
     month_labels = [_short_month_label(m) for m in display_months]
     header = ["Component"] + month_labels

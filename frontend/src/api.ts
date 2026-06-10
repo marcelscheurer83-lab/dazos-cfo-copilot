@@ -1309,6 +1309,26 @@ export async function getProductArrBridge(product: string): Promise<ProductArrBr
   return r.json()
 }
 
+export type ProductBridge = {
+  product: string
+  product_label: string
+  bridge: ArrBridgeMonth[]
+  retention: ArrRetentionMonth[]
+  yoy: ArrYoyMonth[]
+}
+
+export type AllProductArrBridges = {
+  display_months: string[]
+  products: ProductBridge[]
+  message?: string | null
+}
+
+export async function getAllProductArrBridges(): Promise<AllProductArrBridges> {
+  const r = await apiFetch('/arr-bridge/products')
+  if (!r.ok) throw new Error(`Product ARR Bridges fetch failed: HTTP ${r.status}`)
+  return r.json()
+}
+
 export type ExportArrBridgeResult = {
   ok: boolean
   error?: string

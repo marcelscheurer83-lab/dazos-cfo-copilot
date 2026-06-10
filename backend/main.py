@@ -3604,6 +3604,7 @@ ARR_PRODUCT_EXCLUDE = frozenset({
     "data migration services",
     "kipu api set up",
     "customer integration development",
+    "agent implementation fee",
     # Support / non-ARR
     "premium support",
 })

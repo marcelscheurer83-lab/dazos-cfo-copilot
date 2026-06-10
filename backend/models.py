@@ -470,6 +470,7 @@ class OpportunityLineItem(Base):
     quantity = Column(Float, default=0)
     unit_price = Column(Float, default=0)
     total_price = Column(Float, default=0)  # MRR (monthly) for that segment
+    arr = Column(Float, nullable=True)  # Salesforce line-item ARR__c field — authoritative ARR, already net of partner share
     term_months = Column(Float, nullable=True)  # Term in months for this segment (enables period-weighted ARR)
     service_start_date = Column(Date, nullable=True)  # Optional; from SF ServiceDate
     service_end_date = Column(Date, nullable=True)   # Optional; from SF EndDate or custom

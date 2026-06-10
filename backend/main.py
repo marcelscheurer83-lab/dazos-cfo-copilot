@@ -304,6 +304,7 @@ async def _migrate_db() -> None:
         ("cash_flow_lines",   "is_subtotal",   "INTEGER"),
         ("pnl_lines",         "is_plan_only",  "INTEGER"),
         ("dept_detail_lines", "is_plan_only",  "INTEGER"),
+        ("opportunity_line_items", "arr",      "FLOAT"),
     ]
     async with AsyncSessionLocal() as db:
         for tbl, col, col_type in new_cols:
@@ -3464,6 +3465,10 @@ def _account_soql_health_fields() -> str:
     parts = [f for f in _ALL_ACC_HEALTH_FIELDS if f]
     return (", " + ", ".join(parts)) if parts else ""
 
+# Authoritative line-item ARR field (ARR__c) — the maintained ARR per line, already net of partner
+# revenue-share for Alleva accounts. Used directly so line-item ARR ties to the opportunity ARR__c
+# (and the board ARR basis) instead of our MRR×12 annualization. Configurable for other orgs.
+_SALESFORCE_LINE_ITEM_ARR_FIELD = (os.getenv("SALESFORCE_LINE_ITEM_ARR_FIELD") or "ARR__c").strip()
 # Optional: line item term (months) and dates for period-weighted ARR (e.g. 3 mo @ $650 + 21 mo @ $1300 -> ARR = (3*650+21*1300)/24*12).
 _SALESFORCE_LINE_ITEM_TERM_FIELD = (os.getenv("SALESFORCE_LINE_ITEM_TERM_FIELD") or "").strip()  # e.g. Term__c
 # Try these by default so period-weighted ARR works without config; sync falls back if field doesn't exist in org
@@ -3562,8 +3567,10 @@ def _line_item_soql_extra_fields(include_try_term: bool = True, include_service_
     return ", " + ", ".join(parts) if parts else ""
 
 def _line_item_soql(include_optional_term: bool = True, include_service_dates: bool = True) -> str:
+    arr_field = f", {_SALESFORCE_LINE_ITEM_ARR_FIELD}" if _SALESFORCE_LINE_ITEM_ARR_FIELD else ""
     return (
         "SELECT Id, OpportunityId, Name, Product2.Name, Quantity, UnitPrice, TotalPrice"
+        + arr_field
         + _line_item_soql_extra_fields(include_try_term=include_optional_term, include_service_dates=include_service_dates)
         + " FROM OpportunityLineItem"
     )
@@ -3919,11 +3926,18 @@ def _line_item_effective_total(li) -> float:
 
 def _arr_contribution_for_line_group(items: list) -> float:
     """
-    ARR for a group of line items (same opp + same product). When term is present (term_months or from service dates):
+    ARR for a group of line items (same opp + same product).
+
+    Primary source: the Salesforce line-item ``ARR__c`` field (``li.arr``) — the maintained ARR per
+    line, already net of partner revenue-share. When every item in the group has it, ARR = sum(arr),
+    so line-item ARR ties to the opportunity ARR__c / board basis.
+
+    Fallback (only when ARR__c is missing on any item): the legacy period-weighted MRR×12 math —
     ARR = (sum(term_i * monthly_price_i) / sum(term_i)) * 12.
-    E.g. 3 mo @ $650 + 21 mo @ $1300 -> (3*650 + 21*1300)/24 * 12 = $14,625.
-    When no term/dates: fall back to average monthly price × 12 (so multiple segments don't sum to 2x ARR).
     """
+    arr_vals = [getattr(li, "arr", None) for li in items]
+    if items and all(a is not None for a in arr_vals):
+        return round(sum(float(a) for a in arr_vals), 2)
     total_revenue = 0.0
     total_months = 0.0
     has_term = False
@@ -3956,6 +3970,13 @@ def _arr_contribution_and_math_for_line_group(items: list) -> tuple[float, list[
     Same logic as _arr_contribution_for_line_group but returns (arr, segments_math, formula_text, total_term_months).
     segments_math: list of { monthly, term_months, term_times_monthly }.
     """
+    arr_vals = [getattr(li, "arr", None) for li in items]
+    if items and all(a is not None for a in arr_vals):
+        arr = round(sum(float(a) for a in arr_vals), 2)
+        seg = [{"monthly": round(_line_item_effective_total(li), 2),
+                "term_months": getattr(li, "term_months", None),
+                "line_arr": round(float(getattr(li, "arr", 0.0) or 0.0), 2)} for li in items]
+        return arr, seg, "Σ line-item ARR__c (Salesforce field, net of partner share)", 0.0
     segments_math = []
     total_revenue = 0.0
     total_months = 0.0
@@ -4565,12 +4586,26 @@ async def _run_salesforce_sync(db: AsyncSession) -> dict:
                     term_months = round(delta / 30.44, 2)
             except (TypeError, ValueError):
                 pass
+        line_arr = None
+        if _SALESFORCE_LINE_ITEM_ARR_FIELD:
+            _arr_raw = rec.get(_SALESFORCE_LINE_ITEM_ARR_FIELD)
+            if _arr_raw is None and isinstance(rec, dict):
+                for k, v in rec.items():
+                    if k and k.lower() == _SALESFORCE_LINE_ITEM_ARR_FIELD.lower():
+                        _arr_raw = v
+                        break
+            if _arr_raw is not None:
+                try:
+                    line_arr = float(_arr_raw)
+                except (TypeError, ValueError):
+                    line_arr = None
         db.add(OpportunityLineItem(
             opportunity_sf_id=opp_sf_id,
             product_name=product_name,
             quantity=float(rec.get("Quantity") or 0),
             unit_price=float(rec.get("UnitPrice") or 0),
             total_price=total,
+            arr=line_arr,
             term_months=term_months,
             service_start_date=service_start_date,
             service_end_date=service_end_date,
@@ -5450,9 +5485,10 @@ async def _compute_active_arr_rows(
                 share_factor = share_val / 100.0 if share_val > 1.0 else share_val
                 share_factor = max(0.0, min(1.0, share_factor))
             if share_factor is not None:
+                # ARR now derives from the line-item ARR__c field, which is already net of the
+                # partner revenue-share for Alleva accounts, so we no longer scale by the factor
+                # here (doing so would double-count the partner share). Kept for transparency only.
                 alleva_retained_factor = share_factor
-                active_arr_today = round(active_arr_today * share_factor, 2)
-                contracted_arr_today = round(contracted_arr_today * share_factor, 2)
         note = account_note.get(key)
         if _account_matches_diagnostic(aname) and diagnostic_out is not None:
             diagnostic_out.append(
@@ -5510,22 +5546,14 @@ async def _compute_active_arr_rows(
             )
         crm_seats = crm_seats_by_account.get(key)
         crm_arr_val = crm_arr_by_account.get(key)
-        # Per-month CRM snapshot; apply the Alleva retained factor to ARR (seats are raw counts), to stay
-        # consistent with how by_month total ARR is scaled for Alleva Customer accounts.
+        # Per-month CRM snapshot. ARR comes from the line-item ARR__c field (already net of partner
+        # share), so no Alleva factor is applied here. Seats are raw counts.
         crm_seats_bm = crm_seats_by_account_by_month.get(key, {})
-        crm_arr_bm_raw = crm_arr_by_account_by_month.get(key, {})
-        if alleva_retained_factor is not None:
-            crm_arr_bm = {mk: round(v * alleva_retained_factor, 2) for mk, v in crm_arr_bm_raw.items()}
-        else:
-            crm_arr_bm = dict(crm_arr_bm_raw)
-        # Per-product month-end ARR (Alleva-scaled like total/CRM ARR), for per-product ARR bridges.
+        crm_arr_bm = dict(crm_arr_by_account_by_month.get(key, {}))
+        # Per-product month-end ARR (already net via ARR__c), for per-product ARR bridges.
         product_arr_bm: dict[str, dict[str, float]] = {}
         for g in _req_groups:
-            raw_bm = product_arr_by_account_by_month.get(g, {}).get(key, {})
-            if alleva_retained_factor is not None:
-                product_arr_bm[g] = {mk: round(v * alleva_retained_factor, 2) for mk, v in raw_bm.items()}
-            else:
-                product_arr_bm[g] = dict(raw_bm)
+            product_arr_bm[g] = dict(product_arr_by_account_by_month.get(g, {}).get(key, {}))
         out_rows.append({
             "account_id": aid,
             "account_name": aname or "—",

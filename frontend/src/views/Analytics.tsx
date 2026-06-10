@@ -50,6 +50,9 @@ export default function AnalyticsView() {
     }
   }
 
+  const tableTotal = groups.reduce((s, g) => s + (g.arr || 0), 0)
+  const effectiveTotal = tableTotal > 0 ? tableTotal : grandTotal
+
   return (
     <div
       style={{
@@ -126,20 +129,23 @@ export default function AnalyticsView() {
                   </tr>
                 </thead>
                 <tbody>
-                  {groups.map((g) => (
-                    <tr key={g.key} style={{ borderBottom: '1px solid var(--border)' }}>
+                  {groups.map((g) => {
+                    const mix = tableTotal > 0 && g.arr > 0 ? (g.arr / tableTotal) * 100 : 0
+                    return (
+                    <tr key={g.key ?? g.label} style={{ borderBottom: '1px solid var(--border)' }}>
                       <td style={{ padding: '0.5rem 0.75rem', color: 'var(--text)' }}>{g.label}</td>
                       <td style={{ padding: '0.5rem 0.75rem', textAlign: 'right', color: 'var(--text)' }}>{fmtMoney0(g.arr)}</td>
                       <td style={{ padding: '0.5rem 0.75rem', textAlign: 'right', color: 'var(--text-muted)' }}>
-                        {g.arr > 0 ? `${g.mix.toFixed(1)}%` : '—'}
+                        {g.arr > 0 ? `${mix.toFixed(1)}%` : '—'}
                       </td>
                     </tr>
-                  ))}
+                    )
+                  })}
                 </tbody>
                 <tfoot>
                   <tr style={{ borderTop: '2px solid var(--border)', fontWeight: 600 }}>
                     <td style={{ padding: '0.5rem 0.75rem', textAlign: 'right', color: 'var(--text-muted)' }}>Total</td>
-                    <td style={{ padding: '0.5rem 0.75rem', textAlign: 'right', color: 'var(--text)' }}>{fmtMoney0(grandTotal)}</td>
+                    <td style={{ padding: '0.5rem 0.75rem', textAlign: 'right', color: 'var(--text)' }}>{fmtMoney0(tableTotal)}</td>
                     <td style={{ padding: '0.5rem 0.75rem', textAlign: 'right', color: 'var(--text-muted)' }}>100%</td>
                   </tr>
                 </tfoot>
@@ -152,7 +158,7 @@ export default function AnalyticsView() {
             <ProductPenetration
               accounts={penetrationAccounts}
               salesforceBaseUrl={salesforceBaseUrl}
-              currentArrTotal={grandTotal}
+              currentArrTotal={effectiveTotal}
               panelsOnly
             />
           )}

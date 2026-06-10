@@ -3,7 +3,7 @@ import {
   ComposedChart, Bar, Line, XAxis, YAxis, CartesianGrid, Tooltip,
   Legend, ResponsiveContainer, LineChart, ReferenceLine,
 } from 'recharts'
-import { getArrBridge, getProductArrBridge, getBridgeAccounts, getDatasetStatus, refreshAppDataset, formatLastUpdated, ArrBridgeResponse, ArrBridgeMonth, ArrRetentionMonth, ArrYoyMonth, BridgeAccountRow, type DatasetStatus } from '../api'
+import { getArrBridge, getProductArrBridge, exportArrBridgeToSheet, getBridgeAccounts, getDatasetStatus, refreshAppDataset, formatLastUpdated, ArrBridgeResponse, ArrBridgeMonth, ArrRetentionMonth, ArrYoyMonth, BridgeAccountRow, type DatasetStatus } from '../api'
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -95,6 +95,25 @@ export default function ARRBridge() {
   const [drillAccounts, setDrillAccounts] = useState<BridgeAccountRow[]>([])
   const [drillSfBase, setDrillSfBase] = useState<string | null>(null)
   const [drillLoading, setDrillLoading] = useState(false)
+
+  // Export-to-sheet state
+  const [exporting, setExporting] = useState(false)
+  const [exportMsg, setExportMsg] = useState<{ ok: boolean; text: string; url?: string } | null>(null)
+
+  const handleExportBridges = async () => {
+    setExporting(true)
+    setExportMsg(null)
+    try {
+      const res = await exportArrBridgeToSheet()
+      setExporting(false)
+      setExportMsg(res.ok
+        ? { ok: true, text: res.message ?? 'Exported to "ARR_Bridge export".', url: res.spreadsheet_url }
+        : { ok: false, text: res.error ?? 'Export failed.' })
+    } catch (e) {
+      setExporting(false)
+      setExportMsg({ ok: false, text: e instanceof Error ? e.message : 'Export failed.' })
+    }
+  }
 
   useEffect(() => {
     setLoading(true)
@@ -439,13 +458,35 @@ export default function ARRBridge() {
       )}
 
       {/* ── bridge table (total) ── */}
-      <h2 style={{ margin: '0 0 0.75rem', fontSize: '1rem', fontWeight: 600, color: 'var(--text)' }}>
-        Bridge Detail
-      </h2>
+      <div style={{ display: 'flex', alignItems: 'center', gap: '1rem', flexWrap: 'wrap', margin: '0 0 0.75rem' }}>
+        <h2 style={{ margin: 0, fontSize: '1rem', fontWeight: 600, color: 'var(--text)' }}>
+          Bridge: Total
+        </h2>
+        <button
+          type="button"
+          onClick={handleExportBridges}
+          disabled={exporting}
+          title='Export Total + all per-product bridges to the "ARR_Bridge export" tab'
+          style={{ padding: '0.35rem 0.8rem', fontSize: '0.8rem', fontWeight: 600, cursor: exporting ? 'wait' : 'pointer', background: 'var(--accent)', color: 'var(--accent-contrast, #fff)', border: 'none', borderRadius: 6 }}
+        >
+          {exporting ? 'Exporting…' : 'Export all bridges to Sheet'}
+        </button>
+        {exportMsg && (
+          <span style={{ fontSize: '0.8rem', color: exportMsg.ok ? 'var(--text-muted)' : 'var(--negative)' }}>
+            {exportMsg.text}{' '}
+            {exportMsg.ok && exportMsg.url && (
+              <a href={exportMsg.url} target="_blank" rel="noopener noreferrer" style={{ color: 'var(--accent, #60a5fa)' }}>Open sheet</a>
+            )}
+          </span>
+        )}
+      </div>
       <BridgeDetailTable bridge={bridge} retention={retention} yoyByMonth={yoyByMonth} />
 
       {/* ── per-product bridge tables ── */}
-      <ProductBridgeDetail product="crm" title="CRM — Bridge Detail" />
+      <ProductBridgeDetail product="crm" title="Bridge: CRM" />
+      <ProductBridgeDetail product="icampaign" title="Bridge: iCampaign" />
+      <ProductBridgeDetail product="iq_mr" title="Bridge: IQ & Marketing Reports" />
+      <ProductBridgeDetail product="rvk" title="Bridge: RVK Agents" />
     </div>
   )
 }

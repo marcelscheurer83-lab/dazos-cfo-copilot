@@ -1309,6 +1309,22 @@ export async function getProductArrBridge(product: string): Promise<ProductArrBr
   return r.json()
 }
 
+export type ExportArrBridgeResult = {
+  ok: boolean
+  error?: string
+  spreadsheet_url?: string
+  rows_written?: number
+  blocks?: string[]
+  message?: string
+}
+
+export async function exportArrBridgeToSheet(): Promise<ExportArrBridgeResult> {
+  const r = await apiFetch('/export/arr-bridge-to-google-sheet', { method: 'POST' })
+  const data = await r.json()
+  if (!r.ok) return { ok: false, error: data.error ?? data.detail ?? 'Export failed' }
+  return data
+}
+
 export type BridgeAccountRow = {
   account_name: string
   arr: number

@@ -14,7 +14,7 @@ from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
-from typing import Any, List, Optional
+from typing import Any, Callable, List, Optional
 
 from dotenv import load_dotenv, dotenv_values
 from fastapi import FastAPI, Depends, HTTPException, Query
@@ -3702,6 +3702,86 @@ def _is_crm_platform_legacy(product_name: str | None) -> bool:
     return "crm platform" in key and "legacy" in key
 
 
+# ── Product-family SKU predicates for per-product ARR bridges ──────────────────
+# Each predicate takes the raw Salesforce product name. Lines are pre-filtered by
+# _include_line_item_in_arr (so excluded SKUs like implementation services never reach here).
+
+def _is_crm_product(product_name: str | None) -> bool:
+    """CRM family (Seat Pricing definition): CRM Platform Legacy + Includes-5-Seats + Additional CRM Seats."""
+    return (
+        _is_additional_crm_seats(product_name)
+        or _is_crm_platform_includes_5_seats(product_name)
+        or _is_crm_platform_legacy(product_name)
+    )
+
+
+def _is_icampaign_product(product_name: str | None) -> bool:
+    """iCampaign family: any iCampaign SKU (Platform, Email Only/SMS tiers, legacy tiers, Enterprise)."""
+    return "icampaign" in _arr_product_key(product_name)
+
+
+def _is_additional_iqmr_eins(product_name: str | None) -> bool:
+    """Shared 'Additional IQ/MR EINs' add-on (allocated to IQ per CFO decision)."""
+    key = _arr_product_key(product_name)
+    return "additional" in key and "ein" in key and ("iq" in key or "mr" in key)
+
+
+def _is_iq_product(product_name: str | None) -> bool:
+    """IQ family: IQ Platform Fee + the shared Additional IQ/MR EINs add-on (allocated to IQ)."""
+    key = _arr_product_key(product_name)
+    return "iq platform" in key or _is_additional_iqmr_eins(product_name)
+
+
+def _is_marketing_reports_product(product_name: str | None) -> bool:
+    """Marketing Reports family: MR Platform Fee only (EIN add-on allocated to IQ)."""
+    return "marketing reports platform" in _arr_product_key(product_name)
+
+
+def _is_iq_mr_product(product_name: str | None) -> bool:
+    """Combined IQ & Marketing Reports family: IQ Platform + MR Platform + shared Additional IQ/MR EINs."""
+    return _is_iq_product(product_name) or _is_marketing_reports_product(product_name)
+
+
+_RVK_AGENT_KEYS = frozenset({
+    "dazos iconnect", "dazos iscreen", "dazos iassist", "dazos irecover", "dazos idirect",
+})
+
+
+def _is_rvk_agent_product(product_name: str | None) -> bool:
+    """RVK agents: the recurring Dazos i* agent SKUs (excludes one-time Agent Implementation Fee)."""
+    return _arr_product_key(product_name) in _RVK_AGENT_KEYS
+
+
+# Group key → SKU predicate. Used to compute per-account month-end ARR per product family.
+_PRODUCT_GROUP_PREDICATES: dict[str, Callable[[str | None], bool]] = {
+    "crm": _is_crm_product,
+    "icampaign": _is_icampaign_product,
+    "iq": _is_iq_product,
+    "marketing_reports": _is_marketing_reports_product,
+    "iq_mr": _is_iq_mr_product,
+    "rvk": _is_rvk_agent_product,
+}
+
+
+def _product_group_arr_by_opp(lines: list, predicate) -> dict[str, float]:
+    """ARR per opportunity for the subset of line items matching ``predicate`` (period-weighted by product)."""
+    groups: dict[tuple[str, str], list] = {}
+    for li in lines:
+        raw = _normalized_product_name(li.product_name)
+        if not _include_line_item_in_arr(raw, li.product_name):
+            continue
+        if not predicate(li.product_name):
+            continue
+        pk = _arr_product_key(raw) or _arr_product_key(li.product_name) or "other"
+        groups.setdefault(((li.opportunity_sf_id or "").strip(), pk), []).append(li)
+    out: dict[str, float] = {}
+    for (opp_id, _pk), items in groups.items():
+        if not opp_id:
+            continue
+        out[opp_id] = out.get(opp_id, 0.0) + _arr_contribution_for_line_group(items)
+    return out
+
+
 def _crm_seats_for_opportunity_lines(opp_sf_id: str, lines: list) -> int:
     """Additional CRM Seats quantities + 5 if any 'CRM Platform (Includes 5 Seats)' line (same rules as schedule)."""
     oid = (opp_sf_id or "").strip()
@@ -4733,6 +4813,7 @@ async def _compute_active_arr_rows(
     diagnostic_account_name_substring: Optional[str] = None,
     diagnostic_out: Optional[list] = None,
     crm_month_keys: Optional[list[str]] = None,
+    product_month_groups: Optional[list[str]] = None,
 ) -> tuple[list[dict], Optional[str]]:
     """Compute active ARR rows (subscription start/end, ARR per account).
 
@@ -5149,6 +5230,16 @@ async def _compute_active_arr_rows(
         _y, _m = int(_mk[:4]), int(_mk[5:7])
         _month_end_dates.append((_mk, date(_y, _m, calendar.monthrange(_y, _m)[1])))
 
+    # Per-product ARR per opportunity for each requested product family (for per-product ARR bridges).
+    _req_groups = [g for g in (product_month_groups or []) if g in _PRODUCT_GROUP_PREDICATES]
+    product_arr_by_opp: dict[str, dict[str, float]] = {
+        g: _product_group_arr_by_opp(lines, _PRODUCT_GROUP_PREDICATES[g]) for g in _req_groups
+    }
+    # product_arr_by_account_by_month[group][account_key][month_key] = arr
+    product_arr_by_account_by_month: dict[str, dict[tuple[str | None, str | None], dict[str, float]]] = {
+        g: {} for g in _req_groups
+    }
+
     crm_seats_by_account_by_month: dict[tuple[str | None, str | None], dict[str, int]] = {}
     crm_arr_by_account_by_month: dict[tuple[str | None, str | None], dict[str, float]] = {}
     for key in account_keys:
@@ -5157,11 +5248,14 @@ async def _compute_active_arr_rows(
         closed_expansions_key = [o for o in cw_for_account if _is_expansion(o)]
         seats_bm: dict[str, int] = {}
         arr_bm: dict[str, float] = {}
+        prod_bm: dict[str, dict[str, float]] = {g: {} for g in _req_groups}
         for _mk, _me in _month_end_dates:
             p_hit = next((p for p in periods if p["start"] <= _me <= p["end"]), None)
             if p_hit is None:
                 seats_bm[_mk] = 0
                 arr_bm[_mk] = 0.0
+                for g in _req_groups:
+                    prod_bm[g][_mk] = 0.0
                 continue
             opp_ids_me: set[str] = {p_hit["opp"].sf_id} if p_hit["opp"].sf_id else set()
             for o in closed_expansions_key:
@@ -5174,8 +5268,13 @@ async def _compute_active_arr_rows(
                     opp_ids_me.add(o.sf_id)
             seats_bm[_mk] = sum(seats_by_opp.get(oid, 0) for oid in opp_ids_me)
             arr_bm[_mk] = round(sum(crm_arr_by_opp.get(oid, 0.0) for oid in opp_ids_me), 2)
+            for g in _req_groups:
+                gmap = product_arr_by_opp[g]
+                prod_bm[g][_mk] = round(sum(gmap.get(oid, 0.0) for oid in opp_ids_me), 2)
         crm_seats_by_account_by_month[key] = seats_bm
         crm_arr_by_account_by_month[key] = arr_bm
+        for g in _req_groups:
+            product_arr_by_account_by_month[g][key] = prod_bm[g]
 
     out_rows = []
     for (aid, aname), by_product in by_account_product.items():
@@ -5407,6 +5506,14 @@ async def _compute_active_arr_rows(
             crm_arr_bm = {mk: round(v * alleva_retained_factor, 2) for mk, v in crm_arr_bm_raw.items()}
         else:
             crm_arr_bm = dict(crm_arr_bm_raw)
+        # Per-product month-end ARR (Alleva-scaled like total/CRM ARR), for per-product ARR bridges.
+        product_arr_bm: dict[str, dict[str, float]] = {}
+        for g in _req_groups:
+            raw_bm = product_arr_by_account_by_month.get(g, {}).get(key, {})
+            if alleva_retained_factor is not None:
+                product_arr_bm[g] = {mk: round(v * alleva_retained_factor, 2) for mk, v in raw_bm.items()}
+            else:
+                product_arr_bm[g] = dict(raw_bm)
         out_rows.append({
             "account_id": aid,
             "account_name": aname or "—",
@@ -5421,6 +5528,7 @@ async def _compute_active_arr_rows(
             "crm_arr": crm_arr_val,
             "crm_seats_by_month": crm_seats_bm,
             "crm_arr_by_month": crm_arr_bm,
+            "product_arr_by_month": product_arr_bm,
             "anchor_arr": anchor_arr,
             "expansions": expansions,
             "by_product": {p: by_product_arr.get(p, 0) for p in products},
@@ -7770,17 +7878,49 @@ def _build_bridge_from_arr_map(
     return {"bridge": bridge, "retention": retention, "yoy": yoy}
 
 
-# Per-product ARR bridges. Each entry: the per-account month-end ARR field produced by
-# _compute_active_arr_rows for that product family. CRM = Seat-Pricing 'CRM ARR'
-# (CRM Platform Legacy + CRM Platform Includes-5-Seats + Additional CRM Seats; excludes Billing CRM).
-_PRODUCT_BRIDGE_DEFS: dict[str, dict] = {
-    "crm": {"label": "CRM", "field": "crm_arr_by_month"},
+# Per-product ARR bridges. Group key → display label. CRM = Seat-Pricing 'CRM ARR'
+# (CRM Platform Legacy + Includes-5-Seats + Additional CRM Seats; excludes Billing CRM).
+# Order here is the display/export order.
+_PRODUCT_BRIDGE_DEFS: dict[str, str] = {
+    "crm": "CRM",
+    "icampaign": "iCampaign",
+    "iq_mr": "IQ & Marketing Reports",
+    "rvk": "RVK Agents",
 }
+
+
+async def _product_arr_map(db: AsyncSession, group_key: str, month_keys: list[str]) -> dict[str, dict[str, float]]:
+    """Per-account month-end ARR for one product family: arr_map[account][YYYY-MM] = arr (Alleva-scaled).
+
+    CRM reads the always-computed ``crm_arr_by_month``; other families compute ``product_arr_by_month[group]``.
+    """
+    use_crm_field = group_key == "crm"
+    rows, _msg = await _compute_active_arr_rows(
+        db,
+        apply_alleva_retained_arr_adjustment=True,
+        crm_month_keys=month_keys,
+        product_month_groups=None if use_crm_field else [group_key],
+    )
+    arr_map: dict[str, dict[str, float]] = {}
+    for r in rows:
+        if use_crm_field:
+            bm = r.get("crm_arr_by_month") or {}
+        else:
+            bm = (r.get("product_arr_by_month") or {}).get(group_key) or {}
+        if not bm:
+            continue
+        name = r.get("account_name") or "—"
+        d = arr_map.setdefault(name, {})
+        for mk, v in bm.items():
+            fv = float(v or 0.0)
+            if fv:
+                d[mk] = round(d.get(mk, 0.0) + fv, 2)
+    return arr_map
 
 
 @app.get("/api/arr-bridge/by-product")
 async def get_arr_bridge_by_product(
-    product: str = Query("crm", description="Product family key, e.g. 'crm'."),
+    product: str = Query("crm", description="Product family key: crm | icampaign | iq_mr | rvk."),
     db: AsyncSession = Depends(get_db),
 ):
     """ARR bridge (waterfall) + trailing-12M GRR/NRR for a single product family, last 13 months.
@@ -7791,11 +7931,11 @@ async def get_arr_bridge_by_product(
     the total bridge has no product split), product bridges need not sum exactly to the total bridge.
     """
     key = (product or "").strip().lower()
-    pdef = _PRODUCT_BRIDGE_DEFS.get(key)
-    if not pdef:
+    label = _PRODUCT_BRIDGE_DEFS.get(key)
+    if not label:
         return {
             "bridge": [], "retention": [], "yoy": [], "display_months": [],
-            "message": f"Unknown product '{product}'. Available: {', '.join(sorted(_PRODUCT_BRIDGE_DEFS))}.",
+            "message": f"Unknown product '{product}'. Available: {', '.join(_PRODUCT_BRIDGE_DEFS)}.",
         }
 
     today_est = datetime.now(EST).date()
@@ -7814,27 +7954,12 @@ async def get_arr_bridge_by_product(
         month_keys.append(_cur)
         _cur = _mk_offset(_cur, 1)
 
-    rows, _msg = await _compute_active_arr_rows(
-        db, apply_alleva_retained_arr_adjustment=True, crm_month_keys=month_keys
-    )
-
-    field = pdef["field"]
-    arr_map: dict[str, dict[str, float]] = {}
-    for r in rows:
-        bm = r.get(field) or {}
-        if not bm:
-            continue
-        name = r.get("account_name") or "—"
-        d = arr_map.setdefault(name, {})
-        for mk, v in bm.items():
-            fv = float(v or 0.0)
-            if fv:
-                d[mk] = round(d.get(mk, 0.0) + fv, 2)
+    arr_map = await _product_arr_map(db, key, month_keys)
 
     if not any(arr_map.values()):
         return {
             "bridge": [], "retention": [], "yoy": [], "display_months": display_months,
-            "message": f"No {pdef['label']} ARR found. Run 'Refresh app data' to sync Salesforce first.",
+            "message": f"No {label} ARR found. Run 'Refresh app data' to sync Salesforce first.",
         }
 
     built = _build_bridge_from_arr_map(arr_map, display_months, month_keys)
@@ -7844,7 +7969,7 @@ async def get_arr_bridge_by_product(
         "yoy": built["yoy"],
         "display_months": display_months,
         "product": key,
-        "product_label": pdef["label"],
+        "product_label": label,
         "message": None,
     }
 
@@ -14197,6 +14322,116 @@ async def export_copilot_arr_schedule_to_google_sheet(db: AsyncSession = Depends
         "message": f"Exported {len(values)} rows (header, Total, {num_accounts} accounts, Total) to \"Copilot ARR export\" tab."
         + (" No account data yet—sync from Salesforce first if you expect data." if num_accounts == 0 else "")
         + (" Verification read was empty — check the tab name and that the sheet is shared with the service account." if read_back_empty else ""),
+    }
+
+
+ARR_BRIDGE_EXPORT_SHEET = "ARR_Bridge export"
+
+
+def _fmt_pct_export(p) -> str:
+    """Percent for spreadsheet export, e.g. 78.2 -> '78.2%'; None -> ''."""
+    if p is None:
+        return ""
+    try:
+        return f"{float(p):.1f}%"
+    except (TypeError, ValueError):
+        return ""
+
+
+@app.post("/api/export/arr-bridge-to-google-sheet")
+async def export_arr_bridge_to_google_sheet(db: AsyncSession = Depends(get_db)):
+    """Export the Total ARR bridge and every per-product bridge (CRM, iCampaign, IQ,
+    Marketing Reports, RVK Agents) to the "ARR_Bridge export" tab in the financial model
+    (GOOGLE_SHEET_ID). Each bridge is one block (title, header, the 6 component rows +
+    YoY / NRR / GRR), stacked vertically with a spacer row between blocks."""
+    from connectors.google_sheets import GoogleSheetsConnector
+
+    total = await get_arr_bridge(db)
+    if not total.get("bridge"):
+        return {"ok": False, "error": total.get("message") or "No ARR bridge data. Run 'Refresh app data' first."}
+    display_months: list[str] = total["display_months"]
+
+    blocks: list[tuple[str, dict]] = [("Bridge: Total", total)]
+    for key, label in _PRODUCT_BRIDGE_DEFS.items():
+        res = await get_arr_bridge_by_product(product=key, db=db)
+        blocks.append((f"Bridge: {label}", res))
+
+    month_labels = [_short_month_label(m) for m in display_months]
+    header = ["Component"] + month_labels
+    num_cols = len(header)
+    values: list[list] = []
+
+    def _pad(row: list) -> list:
+        return row + [""] * (num_cols - len(row))
+
+    for title, data in blocks:
+        bmap = {x["month"]: x for x in (data.get("bridge") or [])}
+        ret = {r["month"]: r for r in (data.get("retention") or [])}
+        yoy = {y["month"]: y for y in (data.get("yoy") or [])}
+        values.append(_pad([title]))
+        values.append(header)
+
+        def money_row(label_: str, field: str) -> list:
+            return [label_] + [_fmt_money_export(bmap.get(m, {}).get(field) or 0) for m in display_months]
+
+        values.append(money_row("Beginning ARR", "beginning_arr"))
+        values.append(money_row("+ New Business", "new_business"))
+        values.append(money_row("+ Expansion", "expansion"))
+        values.append(money_row("- Contraction", "contraction"))
+        values.append(money_row("- Churn", "churn"))
+        values.append(money_row("Ending ARR", "ending_arr"))
+        values.append(["YoY Growth"] + [_fmt_pct_export(yoy.get(m, {}).get("yoy_pct")) for m in display_months])
+        values.append(["NRR (T12M)"] + [_fmt_pct_export(ret.get(m, {}).get("nrr_trailing_12m")) for m in display_months])
+        values.append(["GRR (T12M)"] + [_fmt_pct_export(ret.get(m, {}).get("grr_trailing_12m")) for m in display_months])
+        values.append(_pad([""]))
+
+    sheet_id = os.getenv("GOOGLE_SHEET_ID")
+    if not sheet_id:
+        return {"ok": False, "error": "GOOGLE_SHEET_ID is not set. Set it in backend/.env to the financial model spreadsheet ID."}
+    backend_dir = Path(__file__).resolve().parent
+    cred_env = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+    cred_path = cred_env
+    if cred_path and not os.path.isabs(cred_path):
+        cred_path = str(backend_dir / cred_path)
+    connector = GoogleSheetsConnector(credentials_path=cred_path or cred_env)
+    connector.set_base_path(backend_dir)
+    if not connector.is_configured():
+        return {"ok": False, "error": "Google Sheets not configured. Set GOOGLE_APPLICATION_CREDENTIALS (or GOOGLE_SHEETS_CREDENTIALS_JSON) in .env."}
+    try:
+        await asyncio.to_thread(connector.ensure_sheet_exists, ARR_BRIDGE_EXPORT_SHEET, spreadsheet_id=sheet_id)
+        exact_title = await asyncio.to_thread(connector.get_sheet_exact_title, ARR_BRIDGE_EXPORT_SHEET, sheet_id)
+        if not exact_title:
+            return {"ok": False, "error": f"Tab \"{ARR_BRIDGE_EXPORT_SHEET}\" not found after ensure. Check the spreadsheet."}
+        sheet_ref = "'" + exact_title.replace("'", "''") + "'"
+        # Clear a generous range first so a shorter export doesn't leave stale rows behind.
+        end_col = _index_to_a1_col(num_cols - 1)
+        await asyncio.to_thread(connector.update_range, f"{sheet_ref}!A1:{end_col}400",
+                                [["" for _ in range(num_cols)] for _ in range(400)], spreadsheet_id=sheet_id)
+        range_a1 = f"{sheet_ref}!A1:{end_col}{len(values)}"
+        await asyncio.to_thread(connector.update_range, range_a1, values, spreadsheet_id=sheet_id)
+    except Exception as e:
+        err_msg = str(e)
+        if "403" in err_msg or "does not have permission" in err_msg.lower():
+            sa_email = connector.get_service_account_email()
+            err_msg = (
+                "Permission denied. Share the Google Sheet with the service account as **Editor**: "
+                + (sa_email or "see client_email in your JSON key") + ". " + err_msg[:200]
+            )
+        elif "404" in err_msg or "Unable to parse range" in err_msg or "not found" in err_msg.lower():
+            err_msg = f"Sheet tab not found. Create a tab named \"{ARR_BRIDGE_EXPORT_SHEET}\" in your financial model. " + err_msg[:200]
+        return {"ok": False, "error": err_msg}
+
+    url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/edit"
+    sheet_gid = await asyncio.to_thread(connector.get_sheet_gid_by_title, ARR_BRIDGE_EXPORT_SHEET, sheet_id)
+    if sheet_gid is not None:
+        url = f"{url}#gid={sheet_gid}"
+    return {
+        "ok": True,
+        "spreadsheet_url": url,
+        "sheet_gid": sheet_gid,
+        "rows_written": len(values),
+        "blocks": [t for t, _ in blocks],
+        "message": f"Exported {len(blocks)} bridges to \"{ARR_BRIDGE_EXPORT_SHEET}\".",
     }
 
 

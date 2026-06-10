@@ -18,8 +18,8 @@ const PRODUCT_ACCENTS: Record<string, string> = {
   RVK: '#3ecfff',
 }
 
-/** Depth 0–4: muted/dark → bright. Index by depth (1–4 used when 0 is hidden). */
-const DEPTH_COLORS = ['#3d3d52', '#5a5a72', '#7c6af7', '#00d4aa', '#3ecfff']
+/** Depth 0–MAX: muted/dark → bright. Index by depth (1–MAX used when 0 is hidden). */
+const DEPTH_COLORS = ['#3d3d52', '#5a5a72', '#7c6af7', '#00d4aa', '#3ecfff', '#f5a623']
 
 /** Panel layout aligned with Dashboard/Bookings: surface, border, 8px radius, 1rem 1.25rem padding. */
 const blockStyle: React.CSSProperties = {
@@ -43,42 +43,6 @@ const gridPanelStyle: React.CSSProperties = {
   ...blockStyle,
 }
 
-/** Key Takeaways panel for Analytics row 1 left. */
-export function KeyTakeaways() {
-  return (
-    <div style={{ ...blockStyle, textAlign: 'left', minWidth: 0 }}>
-      <div style={{ ...panelTitleStyle, marginBottom: '0.75rem', fontSize: '0.8rem' }}>
-        🎯 Product Penetration Analysis — Key Takeaways
-      </div>
-      <div style={{ display: 'flex', flexDirection: 'column', gap: '0.6rem', fontSize: '0.8rem', color: 'var(--text)', lineHeight: 1.4 }}>
-        <div>
-          <div style={{ fontWeight: 600, color: 'var(--text-muted)', marginBottom: '0.25rem', fontSize: '0.8rem' }}>🚨 Critical issues</div>
-          <ul style={{ margin: 0, paddingLeft: '1.25rem' }}>
-            <li>67.7% of customers have only 1 product — dangerously high concentration risk</li>
-            <li>Attach rates are 30–45pts below industry benchmarks — only 14% of CRM customers add IQ or iCampaign (should be 40–60%)</li>
-            <li>Zero customers with 4 products — no one buying the full suite</li>
-          </ul>
-        </div>
-        <div>
-          <div style={{ fontWeight: 600, color: 'var(--text-muted)', marginBottom: '0.25rem', fontSize: '0.8rem' }}>💰 Revenue opportunity</div>
-          <ul style={{ margin: 0, paddingLeft: '1.25rem' }}>
-            <li>$6.3M in white space ARR — 210 CRM customers missing iCampaign, 208 missing IQ, 213 missing Marketing Reports</li>
-            <li>Multi-product customers worth 2–3x more: 1 product = $22K ARR, 2 products = $31K (+41%), 3 products = $47K (+113%)</li>
-            <li>Converting just 50 single-product customers to 2 products = +$450K ARR with zero CAC</li>
-          </ul>
-        </div>
-        <div>
-          <div style={{ fontWeight: 600, color: 'var(--text-muted)', marginBottom: '0.25rem', fontSize: '0.8rem' }}>✅ Immediate actions</div>
-          <ul style={{ margin: 0, paddingLeft: '1.25rem' }}>
-            <li>Launch "CRM + iCampaign" bundle campaign targeting 210 customers (potential: $489K ARR at 20% conversion)</li>
-            <li>Build systematic day-90 upsell motion through CS team</li>
-            <li>Investigate why expansion is failing — pricing, product integration, or sales training issue</li>
-          </ul>
-        </div>
-      </div>
-    </div>
-  )
-}
 
 export type ProductPenetrationAccount = {
   hasCrm: boolean
@@ -108,7 +72,19 @@ type Props = {
 }
 
 const PRODUCT_KEYS = ['CRM', 'iCampaign', 'IQMR', 'RVK'] as const
-const PRODUCT_LABELS: Record<string, string> = { CRM: 'CRM', iCampaign: 'iCampaign', IQMR: 'IQ & MR', RVK: 'RVK' }
+const PRODUCT_LABELS: Record<string, string> = {
+  CRM: 'CRM',
+  iCampaign: 'iCampaign',
+  IQMR: 'IQ & Marketing Reports',
+  RVK: 'RVK Agents',
+}
+const MAX_PRODUCT_DEPTH = PRODUCT_KEYS.length
+
+function fmtMoneyShort(n: number) {
+  if (n >= 1e6) return `$${(n / 1e6).toFixed(1)}M`
+  if (n >= 1e3) return `$${Math.round(n / 1e3)}K`
+  return `$${Math.round(n).toLocaleString()}`
+}
 
 function getHas(a: ProductPenetrationAccount, key: string): boolean {
   switch (key) {
@@ -136,11 +112,11 @@ function getAccountDepth(a: ProductPenetrationAccount): number {
 }
 
 function depthDistribution(accounts: ProductPenetrationAccount[]) {
-  const counts = [0, 0, 0, 0, 0]
+  const counts = Array.from({ length: MAX_PRODUCT_DEPTH + 1 }, () => 0)
   for (const a of accounts) {
     counts[getAccountDepth(a)] += 1
   }
-  return [0, 1, 2, 3, 4].map((depth) => ({
+  return Array.from({ length: MAX_PRODUCT_DEPTH }, (_, i) => i + 1).map((depth) => ({
     depth,
     label: depth === 1 ? '1 product' : `${depth} products`,
     count: counts[depth],
@@ -176,15 +152,17 @@ function attachRateMatrix(accounts: ProductPenetrationAccount[]) {
 }
 
 function revenueByDepth(accounts: ProductPenetrationAccount[]) {
-  const byDepth: Record<number, { sum: number; count: number }> = { 1: { sum: 0, count: 0 }, 2: { sum: 0, count: 0 }, 3: { sum: 0, count: 0 }, 4: { sum: 0, count: 0 } }
+  const byDepth: Record<number, { sum: number; count: number }> = Object.fromEntries(
+    Array.from({ length: MAX_PRODUCT_DEPTH }, (_, i) => [i + 1, { sum: 0, count: 0 }])
+  )
   for (const a of accounts) {
     const depth = getAccountDepth(a)
-    if (depth >= 1 && depth <= 4 && typeof a.arr === 'number') {
+    if (depth >= 1 && depth <= MAX_PRODUCT_DEPTH && typeof a.arr === 'number') {
       byDepth[depth].sum += a.arr
       byDepth[depth].count += 1
     }
   }
-  return [1, 2, 3, 4].map((d) => ({
+  return Array.from({ length: MAX_PRODUCT_DEPTH }, (_, i) => i + 1).map((d) => ({
     depth: d,
     label: d === 1 ? '1 product' : `${d} products`,
     count: byDepth[d].count,
@@ -233,6 +211,115 @@ function crossSellOpportunities(accounts: ProductPenetrationAccount[]) {
   return rows.filter((r) => r.count > 0).sort((a, b) => b.totalOpportunity - a.totalOpportunity)
 }
 
+/** Key Takeaways panel — computed live from the same account set as the charts below. */
+export function KeyTakeaways({
+  accounts,
+  currentArrTotal,
+  asOfLabel,
+}: {
+  accounts: ProductPenetrationAccount[]
+  currentArrTotal?: number
+  asOfLabel?: string | null
+}) {
+  const total = accounts.length
+  const depthData = depthDistribution(accounts)
+  const single = depthData.find((d) => d.depth === 1)?.count ?? 0
+  const singlePct = total > 0 ? ((100 * single) / total).toFixed(1) : '0'
+  const fullSuite = depthData.find((d) => d.depth === MAX_PRODUCT_DEPTH)?.count ?? 0
+
+  const attach = attachRateMatrix(accounts)
+  const crmToIcampaign = attach.CRM?.iCampaign ?? 0
+  const crmToIqMr = attach.CRM?.IQMR ?? 0
+  const crmToRvk = attach.CRM?.RVK ?? 0
+
+  const ws = whiteSpaceMatrix(accounts)
+  const crmMissingIcampaign = ws.CRM?.iCampaign ?? 0
+  const crmMissingIqMr = ws.CRM?.IQMR ?? 0
+  const crmMissingRvk = ws.CRM?.RVK ?? 0
+  const rvkAccounts = accounts.filter((a) => a.hasRvk).length
+
+  const revByDepth = revenueByDepth(accounts).filter((d) => d.count > 0)
+  const avg1 = revByDepth.find((d) => d.depth === 1)?.avgArr ?? 0
+  const avg2 = revByDepth.find((d) => d.depth === 2)?.avgArr ?? 0
+  const avg3 = revByDepth.find((d) => d.depth === 3)?.avgArr ?? 0
+  const uplift2 = avg1 > 0 ? Math.round(((avg2 - avg1) / avg1) * 100) : 0
+  const uplift3 = avg1 > 0 ? Math.round(((avg3 - avg1) / avg1) * 100) : 0
+
+  const topOpps = crossSellOpportunities(accounts).slice(0, 3)
+  const topOppTotal = topOpps.reduce((s, r) => s + r.totalOpportunity, 0)
+  const topCampaign = topOpps[0]
+
+  if (total === 0) {
+    return (
+      <div style={{ ...blockStyle, textAlign: 'left', minWidth: 0 }}>
+        <div style={{ ...panelTitleStyle, marginBottom: '0.75rem', fontSize: '0.8rem' }}>
+          Product Penetration Analysis — Key Takeaways
+        </div>
+        <p style={{ margin: 0, fontSize: '0.8rem', color: 'var(--text-muted)' }}>Loading account data…</p>
+      </div>
+    )
+  }
+
+  return (
+    <div style={{ ...blockStyle, textAlign: 'left', minWidth: 0 }}>
+      <div style={{ ...panelTitleStyle, marginBottom: '0.75rem', fontSize: '0.8rem' }}>
+        Product Penetration Analysis — Key Takeaways
+        {asOfLabel ? ` (${asOfLabel})` : ''}
+      </div>
+      <p style={{ ...panelDescStyle, marginTop: 0 }}>
+        CRM, iCampaign, IQ &amp; Marketing Reports, and RVK Agents — reconciled to the ARR bridge.
+      </p>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: '0.6rem', fontSize: '0.8rem', color: 'var(--text)', lineHeight: 1.4 }}>
+        <div>
+          <div style={{ fontWeight: 600, color: 'var(--text-muted)', marginBottom: '0.25rem', fontSize: '0.8rem' }}>Critical issues</div>
+          <ul style={{ margin: 0, paddingLeft: '1.25rem' }}>
+            <li>{singlePct}% of customers ({single.toLocaleString()} accounts) hold only 1 product family</li>
+            <li>CRM attach: {crmToIcampaign}% iCampaign, {crmToIqMr}% IQ &amp; MR, {crmToRvk}% RVK Agents</li>
+            <li>{fullSuite === 0 ? 'No' : fullSuite} customer{fullSuite === 1 ? '' : 's'} with all {MAX_PRODUCT_DEPTH} product families</li>
+          </ul>
+        </div>
+        <div>
+          <div style={{ fontWeight: 600, color: 'var(--text-muted)', marginBottom: '0.25rem', fontSize: '0.8rem' }}>Revenue opportunity</div>
+          <ul style={{ margin: 0, paddingLeft: '1.25rem' }}>
+            <li>
+              CRM white space: {crmMissingIcampaign} missing iCampaign, {crmMissingIqMr} missing IQ &amp; MR, {crmMissingRvk} missing RVK Agents
+            </li>
+            {avg1 > 0 && avg2 > 0 && (
+              <li>
+                Multi-product lift: 1 product = {fmtMoneyShort(avg1)} avg ARR
+                {avg2 > 0 ? `, 2 products = ${fmtMoneyShort(avg2)} (+${uplift2}%)` : ''}
+                {avg3 > 0 ? `, 3 products = ${fmtMoneyShort(avg3)} (+${uplift3}%)` : ''}
+              </li>
+            )}
+            {topOppTotal > 0 && (
+              <li>Top-3 cross-sell paths: {fmtMoneyShort(topOppTotal)} ARR opportunity</li>
+            )}
+          </ul>
+        </div>
+        <div>
+          <div style={{ fontWeight: 600, color: 'var(--text-muted)', marginBottom: '0.25rem', fontSize: '0.8rem' }}>Immediate actions</div>
+          <ul style={{ margin: 0, paddingLeft: '1.25rem' }}>
+            {topCampaign && (
+              <li>
+                Prioritize {topCampaign.campaign}: {topCampaign.count} accounts, {fmtMoneyShort(topCampaign.totalOpportunity)} ARR potential
+              </li>
+            )}
+            {crmMissingRvk > 0 && (
+              <li>RVK Agents attach is early — {crmMissingRvk} CRM accounts have no RVK ({rvkAccounts} accounts live today)</li>
+            )}
+            <li>Run bundle campaigns against CRM-only accounts with highest ARR first</li>
+          </ul>
+        </div>
+        {currentArrTotal != null && currentArrTotal > 0 && (
+          <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)', marginTop: '0.25rem' }}>
+            {total.toLocaleString()} accounts · {fmtMoneyShort(currentArrTotal)} total ARR
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
 export default function ProductPenetration({ accounts, salesforceBaseUrl, currentArrTotal, panelsOnly }: Props) {
   const [selectedDepth, setSelectedDepth] = useState<number | null>(null)
   const depthData = depthDistribution(accounts)
@@ -252,7 +339,7 @@ export default function ProductPenetration({ accounts, salesforceBaseUrl, curren
           Product depth distribution
         </div>
         <p style={panelDescStyle}>
-          Count of accounts by number of products held.
+          Count of accounts by number of product families held (CRM, iCampaign, IQ &amp; MR, RVK Agents).
         </p>
         <div style={{ height: 260, width: '100%', flexShrink: 0 }}>
           <ResponsiveContainer width="100%" height="100%">
@@ -300,7 +387,7 @@ export default function ProductPenetration({ accounts, salesforceBaseUrl, curren
     const perProductPanel = (
       <div style={gridPanelStyle}>
         <div style={panelTitleStyle}>Per-product penetration</div>
-        <p style={panelDescStyle}>Share of accounts with each product.</p>
+        <p style={panelDescStyle}>Share of accounts with each product family.</p>
         <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
           {productStats.map((p) => {
             const accent = PRODUCT_ACCENTS[p.key] ?? '#888'
@@ -517,7 +604,7 @@ export default function ProductPenetration({ accounts, salesforceBaseUrl, curren
           Product depth distribution
         </div>
         <p style={panelDescStyle}>
-          Count of accounts by number of products held.
+          Count of accounts by number of product families held (CRM, iCampaign, IQ &amp; MR, RVK Agents).
         </p>
         <div style={{ height: 260, width: '100%', flexShrink: 0 }}>
           <ResponsiveContainer width="100%" height="100%">

@@ -613,7 +613,7 @@ export type ActiveARRAnalyticsResponse = {
 
 export async function getActiveARRAnalytics(asOf?: string): Promise<ActiveARRAnalyticsResponse> {
   const qs = asOf ? `?as_of=${encodeURIComponent(asOf)}` : ''
-  const r = await apiFetch(`/analytics/active-arr-by-product${qs}`)
+  const r = await apiFetch(`/analytics/active-arr-by-product${qs}`, { cache: 'no-store' })
   if (!r.ok) throw new Error('Failed to fetch Active ARR analytics')
   return r.json()
 }

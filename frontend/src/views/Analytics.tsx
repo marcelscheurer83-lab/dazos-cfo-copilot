@@ -79,7 +79,7 @@ export default function AnalyticsView() {
           }}
         >
           {/* Row 1: Key takeaways (left) | Active ARR by product line (right) */}
-          <KeyTakeaways />
+          <KeyTakeaways accounts={penetrationAccounts} currentArrTotal={effectiveTotal} asOfLabel={asOfLabel} />
           {/* Active ARR by product line */}
           <div
             style={{
@@ -129,7 +129,7 @@ export default function AnalyticsView() {
                   </tr>
                 </thead>
                 <tbody>
-                  {groups.map((g) => {
+                  {groups.filter((g) => g.arr > 0).map((g) => {
                     const mix = tableTotal > 0 && g.arr > 0 ? (g.arr / tableTotal) * 100 : 0
                     return (
                     <tr key={g.key ?? g.label} style={{ borderBottom: '1px solid var(--border)' }}>

@@ -4732,6 +4732,7 @@ async def _compute_active_arr_rows(
     apply_alleva_retained_arr_adjustment: bool = False,
     diagnostic_account_name_substring: Optional[str] = None,
     diagnostic_out: Optional[list] = None,
+    crm_month_keys: Optional[list[str]] = None,
 ) -> tuple[list[dict], Optional[str]]:
     """Compute active ARR rows (subscription start/end, ARR per account).
 
@@ -5142,7 +5143,7 @@ async def _compute_active_arr_rows(
     # current_period_opp_sf_ids, but evaluated at each month-end instead of today: take the closed-won
     # period (NB/renewal term) that contains the month-end, plus expansions that closed on/before that
     # month-end and within the period. Powers the Seat Pricing "previous month end" view.
-    _schedule_months = _default_schedule_by_month_keys()
+    _schedule_months = crm_month_keys if crm_month_keys else _default_schedule_by_month_keys()
     _month_end_dates: list[tuple[str, date]] = []
     for _mk in _schedule_months:
         _y, _m = int(_mk[:4]), int(_mk[5:7])
@@ -7688,6 +7689,162 @@ async def get_arr_bridge(db: AsyncSession = Depends(get_db)):
         "retention": retention,
         "yoy": yoy,
         "display_months": display_months,
+        "message": None,
+    }
+
+
+def _build_bridge_from_arr_map(
+    arr_map: dict[str, dict[str, float]],
+    display_months: list[str],
+    yoy_months: list[str],
+) -> dict:
+    """Shared ARR-bridge / retention / YoY math, given arr_map[account][YYYY-MM] = arr.
+
+    Same component rules as /api/arr-bridge (month M vs M-1): New Business (0→>0), Expansion (up),
+    Contraction (down, still >0), Churn (>0→0). Trailing-12M NRR/GRR use the M-12 cohort.
+    """
+    all_accounts = list(arr_map.keys())
+
+    def get_arr(account: str, mk: str) -> float:
+        return arr_map.get(account, {}).get(mk, 0.0)
+
+    def total_arr(mk: str) -> float:
+        return round(sum(arr_map.get(a, {}).get(mk, 0.0) for a in all_accounts), 2)
+
+    bridge: list[dict] = []
+    retention: list[dict] = []
+    for mk in display_months:
+        prior_mk = _mk_offset(mk, -1)
+        beg = total_arr(prior_mk)
+        new_biz = exp = ctr = churn = 0.0
+        for acc in all_accounts:
+            a_prior = get_arr(acc, prior_mk)
+            a_curr = get_arr(acc, mk)
+            if a_prior == 0.0 and a_curr > 0.0:
+                new_biz += a_curr
+            elif a_prior > 0.0 and a_curr > a_prior:
+                exp += a_curr - a_prior
+            elif a_prior > 0.0 and 0.0 < a_curr < a_prior:
+                ctr += a_prior - a_curr
+            elif a_prior > 0.0 and a_curr == 0.0:
+                churn += a_prior
+        end = total_arr(mk)
+        bridge.append({
+            "month": mk,
+            "beginning_arr": round(beg, 2),
+            "new_business": round(new_biz, 2),
+            "expansion": round(exp, 2),
+            "contraction": round(ctr, 2),
+            "churn": round(churn, 2),
+            "net_change": round(new_biz + exp - ctr - churn, 2),
+            "ending_arr": round(end, 2),
+        })
+
+        m12 = _mk_offset(mk, -12)
+        cohort = [a for a in all_accounts if get_arr(a, m12) > 0.0]
+        if cohort:
+            denom = round(sum(get_arr(a, m12) for a in cohort), 2)
+            nrr_num = round(sum(get_arr(a, mk) for a in cohort), 2)
+            grr_num = round(sum(min(get_arr(a, mk), get_arr(a, m12)) for a in cohort), 2)
+            retention.append({
+                "month": mk,
+                "nrr_trailing_12m": round(nrr_num / denom * 100, 1) if denom > 0 else None,
+                "grr_trailing_12m": round(grr_num / denom * 100, 1) if denom > 0 else None,
+                "cohort_arr": denom,
+                "cohort_size": len(cohort),
+            })
+        else:
+            retention.append({"month": mk, "nrr_trailing_12m": None, "grr_trailing_12m": None, "cohort_arr": None, "cohort_size": 0})
+
+    month_totals = {mk: total_arr(mk) for mk in yoy_months}
+    yoy: list[dict] = []
+    for mk in yoy_months:
+        m12 = _mk_offset(mk, -12)
+        m1 = _mk_offset(mk, -1)
+        if m12 in month_totals:
+            prior = month_totals[m12]
+            pct = round((month_totals[mk] - prior) / prior * 100, 1) if prior > 0 else None
+            net_new = round(month_totals[mk] - month_totals.get(m1, total_arr(m1)), 2)
+            yoy.append({"month": mk, "ending_arr": month_totals[mk], "net_new_arr": net_new, "yoy_pct": pct})
+
+    return {"bridge": bridge, "retention": retention, "yoy": yoy}
+
+
+# Per-product ARR bridges. Each entry: the per-account month-end ARR field produced by
+# _compute_active_arr_rows for that product family. CRM = Seat-Pricing 'CRM ARR'
+# (CRM Platform Legacy + CRM Platform Includes-5-Seats + Additional CRM Seats; excludes Billing CRM).
+_PRODUCT_BRIDGE_DEFS: dict[str, dict] = {
+    "crm": {"label": "CRM", "field": "crm_arr_by_month"},
+}
+
+
+@app.get("/api/arr-bridge/by-product")
+async def get_arr_bridge_by_product(
+    product: str = Query("crm", description="Product family key, e.g. 'crm'."),
+    db: AsyncSession = Depends(get_db),
+):
+    """ARR bridge (waterfall) + trailing-12M GRR/NRR for a single product family, last 13 months.
+
+    Uses the same per-account month-end product ARR as the Seat Pricing view (Salesforce line items,
+    point-in-time per month-end, Alleva-scaled), so per-product numbers reconcile with that view.
+    Because per-product history comes from Salesforce line items (the ARR_Schedule sheet that powers
+    the total bridge has no product split), product bridges need not sum exactly to the total bridge.
+    """
+    key = (product or "").strip().lower()
+    pdef = _PRODUCT_BRIDGE_DEFS.get(key)
+    if not pdef:
+        return {
+            "bridge": [], "retention": [], "yoy": [], "display_months": [],
+            "message": f"Unknown product '{product}'. Available: {', '.join(sorted(_PRODUCT_BRIDGE_DEFS))}.",
+        }
+
+    today_est = datetime.now(EST).date()
+    current_mk = today_est.strftime("%Y-%m")
+    display_months: list[str] = []
+    _m = date(today_est.year, today_est.month, 1)
+    for _ in range(13):
+        display_months.insert(0, _m.strftime("%Y-%m"))
+        _m = date(_m.year - 1 if _m.month == 1 else _m.year, 12 if _m.month == 1 else _m.month - 1, 1)
+
+    # Compute monthly product ARR from M-13 of the earliest shown month (for T12M / beginning ARR) → current.
+    fetch_from = _mk_offset(display_months[0], -13)
+    month_keys: list[str] = []
+    _cur = fetch_from
+    while _cur <= current_mk:
+        month_keys.append(_cur)
+        _cur = _mk_offset(_cur, 1)
+
+    rows, _msg = await _compute_active_arr_rows(
+        db, apply_alleva_retained_arr_adjustment=True, crm_month_keys=month_keys
+    )
+
+    field = pdef["field"]
+    arr_map: dict[str, dict[str, float]] = {}
+    for r in rows:
+        bm = r.get(field) or {}
+        if not bm:
+            continue
+        name = r.get("account_name") or "—"
+        d = arr_map.setdefault(name, {})
+        for mk, v in bm.items():
+            fv = float(v or 0.0)
+            if fv:
+                d[mk] = round(d.get(mk, 0.0) + fv, 2)
+
+    if not any(arr_map.values()):
+        return {
+            "bridge": [], "retention": [], "yoy": [], "display_months": display_months,
+            "message": f"No {pdef['label']} ARR found. Run 'Refresh app data' to sync Salesforce first.",
+        }
+
+    built = _build_bridge_from_arr_map(arr_map, display_months, month_keys)
+    return {
+        "bridge": built["bridge"],
+        "retention": built["retention"],
+        "yoy": built["yoy"],
+        "display_months": display_months,
+        "product": key,
+        "product_label": pdef["label"],
         "message": None,
     }
 

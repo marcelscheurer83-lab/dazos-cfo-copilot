@@ -1298,6 +1298,17 @@ export async function getArrBridge(): Promise<ArrBridgeResponse> {
   return r.json()
 }
 
+export type ProductArrBridgeResponse = ArrBridgeResponse & {
+  product?: string
+  product_label?: string
+}
+
+export async function getProductArrBridge(product: string): Promise<ProductArrBridgeResponse> {
+  const r = await apiFetch(`/arr-bridge/by-product?product=${encodeURIComponent(product)}`)
+  if (!r.ok) throw new Error(`Product ARR Bridge fetch failed: HTTP ${r.status}`)
+  return r.json()
+}
+
 export type BridgeAccountRow = {
   account_name: string
   arr: number

@@ -3,7 +3,7 @@ import {
   ComposedChart, Bar, Line, XAxis, YAxis, CartesianGrid, Tooltip,
   Legend, ResponsiveContainer, LineChart, ReferenceLine,
 } from 'recharts'
-import { getArrBridge, getBridgeAccounts, getDatasetStatus, refreshAppDataset, formatLastUpdated, ArrBridgeResponse, ArrBridgeMonth, ArrRetentionMonth, ArrYoyMonth, BridgeAccountRow, type DatasetStatus } from '../api'
+import { getArrBridge, getProductArrBridge, getBridgeAccounts, getDatasetStatus, refreshAppDataset, formatLastUpdated, ArrBridgeResponse, ArrBridgeMonth, ArrRetentionMonth, ArrYoyMonth, BridgeAccountRow, type DatasetStatus } from '../api'
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -438,70 +438,122 @@ export default function ARRBridge() {
         </div>
       )}
 
-      {/* ── bridge table ── */}
+      {/* ── bridge table (total) ── */}
       <h2 style={{ margin: '0 0 0.75rem', fontSize: '1rem', fontWeight: 600, color: 'var(--text)' }}>
         Bridge Detail
       </h2>
-      <div style={{ overflowX: 'auto', paddingLeft: 64, paddingRight: 64 }}>
-        <table style={{ borderCollapse: 'collapse', fontSize: '0.8rem', width: '100%' }}>
-          <thead>
-            <tr style={{ borderBottom: '2px solid var(--border)', background: 'var(--surface)' }}>
-              <th style={TH}>Component</th>
-              {bridge.map((b) => <th key={b.month} style={{ ...TH, textAlign: 'right' }}>{fmtMonth(b.month)}</th>)}
-            </tr>
-          </thead>
-          <tbody>
-            {[
-              { key: 'beginning_arr', label: 'Beginning ARR', color: 'var(--text-muted)', bold: false },
-              { key: 'new_business',   label: '+ New Business', color: C_NEW_BIZ,     bold: false },
-              { key: 'expansion',      label: '+ Expansion',    color: C_EXPANSION,   bold: false },
-              { key: 'contraction',    label: '− Contraction',  color: C_CONTRACTION, bold: false },
-              { key: 'churn',          label: '− Churn',        color: C_CHURN,       bold: false },
-              { key: 'ending_arr',     label: 'Ending ARR',     color: 'var(--text)', bold: true  },
-            ].map(({ key, label, color, bold }) => (
-              <tr key={key} style={{ borderBottom: key === 'ending_arr' ? '2px solid var(--border)' : '1px solid var(--border)' }}>
-                <td style={{ ...TD, color, fontWeight: bold ? 700 : 400 }}>{label}</td>
-                {bridge.map((b) => {
-                  const raw = (b as any)[key] as number
-                  return (
-                    <td key={b.month} style={{ ...TD, textAlign: 'right', color, fontWeight: bold ? 700 : 400, fontVariantNumeric: 'tabular-nums' }}>
-                      {raw === 0 ? '—' : fmtFull(raw)}
-                    </td>
-                  )
-                })}
-              </tr>
-            ))}
-            <tr style={{ borderBottom: '1px solid var(--border)' }}>
-              <td style={{ ...TD, color: 'var(--text-muted)' }}>YoY Growth</td>
+      <BridgeDetailTable bridge={bridge} retention={retention} yoyByMonth={yoyByMonth} />
+
+      {/* ── per-product bridge tables ── */}
+      <ProductBridgeDetail product="crm" title="CRM — Bridge Detail" />
+    </div>
+  )
+}
+
+// ── reusable bridge detail table ───────────────────────────────────────────────
+
+function BridgeDetailTable({ bridge, retention, yoyByMonth }: {
+  bridge: ArrBridgeMonth[]
+  retention: ArrRetentionMonth[]
+  yoyByMonth: Record<string, number | null>
+}) {
+  return (
+    <div style={{ overflowX: 'auto', paddingLeft: 64, paddingRight: 64 }}>
+      <table style={{ borderCollapse: 'collapse', fontSize: '0.8rem', width: '100%' }}>
+        <thead>
+          <tr style={{ borderBottom: '2px solid var(--border)', background: 'var(--surface)' }}>
+            <th style={TH}>Component</th>
+            {bridge.map((b) => <th key={b.month} style={{ ...TH, textAlign: 'right' }}>{fmtMonth(b.month)}</th>)}
+          </tr>
+        </thead>
+        <tbody>
+          {[
+            { key: 'beginning_arr', label: 'Beginning ARR', color: 'var(--text-muted)', bold: false },
+            { key: 'new_business',   label: '+ New Business', color: C_NEW_BIZ,     bold: false },
+            { key: 'expansion',      label: '+ Expansion',    color: C_EXPANSION,   bold: false },
+            { key: 'contraction',    label: '− Contraction',  color: C_CONTRACTION, bold: false },
+            { key: 'churn',          label: '− Churn',        color: C_CHURN,       bold: false },
+            { key: 'ending_arr',     label: 'Ending ARR',     color: 'var(--text)', bold: true  },
+          ].map(({ key, label, color, bold }) => (
+            <tr key={key} style={{ borderBottom: key === 'ending_arr' ? '2px solid var(--border)' : '1px solid var(--border)' }}>
+              <td style={{ ...TD, color, fontWeight: bold ? 700 : 400 }}>{label}</td>
               {bridge.map((b) => {
-                const pct = yoyByMonth[b.month]
+                const raw = (b as any)[key] as number
                 return (
-                  <td key={b.month} style={{ ...TD, textAlign: 'right', fontVariantNumeric: 'tabular-nums',
-                    color: pct == null ? 'var(--text-muted)' : pct >= 20 ? C_NRR : pct >= 0 ? C_GRR : C_CHURN }}>
-                    {pct != null ? `${pct.toFixed(1)}%` : '—'}
+                  <td key={b.month} style={{ ...TD, textAlign: 'right', color, fontWeight: bold ? 700 : 400, fontVariantNumeric: 'tabular-nums' }}>
+                    {raw === 0 ? '—' : fmtFull(raw)}
                   </td>
                 )
               })}
             </tr>
-            <tr style={{ borderBottom: '1px solid var(--border)' }}>
-              <td style={{ ...TD, color: 'var(--text-muted)' }}>NRR (T12M)</td>
-              {retention.map((r) => (
-                <td key={r.month} style={{ ...TD, textAlign: 'right', color: r.nrr_trailing_12m == null ? 'var(--text-muted)' : r.nrr_trailing_12m >= 100 ? C_NRR : r.nrr_trailing_12m >= 85 ? C_GRR : C_CHURN, fontVariantNumeric: 'tabular-nums' }}>
-                  {r.nrr_trailing_12m != null ? `${r.nrr_trailing_12m.toFixed(1)}%` : '—'}
+          ))}
+          <tr style={{ borderBottom: '1px solid var(--border)' }}>
+            <td style={{ ...TD, color: 'var(--text-muted)' }}>YoY Growth</td>
+            {bridge.map((b) => {
+              const pct = yoyByMonth[b.month]
+              return (
+                <td key={b.month} style={{ ...TD, textAlign: 'right', fontVariantNumeric: 'tabular-nums',
+                  color: pct == null ? 'var(--text-muted)' : pct >= 20 ? C_NRR : pct >= 0 ? C_GRR : C_CHURN }}>
+                  {pct != null ? `${pct.toFixed(1)}%` : '—'}
                 </td>
-              ))}
-            </tr>
-            <tr>
-              <td style={{ ...TD, color: 'var(--text-muted)' }}>GRR (T12M)</td>
-              {retention.map((r) => (
-                <td key={r.month} style={{ ...TD, textAlign: 'right', color: r.grr_trailing_12m == null ? 'var(--text-muted)' : r.grr_trailing_12m >= 90 ? C_NRR : r.grr_trailing_12m >= 75 ? C_GRR : C_CHURN, fontVariantNumeric: 'tabular-nums' }}>
-                  {r.grr_trailing_12m != null ? `${r.grr_trailing_12m.toFixed(1)}%` : '—'}
-                </td>
-              ))}
-            </tr>
-          </tbody>
-        </table>
-      </div>
+              )
+            })}
+          </tr>
+          <tr style={{ borderBottom: '1px solid var(--border)' }}>
+            <td style={{ ...TD, color: 'var(--text-muted)' }}>NRR (T12M)</td>
+            {retention.map((r) => (
+              <td key={r.month} style={{ ...TD, textAlign: 'right', color: r.nrr_trailing_12m == null ? 'var(--text-muted)' : r.nrr_trailing_12m >= 100 ? C_NRR : r.nrr_trailing_12m >= 85 ? C_GRR : C_CHURN, fontVariantNumeric: 'tabular-nums' }}>
+                {r.nrr_trailing_12m != null ? `${r.nrr_trailing_12m.toFixed(1)}%` : '—'}
+              </td>
+            ))}
+          </tr>
+          <tr>
+            <td style={{ ...TD, color: 'var(--text-muted)' }}>GRR (T12M)</td>
+            {retention.map((r) => (
+              <td key={r.month} style={{ ...TD, textAlign: 'right', color: r.grr_trailing_12m == null ? 'var(--text-muted)' : r.grr_trailing_12m >= 90 ? C_NRR : r.grr_trailing_12m >= 75 ? C_GRR : C_CHURN, fontVariantNumeric: 'tabular-nums' }}>
+                {r.grr_trailing_12m != null ? `${r.grr_trailing_12m.toFixed(1)}%` : '—'}
+              </td>
+            ))}
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  )
+}
+
+// ── per-product bridge detail (fetches its own data) ───────────────────────────
+
+function ProductBridgeDetail({ product, title }: { product: string; title: string }) {
+  const [data, setData] = useState<ArrBridgeResponse | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
+
+  useEffect(() => {
+    setLoading(true)
+    setError(null)
+    getProductArrBridge(product)
+      .then((res) => { setData(res); setLoading(false) })
+      .catch((e: unknown) => { setError(e instanceof Error ? e.message : String(e)); setLoading(false) })
+  }, [product])
+
+  const yoyByMonth = Object.fromEntries((data?.yoy ?? []).map((y) => [y.month, y.yoy_pct]))
+
+  return (
+    <div style={{ marginTop: '2.5rem' }}>
+      <h2 style={{ margin: '0 0 0.75rem', fontSize: '1rem', fontWeight: 600, color: 'var(--text)' }}>
+        {title}
+      </h2>
+      {loading ? (
+        <div style={{ padding: '1rem', color: 'var(--text-muted)', fontSize: '0.85rem' }}>Loading…</div>
+      ) : error ? (
+        <div style={{ padding: '1rem', color: 'var(--negative)', fontSize: '0.85rem' }}>Error: {error}</div>
+      ) : !data || data.bridge.length === 0 ? (
+        <div style={{ padding: '1rem', color: 'var(--text-muted)', fontSize: '0.85rem' }}>
+          {data?.message ?? 'No data.'}
+        </div>
+      ) : (
+        <BridgeDetailTable bridge={data.bridge} retention={data.retention} yoyByMonth={yoyByMonth} />
+      )}
     </div>
   )
 }

@@ -86,6 +86,20 @@ function fmtMoneyShort(n: number) {
   return `$${Math.round(n).toLocaleString()}`
 }
 
+/** Y-axis ceiling with headroom so bar-top labels (e.g. $80K) aren't clipped. */
+function revenueChartYMax(data: { avgArr: number }[]): number {
+  const max = Math.max(0, ...data.map((d) => d.avgArr || 0))
+  if (max <= 0) return 20000
+  const padded = max * 1.2
+  const step = padded <= 30000 ? 10000 : 20000
+  return Math.ceil(padded / step) * step
+}
+
+function formatAvgArrLabel(value: number) {
+  if (typeof value !== 'number') return ''
+  return value >= 1000 ? `$${Math.round(value / 1000)}K` : `$${value}`
+}
+
 function getHas(a: ProductPenetrationAccount, key: string): boolean {
   switch (key) {
     case 'CRM': return a.hasCrm
@@ -451,20 +465,18 @@ export default function ProductPenetration({ accounts, salesforceBaseUrl, curren
         {accounts.some((a) => typeof a.arr === 'number' && a.arr > 0) ? (
           (() => {
             const revenueDepthData = revenueByDepth(accounts).filter((d) => d.count > 0)
+            const yMax = revenueChartYMax(revenueDepthData)
             return (
               <ResponsiveContainer width="100%" height={180}>
-                <BarChart data={revenueDepthData} margin={{ top: 8, right: 8, left: 0, bottom: 4 }}>
+                <BarChart data={revenueDepthData} margin={{ top: 28, right: 8, left: 0, bottom: 4 }}>
                   <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" vertical={false} />
                   <XAxis dataKey="label" axisLine={false} tickLine={false} />
-                  <YAxis tick={{ fontSize: 11, fill: 'var(--text-muted)' }} axisLine={false} tickLine={false} tickFormatter={(v) => `$${v >= 1000 ? `${(v / 1000).toFixed(0)}K` : v}`} />
+                  <YAxis domain={[0, yMax]} tick={{ fontSize: 11, fill: 'var(--text-muted)' }} axisLine={false} tickLine={false} tickFormatter={(v) => `$${v >= 1000 ? `${(v / 1000).toFixed(0)}K` : v}`} />
                   <Bar dataKey="avgArr" radius={[4, 4, 0, 0]} cursor="pointer" onClick={(data: any) => setSelectedDepth(data?.depth ?? null)}>
                     <LabelList
                       dataKey="avgArr"
                       position="top"
-                      formatter={(value: number) => {
-                        if (typeof value !== 'number') return ''
-                        return value >= 1000 ? `$${Math.round(value / 1000)}K` : `$${value}`
-                      }}
+                      formatter={formatAvgArrLabel}
                       style={{ fill: 'var(--text)', fontSize: 12, fontWeight: 600 }}
                     />
                     {revenueDepthData.map((d) => <Cell key={d.depth} fill={DEPTH_COLORS[d.depth]} />)}
@@ -839,15 +851,16 @@ export default function ProductPenetration({ accounts, salesforceBaseUrl, curren
           {accounts.some((a) => typeof a.arr === 'number' && a.arr > 0) ? (
             (() => {
               const revenueDepthData = revenueByDepth(accounts).filter((d) => d.count > 0)
+              const yMax = revenueChartYMax(revenueDepthData)
               return (
                 <ResponsiveContainer width="100%" height={180}>
                   <BarChart
                     data={revenueDepthData}
-                    margin={{ top: 8, right: 8, left: 0, bottom: 4 }}
+                    margin={{ top: 28, right: 8, left: 0, bottom: 4 }}
                   >
                     <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" vertical={false} />
                     <XAxis dataKey="label" axisLine={false} tickLine={false} />
-                    <YAxis tick={{ fontSize: 11, fill: 'var(--text-muted)' }} axisLine={false} tickLine={false} tickFormatter={(v) => `$${v >= 1000 ? `${(v / 1000).toFixed(0)}K` : v}`} />
+                    <YAxis domain={[0, yMax]} tick={{ fontSize: 11, fill: 'var(--text-muted)' }} axisLine={false} tickLine={false} tickFormatter={(v) => `$${v >= 1000 ? `${(v / 1000).toFixed(0)}K` : v}`} />
                     <Bar
                       dataKey="avgArr"
                       radius={[4, 4, 0, 0]}
@@ -858,6 +871,7 @@ export default function ProductPenetration({ accounts, salesforceBaseUrl, curren
                       <LabelList
                         dataKey="avgArr"
                         position="top"
+                        formatter={formatAvgArrLabel}
                         style={{ fill: 'var(--text)', fontSize: 12, fontWeight: 600 }}
                       />
                       {revenueDepthData.map((d) => (

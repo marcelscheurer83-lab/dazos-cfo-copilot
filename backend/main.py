@@ -7948,6 +7948,10 @@ _PRODUCT_BRIDGE_DEFS: dict[str, str] = {
     "other": "Other",
 }
 
+# Per-product bridges start from this year-end anchor (Dec 2025 = opening balance), then build
+# forward month by month. 2025 product-level cleanup is out of scope; the Total bridge keeps 2025.
+_PRODUCT_BRIDGE_ANCHOR_MK = "2025-12"
+
 
 async def _product_arr_map(db: AsyncSession, group_key: str, month_keys: list[str]) -> dict[str, dict[str, float]]:
     """Per-account month-end ARR for one product family: arr_map[account][YYYY-MM] = arr (Alleva-scaled).
@@ -8062,17 +8066,29 @@ async def _compute_all_product_bridges(db: AsyncSession) -> dict:
                 if parts.get(g):
                     alloc[g].setdefault(acc, {})[mk] = parts[g]
 
+    # Per-product bridges anchor at the Dec-2025 year-end ARR and build forward; 2025 product-level
+    # cleanup is out of scope (the Total bridge keeps full 2025 history). Dec 2025 is shown as an
+    # opening balance (no movement breakdown); Jan 2026 onward are real monthly bridges.
+    product_anchor_mk = _PRODUCT_BRIDGE_ANCHOR_MK
+    product_display_months = [mk for mk in display_months if mk >= product_anchor_mk] or list(display_months)
+
     products_out: list[dict] = []
     for g in groups:
-        built = _build_bridge_from_arr_map(alloc[g], display_months, month_keys, logo_totals=snap)
+        built = _build_bridge_from_arr_map(alloc[g], product_display_months, month_keys, logo_totals=snap)
+        bridge_rows = built["bridge"]
+        if bridge_rows and bridge_rows[0]["month"] == product_anchor_mk:
+            anchor = bridge_rows[0]
+            anchor["beginning_arr"] = anchor["ending_arr"]
+            anchor["new_business"] = anchor["expansion"] = anchor["contraction"] = anchor["churn"] = 0.0
+            anchor["net_change"] = 0.0
         products_out.append({
             "product": g,
             "product_label": _PRODUCT_BRIDGE_DEFS[g],
-            "bridge": built["bridge"],
+            "bridge": bridge_rows,
             "retention": built["retention"],
             "yoy": built["yoy"],
         })
-    return {"display_months": display_months, "products": products_out, "has_data": bool(snap_rows)}
+    return {"display_months": product_display_months, "products": products_out, "has_data": bool(snap_rows)}
 
 
 @app.get("/api/arr-bridge/products")

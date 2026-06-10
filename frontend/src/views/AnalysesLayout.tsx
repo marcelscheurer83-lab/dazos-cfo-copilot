@@ -4,6 +4,7 @@ const tabs = [
   { to: '/analyses/product-penetration', label: 'Product Penetration' },
   { to: '/analyses/crm-seats', label: 'CRM Seat Pricing' },
   { to: '/analyses/churn', label: 'Churn Analysis' },
+  { to: '/analyses/pp-project', label: 'P&P Project' },
 ]
 
 export default function AnalysesLayout() {

@@ -18,6 +18,7 @@ import Closed from './views/Closed'
 import Renewals from './views/Renewals'
 import ARRLayout from './views/ARRLayout'
 import AnalysesLayout from './views/AnalysesLayout'
+import AnalysesPPProject from './views/AnalysesPPProject'
 import FinancialsLayout from './views/FinancialsLayout'
 import PnL from './views/PnL'
 import CashFlow from './views/CashFlow'
@@ -153,6 +154,7 @@ export default function App() {
           <Route path="product-penetration" element={<Analytics />} />
           <Route path="crm-seats" element={<AnalyticsCRMSeats />} />
           <Route path="churn" element={<ChurnAnalysis />} />
+          <Route path="pp-project" element={<AnalysesPPProject />} />
         </Route>
         <Route path="arr" element={<Navigate to="/products-purchased" replace />} />
         <Route path="closed-data" element={<Navigate to="/bookings" replace />} />

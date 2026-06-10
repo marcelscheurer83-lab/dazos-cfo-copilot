@@ -802,6 +802,63 @@ export async function exportCohortRetentionToSheet(): Promise<ExportCohortRetent
   }
 }
 
+export type PPProjectExportRow = {
+  customer_name: string
+  account_id: string | null
+  total_customer_arr: number
+  cohort_month: string
+  subscription_start: string
+  subscription_end: string
+  product_sku: string
+  sku_arr: number | null
+  quantity: number | null
+}
+
+export type PPProjectExportResponse = {
+  month_key: string
+  as_of: string | null
+  rows: PPProjectExportRow[]
+  account_count: number
+  line_count: number
+  grand_total: number
+  salesforce_base_url?: string
+}
+
+export type ExportPPProjectResult = {
+  ok: boolean
+  spreadsheet_url?: string
+  spreadsheet_id?: string
+  rows_written?: number
+  account_count?: number
+  line_count?: number
+  range_used?: string
+  message?: string
+  error?: string
+}
+
+export async function getPPProjectExport(): Promise<PPProjectExportResponse> {
+  const r = await apiFetch('/analyses/pp-project-export', { cache: 'no-store' })
+  if (!r.ok) throw new Error('Failed to fetch P&P project export preview')
+  return r.json()
+}
+
+export async function exportPPProjectToSheet(): Promise<ExportPPProjectResult> {
+  const r = await apiFetch('/export/pp-project-to-google-sheet', { method: 'POST' })
+  const data = await r.json()
+  if (!r.ok) return { ok: false, error: data.error ?? data.detail ?? 'Export failed' }
+  return {
+    ok: true,
+    spreadsheet_url: data.spreadsheet_url,
+    spreadsheet_id: data.spreadsheet_id,
+    rows_written: data.rows_written,
+    account_count: data.account_count,
+    line_count: data.line_count,
+    range_used: data.range_used,
+    message: data.message,
+    error: data.error,
+  }
+}
+
 /** Pipeline overview: open opportunities (not Closed Won/Lost). One row per opportunity. */
 export type PipelineOverviewRow = {
   account_id: string | null

@@ -14375,10 +14375,10 @@ async def export_arr_bridge_to_google_sheet(db: AsyncSession = Depends(get_db)):
             return [label_] + [_fmt_money_export(bmap.get(m, {}).get(field) or 0) for m in display_months]
 
         values.append(money_row("Beginning ARR", "beginning_arr"))
-        values.append(money_row("+ New Business", "new_business"))
-        values.append(money_row("+ Expansion", "expansion"))
-        values.append(money_row("- Contraction", "contraction"))
-        values.append(money_row("- Churn", "churn"))
+        values.append(money_row("New Business", "new_business"))
+        values.append(money_row("Expansion", "expansion"))
+        values.append(money_row("Contraction", "contraction"))
+        values.append(money_row("Churn", "churn"))
         values.append(money_row("Ending ARR", "ending_arr"))
         values.append(["YoY Growth"] + [_fmt_pct_export(yoy.get(m, {}).get("yoy_pct")) for m in display_months])
         values.append(["NRR (T12M)"] + [_fmt_pct_export(ret.get(m, {}).get("nrr_trailing_12m")) for m in display_months])

@@ -15128,9 +15128,15 @@ async def _pp_project_month_end_context(
             sub_by_name[aname] = (p_hit["start"].isoformat(), p_hit["end"].isoformat())
             opp_ids: set[str] = {p_hit["opp"].sf_id} if p_hit["opp"].sf_id else set()
             for o in closed_expansions_key:
-                if (
-                    o.sf_id
-                    and o.close_date
+                if not o.sf_id:
+                    continue
+                cs = o.contract_start_date
+                ce = o.contract_end_date or o.renewal_date
+                if cs is not None:
+                    if cs <= month_end and (ce is None or month_end <= ce):
+                        opp_ids.add(o.sf_id)
+                elif (
+                    o.close_date
                     and p_hit["start"] <= o.close_date <= p_hit["end"]
                     and o.close_date <= month_end
                 ):

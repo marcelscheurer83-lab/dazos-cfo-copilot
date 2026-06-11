@@ -33,6 +33,7 @@ const PREVIEW_COLUMNS: { key: keyof PPProjectExportRow; label: string; align: 'l
   { key: 'iq_mr_locations', label: 'IQ/ MR locations', align: 'right', fmt: (v) => (v != null ? (v as number).toLocaleString() : '—') },
   { key: 'icampaign_arr', label: 'iCampaign ARR', align: 'right', fmt: (v) => fmtMoney0(v as number) },
   { key: 'rvk_arr', label: 'RVK agent ARR', align: 'right', fmt: (v) => fmtMoney0(v as number) },
+  { key: 'rvk_agent_number', label: 'RVK agent number', align: 'right', fmt: (v) => (v != null ? (v as number).toLocaleString() : '—') },
 ]
 
 export default function AnalysesPPProject() {
@@ -169,7 +170,7 @@ export default function AnalysesPPProject() {
                           style={{
                             padding: '0.45rem 0.6rem',
                             textAlign: col.align,
-                            color: col.key === 'customer_name' || col.key === 'account_id' ? 'var(--text)' : col.key.includes('cohort') || col.key.includes('subscription') || col.key.includes('seats') || col.key.includes('locations') ? 'var(--text-muted)' : 'var(--text)',
+                            color: col.key === 'customer_name' || col.key === 'account_id' ? 'var(--text)' : col.key.includes('cohort') || col.key.includes('subscription') || col.key.includes('seats') || col.key.includes('locations') || col.key === 'rvk_agent_number' ? 'var(--text-muted)' : 'var(--text)',
                           }}
                         >
                           {display}

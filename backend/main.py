@@ -3801,6 +3801,13 @@ def _is_rvk_agent_product(product_name: str | None) -> bool:
     return _arr_product_key(product_name) in _RVK_AGENT_KEYS
 
 
+def _rvk_agent_quantity_for_line_item(product_name: str | None, quantity: float | int | None) -> float:
+    """Agent count from recurring RVK agent line items."""
+    if _is_rvk_agent_product(product_name):
+        return float(quantity or 0)
+    return 0.0
+
+
 # Group key → SKU predicate. Used to compute per-account month-end ARR per product family.
 _PRODUCT_GROUP_PREDICATES: dict[str, Callable[[str | None], bool]] = {
     "crm": _is_crm_product,
@@ -15051,8 +15058,8 @@ PP_PROJECT_EXPORT_MONTH = "2026-05"
 async def _pp_project_month_end_context(
     db: AsyncSession,
     month_end: date,
-) -> tuple[dict[str, tuple[str, str]], dict[str, float]]:
-    """Per account (by name): subscription start/end at month_end, and IQ/MR location count."""
+) -> tuple[dict[str, tuple[str, str]], dict[str, float], dict[str, float]]:
+    """Per account (by name): subscription start/end at month_end, IQ/MR locations, RVK agent count."""
     overrides = await _get_record_type_overrides(db)
 
     def _opp_type(o: Opportunity) -> str:
@@ -15107,6 +15114,7 @@ async def _pp_project_month_end_context(
 
     sub_by_name: dict[str, tuple[str, str]] = {}
     iq_mr_locations_by_name: dict[str, float] = {}
+    rvk_agents_by_name: dict[str, float] = {}
 
     for key in account_keys:
         aname = (key[1] or "").strip()
@@ -15128,14 +15136,18 @@ async def _pp_project_month_end_context(
                 ):
                     opp_ids.add(o.sf_id)
             loc_qty = 0.0
+            rvk_qty = 0.0
             for li in lines:
                 if li.opportunity_sf_id not in opp_ids:
                     continue
                 loc_qty += _iq_mr_location_quantity_for_line_item(li.product_name, li.quantity)
+                rvk_qty += _rvk_agent_quantity_for_line_item(li.product_name, li.quantity)
             if loc_qty:
                 iq_mr_locations_by_name[aname] = round(loc_qty, 2)
+            if rvk_qty:
+                rvk_agents_by_name[aname] = round(rvk_qty, 2)
 
-    return sub_by_name, iq_mr_locations_by_name
+    return sub_by_name, iq_mr_locations_by_name, rvk_agents_by_name
 
 
 async def _build_pp_project_export_data(
@@ -15165,7 +15177,7 @@ async def _build_pp_project_export_data(
     schedule_rows, _ = await _compute_active_arr_rows(db, crm_month_keys=[month_key])
     schedule_by_name: dict[str, dict] = {r.get("account_name") or "—": r for r in schedule_rows}
 
-    sub_by_name, iq_mr_locations_by_name = await _pp_project_month_end_context(db, month_end)
+    sub_by_name, iq_mr_locations_by_name, rvk_agents_by_name = await _pp_project_month_end_context(db, month_end)
 
     export_rows: list[dict] = []
     for aname in sorted(snap.keys()):
@@ -15202,6 +15214,7 @@ async def _build_pp_project_export_data(
             "iq_mr_locations": iq_mr_locations_by_name.get(aname),
             "icampaign_arr": icampaign_arr,
             "rvk_arr": rvk_arr,
+            "rvk_agent_number": rvk_agents_by_name.get(aname),
         })
 
     account_count = len(export_rows)
@@ -15229,6 +15242,7 @@ def _pp_project_export_sheet_values(data: dict) -> list[list]:
         "IQ/ MR locations",
         "iCampaign ARR",
         "RVK agent ARR",
+        "RVK agent number",
     ]
     values = [header]
     for r in data.get("rows") or []:
@@ -15245,6 +15259,7 @@ def _pp_project_export_sheet_values(data: dict) -> list[list]:
             r.get("iq_mr_locations") if r.get("iq_mr_locations") is not None else "",
             round(float(r.get("icampaign_arr") or 0), 2),
             round(float(r.get("rvk_arr") or 0), 2),
+            r.get("rvk_agent_number") if r.get("rvk_agent_number") is not None else "",
         ])
     return values
 

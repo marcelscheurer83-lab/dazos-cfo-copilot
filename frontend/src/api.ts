@@ -815,6 +815,7 @@ export type PPProjectExportRow = {
   iq_mr_locations: number | null
   icampaign_arr: number
   rvk_arr: number
+  rvk_agent_number: number | null
 }
 
 export type PPProjectExportResponse = {

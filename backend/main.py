@@ -3740,6 +3740,30 @@ def _is_additional_iqmr_eins(product_name: str | None) -> bool:
     return "additional" in key and "ein" in key and ("iq" in key or "mr" in key)
 
 
+def _is_iq_platform_fee(product_name: str | None) -> bool:
+    """IQ Platform Fee (Includes 1 EIN) — quantity = location count."""
+    if not product_name or not product_name.strip():
+        return False
+    key = _arr_product_key(product_name)
+    return "iq platform" in key and not _is_additional_iqmr_eins(product_name)
+
+
+def _is_mr_platform_fee(product_name: str | None) -> bool:
+    """Marketing Reports Platform Fee (Includes 1 EIN) — quantity = location count."""
+    if not product_name or not product_name.strip():
+        return False
+    return "marketing reports platform" in _arr_product_key(product_name)
+
+
+def _iq_mr_location_quantity_for_line_item(product_name: str | None, quantity: float | int | None) -> float:
+    """Location/EIN count from IQ Platform, MR Platform, or Additional IQ/MR EINs."""
+    if not product_name:
+        return 0.0
+    if _is_iq_platform_fee(product_name) or _is_mr_platform_fee(product_name) or _is_additional_iqmr_eins(product_name):
+        return float(quantity or 0)
+    return 0.0
+
+
 def _is_iq_product(product_name: str | None) -> bool:
     """IQ family: IQ Platform Fee + the shared Additional IQ/MR EINs add-on (allocated to IQ)."""
     key = _arr_product_key(product_name)
@@ -15107,8 +15131,7 @@ async def _pp_project_month_end_context(
             for li in lines:
                 if li.opportunity_sf_id not in opp_ids:
                     continue
-                if _is_additional_iqmr_eins(li.product_name):
-                    loc_qty += float(li.quantity or 0)
+                loc_qty += _iq_mr_location_quantity_for_line_item(li.product_name, li.quantity)
             if loc_qty:
                 iq_mr_locations_by_name[aname] = round(loc_qty, 2)
 

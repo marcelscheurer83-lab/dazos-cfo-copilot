@@ -3808,21 +3808,6 @@ def _rvk_agent_quantity_for_line_item(product_name: str | None, quantity: float 
     return 0.0
 
 
-def _rvk_agent_count_from_lines(lines: list, opp_ids: set[str]) -> float:
-    """Distinct RVK agents at month-end: max quantity per agent SKU across active opps, then sum."""
-    by_sku: dict[str, float] = {}
-    for li in lines:
-        if (li.opportunity_sf_id or "") not in opp_ids:
-            continue
-        if not _is_rvk_agent_product(li.product_name):
-            continue
-        sku = _arr_product_key(li.product_name)
-        qty = float(li.quantity or 0)
-        if qty > by_sku.get(sku, 0.0):
-            by_sku[sku] = qty
-    return round(sum(by_sku.values()), 2)
-
-
 # Group key → SKU predicate. Used to compute per-account month-end ARR per product family.
 _PRODUCT_GROUP_PREDICATES: dict[str, Callable[[str | None], bool]] = {
     "crm": _is_crm_product,
@@ -15157,11 +15142,12 @@ async def _pp_project_month_end_context(
                 ):
                     opp_ids.add(o.sf_id)
             loc_qty = 0.0
+            rvk_qty = 0.0
             for li in lines:
                 if li.opportunity_sf_id not in opp_ids:
                     continue
                 loc_qty += _iq_mr_location_quantity_for_line_item(li.product_name, li.quantity)
-            rvk_qty = _rvk_agent_count_from_lines(lines, opp_ids)
+                rvk_qty += _rvk_agent_quantity_for_line_item(li.product_name, li.quantity)
             if loc_qty:
                 iq_mr_locations_by_name[aname] = round(loc_qty, 2)
             if rvk_qty:

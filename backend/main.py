@@ -15024,46 +15024,11 @@ PP_PROJECT_EXPORT_SHEET = "P&P project export_May '26"
 PP_PROJECT_EXPORT_MONTH = "2026-05"
 
 
-def _export_quantity_for_line_items(items: list) -> float | None:
-    """Usage metric per SKU row: seats, IQ/MR locations, or RVK agents; blank for iCampaign."""
-    if not items:
-        return None
-    pname = items[0].product_name
-    if _is_icampaign_product(pname):
-        return None
-    if _is_rvk_agent_product(pname):
-        qty = sum(float(li.quantity or 0) for li in items)
-        return round(qty, 2) if qty else None
-    if _is_additional_iqmr_eins(pname):
-        qty = sum(float(li.quantity or 0) for li in items)
-        return round(qty, 2) if qty else None
-    if _is_additional_crm_seats(pname):
-        qty = sum(float(li.quantity or 0) for li in items)
-        return round(qty, 2) if qty else None
-    if _is_crm_platform_includes_5_seats(pname):
-        return 5.0
-    return None
-
-
-def _display_sku_name(items: list) -> str:
-    if not items:
-        return "Other"
-    li = items[0]
-    canonical = _match_arr_product(li.product_name) or _match_arr_product(_normalized_product_name(li.product_name))
-    if canonical:
-        return canonical
-    return (li.product_name or "Other").strip()
-
-
-async def _build_pp_project_export_data(
+async def _pp_project_month_end_context(
     db: AsyncSession,
-    month_key: str = PP_PROJECT_EXPORT_MONTH,
-) -> dict:
-    """May-end (or month_key-end) investor snapshot: one row per customer × active SKU."""
-    month_end = _month_key_to_period(month_key)
-    if month_end is None:
-        return {"month_key": month_key, "as_of": None, "rows": [], "account_count": 0, "line_count": 0}
-
+    month_end: date,
+) -> tuple[dict[str, tuple[str, str]], dict[str, float]]:
+    """Per account (by name): subscription start/end at month_end, and IQ/MR location count."""
     overrides = await _get_record_type_overrides(db)
 
     def _opp_type(o: Opportunity) -> str:
@@ -15087,32 +15052,20 @@ async def _build_pp_project_export_data(
         )
     )
     closed_won_opps = [o for o in (await db.execute(q_cw)).scalars().all() if _is_closed_won_stage(o.stage_name)]
-    q_open = select(Opportunity).where(
-        Opportunity.stage_name.isnot(None),
-        ~Opportunity.stage_name.in_(CLOSED_STAGES),
-    )
-    open_opps = [
-        o for o in (await db.execute(q_open)).scalars().all()
-        if not _is_closed_won_stage(o.stage_name) and (o.stage_name or "").strip().lower() != "closed lost"
-    ]
 
     account_keys: set[tuple[str | None, str | None]] = set()
     for o in closed_won_opps:
         if _is_renewal(o) or _is_nb(o):
-            account_keys.add((o.account_id, o.account_name or None))
-    for o in open_opps:
-        if _is_renewal(o):
             account_keys.add((o.account_id, o.account_name or None))
 
     account_period_opps: dict[tuple[str | None, str | None], list[dict]] = {}
     for key in account_keys:
         cw_for_account = [o for o in closed_won_opps if (o.account_id, o.account_name or None) == key]
         closed_renewal_or_nb = [o for o in cw_for_account if _is_renewal(o) or _is_nb(o)]
-
-        def _period_start(o: Opportunity) -> date:
-            return o.contract_start_date or o.close_date or date.max
-
-        period_opps_sorted = sorted(closed_renewal_or_nb, key=lambda o: (_period_start(o), o.contract_end_date or date.min))
+        period_opps_sorted = sorted(
+            closed_renewal_or_nb,
+            key=lambda o: (o.contract_start_date or o.close_date or date.max, o.contract_end_date or date.min),
+        )
         periods_for_key: list[dict] = []
         for o in period_opps_sorted:
             p_start = o.contract_start_date or o.close_date
@@ -15128,7 +15081,54 @@ async def _build_pp_project_export_data(
         )
     ).scalars().all() if all_closed_sf_ids else []
 
-    # Cohort = first month with ARR > 0
+    sub_by_name: dict[str, tuple[str, str]] = {}
+    iq_mr_locations_by_name: dict[str, float] = {}
+
+    for key in account_keys:
+        aname = (key[1] or "").strip()
+        if not aname:
+            continue
+        periods = account_period_opps.get(key, [])
+        cw_for_account = [o for o in closed_won_opps if (o.account_id, o.account_name or None) == key]
+        closed_expansions_key = [o for o in cw_for_account if _is_expansion(o)]
+        p_hit = next((p for p in periods if p["start"] <= month_end <= p["end"]), None)
+        if p_hit:
+            sub_by_name[aname] = (p_hit["start"].isoformat(), p_hit["end"].isoformat())
+            opp_ids: set[str] = {p_hit["opp"].sf_id} if p_hit["opp"].sf_id else set()
+            for o in closed_expansions_key:
+                if (
+                    o.sf_id
+                    and o.close_date
+                    and p_hit["start"] <= o.close_date <= p_hit["end"]
+                    and o.close_date <= month_end
+                ):
+                    opp_ids.add(o.sf_id)
+            loc_qty = 0.0
+            for li in lines:
+                if li.opportunity_sf_id not in opp_ids:
+                    continue
+                if _is_additional_iqmr_eins(li.product_name):
+                    loc_qty += float(li.quantity or 0)
+            if loc_qty:
+                iq_mr_locations_by_name[aname] = round(loc_qty, 2)
+
+    return sub_by_name, iq_mr_locations_by_name
+
+
+async def _build_pp_project_export_data(
+    db: AsyncSession,
+    month_key: str = PP_PROJECT_EXPORT_MONTH,
+) -> dict:
+    """May-end investor snapshot: one row per account with product-family ARR columns."""
+    month_end = _month_key_to_period(month_key)
+    if month_end is None:
+        return {"month_key": month_key, "as_of": None, "rows": [], "account_count": 0, "line_count": 0}
+
+    named_groups = ["crm", "icampaign", "iq_mr", "rvk"]
+    snap, alloc = await _reconciled_product_alloc(
+        db, month_keys=[month_key], snap_from=month_key, snap_to=month_key, named_groups=named_groups
+    )
+
     history_data = await _build_arr_history_data(db)
     all_months: list[str] = history_data["month_columns"]
     cohort_by_name: dict[str, str] = {}
@@ -15139,124 +15139,76 @@ async def _build_pp_project_export_data(
                 cohort_by_name[name] = mk
                 break
 
-    snap_rows = (
-        await db.execute(select(MonthlyArrSnapshot).where(MonthlyArrSnapshot.month_key == month_key))
-    ).scalars().all()
-    snap_by_name = {s.account_name: round(float(s.arr or 0), 2) for s in snap_rows if (s.arr or 0) > 0}
-
     schedule_rows, _ = await _compute_active_arr_rows(db, crm_month_keys=[month_key])
-    name_to_key: dict[str, tuple[str | None, str | None]] = {}
-    account_id_by_name: dict[str, str | None] = {}
-    for r in schedule_rows:
-        aname = r.get("account_name") or "—"
-        aid = r.get("account_id")
-        name_to_key[aname] = (aid, aname if aname != "—" else None)
-        account_id_by_name[aname] = aid
+    schedule_by_name: dict[str, dict] = {r.get("account_name") or "—": r for r in schedule_rows}
 
-    def _opp_ids_at_month_end(key: tuple[str | None, str | None]) -> tuple[dict | None, set[str]]:
-        periods = account_period_opps.get(key, [])
-        cw_for_account = [o for o in closed_won_opps if (o.account_id, o.account_name or None) == key]
-        closed_expansions_key = [o for o in cw_for_account if _is_expansion(o)]
-        p_hit = next((p for p in periods if p["start"] <= month_end <= p["end"]), None)
-        if p_hit is None:
-            return None, set()
-        opp_ids: set[str] = {p_hit["opp"].sf_id} if p_hit["opp"].sf_id else set()
-        for o in closed_expansions_key:
-            if (
-                o.sf_id
-                and o.close_date
-                and p_hit["start"] <= o.close_date <= p_hit["end"]
-                and o.close_date <= month_end
-            ):
-                opp_ids.add(o.sf_id)
-        return p_hit, opp_ids
+    sub_by_name, iq_mr_locations_by_name = await _pp_project_month_end_context(db, month_end)
 
     export_rows: list[dict] = []
-    for aname in sorted(snap_by_name.keys()):
-        total_arr = snap_by_name[aname]
-        key = name_to_key.get(aname)
-        if key is None:
-            # Try fuzzy match on account keys
-            for k in account_keys:
-                if (k[1] or "").strip() == aname.strip():
-                    key = k
-                    break
-        cohort_month = cohort_by_name.get(aname, "")
-        account_id = account_id_by_name.get(aname)
-        p_hit, opp_ids = _opp_ids_at_month_end(key) if key else (None, set())
-        sub_start = p_hit["start"].isoformat() if p_hit else ""
-        sub_end = p_hit["end"].isoformat() if p_hit else ""
-
-        sku_groups: dict[str, list] = {}
-        for li in lines:
-            if li.opportunity_sf_id not in opp_ids:
-                continue
-            raw = _normalized_product_name(li.product_name)
-            if not _include_line_item_in_arr(raw, li.product_name):
-                continue
-            pk = _arr_product_key(raw) or _arr_product_key(li.product_name) or "other"
-            canonical = _match_arr_product(li.product_name) or _match_arr_product(raw) or pk
-            sku_groups.setdefault(canonical, []).append(li)
-
-        if not sku_groups:
-            export_rows.append({
-                "customer_name": aname,
-                "account_id": account_id,
-                "total_customer_arr": total_arr,
-                "cohort_month": cohort_month,
-                "subscription_start": sub_start,
-                "subscription_end": sub_end,
-                "product_sku": "",
-                "sku_arr": None,
-                "quantity": None,
-            })
+    for aname in sorted(snap.keys()):
+        total_arr = round(float(snap[aname].get(month_key, 0) or 0), 2)
+        if total_arr <= 0:
             continue
+        sched = schedule_by_name.get(aname, {})
+        account_id = sched.get("account_id")
+        cohort_month = cohort_by_name.get(aname, "")
+        sub_start, sub_end = sub_by_name.get(aname, ("", ""))
+        crm_seats = int((sched.get("crm_seats_by_month") or {}).get(month_key, 0) or 0)
 
-        for _pk, items in sorted(sku_groups.items(), key=lambda x: _display_sku_name(x[1])):
-            by_opp: dict[str, list] = {}
-            for li in items:
-                by_opp.setdefault(li.opportunity_sf_id or "", []).append(li)
-            arr = round(sum(_arr_contribution_for_line_group(g) for g in by_opp.values() if g), 2)
-            if not arr:
-                continue
-            export_rows.append({
-                "customer_name": aname,
-                "account_id": account_id,
-                "total_customer_arr": total_arr,
-                "cohort_month": cohort_month,
-                "subscription_start": sub_start,
-                "subscription_end": sub_end,
-                "product_sku": _display_sku_name(items),
-                "sku_arr": arr,
-                "quantity": _export_quantity_for_line_items(items),
-            })
+        def _fam_arr(g: str) -> float:
+            return round(float(alloc.get(g, {}).get(aname, {}).get(month_key, 0) or 0), 2)
 
-    account_count = len(snap_by_name)
+        # Bridge splits Total ARR across 5 families; "other" holds Billing CRM + rounding residue.
+        # Investor export shows 4 product columns — fold other into CRM so columns sum to Total ARR.
+        other_arr = _fam_arr("other")
+        crm_arr = round(_fam_arr("crm") + other_arr, 2)
+        icampaign_arr = _fam_arr("icampaign")
+        iq_mr_arr = _fam_arr("iq_mr")
+        rvk_arr = _fam_arr("rvk")
+
+        export_rows.append({
+            "customer_name": aname,
+            "account_id": account_id,
+            "total_customer_arr": total_arr,
+            "cohort_month": cohort_month,
+            "subscription_start": sub_start,
+            "subscription_end": sub_end,
+            "crm_arr": crm_arr,
+            "crm_seats": crm_seats if crm_seats else None,
+            "iq_mr_arr": iq_mr_arr,
+            "iq_mr_locations": iq_mr_locations_by_name.get(aname),
+            "icampaign_arr": icampaign_arr,
+            "rvk_arr": rvk_arr,
+        })
+
+    account_count = len(export_rows)
     return {
         "month_key": month_key,
         "as_of": month_end.isoformat(),
         "rows": export_rows,
         "account_count": account_count,
-        "line_count": len(export_rows),
-        "grand_total": round(sum(snap_by_name.values()), 2),
+        "line_count": account_count,
+        "grand_total": round(sum(r["total_customer_arr"] for r in export_rows), 2),
     }
 
 
 def _pp_project_export_sheet_values(data: dict) -> list[list]:
     header = [
-        "Customer name",
-        "SFDC Account ID",
-        "Total customer ARR",
-        "Cohort month (first ARR)",
-        "Subscription start",
-        "Subscription end",
-        "Product SKU",
-        "SKU ARR",
-        "Quantity",
+        "Customer",
+        "SF Account ID",
+        "Total ARR",
+        "Cohort",
+        "Sub start",
+        "Sub end",
+        "CRM ARR",
+        "CRM seats",
+        "IQ/ MR ARR",
+        "IQ/ MR locations",
+        "iCampaign ARR",
+        "RVK agent ARR",
     ]
     values = [header]
     for r in data.get("rows") or []:
-        qty = r.get("quantity")
         values.append([
             r.get("customer_name") or "",
             r.get("account_id") or "",
@@ -15264,9 +15216,12 @@ def _pp_project_export_sheet_values(data: dict) -> list[list]:
             r.get("cohort_month") or "",
             r.get("subscription_start") or "",
             r.get("subscription_end") or "",
-            r.get("product_sku") or "",
-            round(float(r["sku_arr"]), 2) if r.get("sku_arr") is not None else "",
-            qty if qty is not None else "",
+            round(float(r.get("crm_arr") or 0), 2),
+            r.get("crm_seats") if r.get("crm_seats") is not None else "",
+            round(float(r.get("iq_mr_arr") or 0), 2),
+            r.get("iq_mr_locations") if r.get("iq_mr_locations") is not None else "",
+            round(float(r.get("icampaign_arr") or 0), 2),
+            round(float(r.get("rvk_arr") or 0), 2),
         ])
     return values
 
@@ -15276,7 +15231,7 @@ async def get_pp_project_export(
     month: Optional[str] = Query(None, description="Month key YYYY-MM (default May 2026)"),
     db: AsyncSession = Depends(get_db),
 ):
-    """Preview the P&P / investor customer snapshot (one row per customer × SKU)."""
+    """Preview the P&P / investor customer snapshot (one row per account)."""
     data = await _build_pp_project_export_data(db, month_key=(month or PP_PROJECT_EXPORT_MONTH).strip())
     base = os.getenv("SALESFORCE_BASE_URL", "").strip().rstrip("/")
     if base:

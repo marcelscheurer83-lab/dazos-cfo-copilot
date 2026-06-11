@@ -20,6 +20,21 @@ function fmtCohortMonth(ym: string) {
   return `${months[m - 1]} ${y}`
 }
 
+const PREVIEW_COLUMNS: { key: keyof PPProjectExportRow; label: string; align: 'left' | 'right'; fmt?: (v: unknown) => string }[] = [
+  { key: 'customer_name', label: 'Customer', align: 'left' },
+  { key: 'account_id', label: 'SF Account ID', align: 'left' },
+  { key: 'total_customer_arr', label: 'Total ARR', align: 'right', fmt: (v) => fmtMoney0(v as number) },
+  { key: 'cohort_month', label: 'Cohort', align: 'right', fmt: (v) => fmtCohortMonth(v as string) },
+  { key: 'subscription_start', label: 'Sub start', align: 'right', fmt: (v) => (v as string) || '—' },
+  { key: 'subscription_end', label: 'Sub end', align: 'right', fmt: (v) => (v as string) || '—' },
+  { key: 'crm_arr', label: 'CRM ARR', align: 'right', fmt: (v) => fmtMoney0(v as number) },
+  { key: 'crm_seats', label: 'CRM seats', align: 'right', fmt: (v) => (v != null ? (v as number).toLocaleString() : '—') },
+  { key: 'iq_mr_arr', label: 'IQ/ MR ARR', align: 'right', fmt: (v) => fmtMoney0(v as number) },
+  { key: 'iq_mr_locations', label: 'IQ/ MR locations', align: 'right', fmt: (v) => (v != null ? (v as number).toLocaleString() : '—') },
+  { key: 'icampaign_arr', label: 'iCampaign ARR', align: 'right', fmt: (v) => fmtMoney0(v as number) },
+  { key: 'rvk_arr', label: 'RVK agent ARR', align: 'right', fmt: (v) => fmtMoney0(v as number) },
+]
+
 export default function AnalysesPPProject() {
   const [data, setData] = useState<PPProjectExportResponse | null>(null)
   const [loading, setLoading] = useState(true)
@@ -69,13 +84,13 @@ export default function AnalysesPPProject() {
             P&amp;P Project (May &apos;26)
           </h2>
           <p style={{ margin: 0, fontSize: '0.85rem', color: 'var(--text-muted)', maxWidth: 720, lineHeight: 1.45 }}>
-            Investor snapshot as of May 31, 2026 — one row per customer × active product SKU.
-            Total ARR reconciles to the ARR bridge; cohort month is the first month with ARR &gt; 0;
-            subscription dates reflect the term active at month-end; quantity = CRM seats, IQ/MR locations, or RVK agents where applicable.
+            Investor snapshot as of May 31, 2026 — one row per account.
+            Total ARR reconciles to the ARR bridge; product-family columns use the same allocation as Analytics;
+            cohort is the first month with ARR &gt; 0; subscription dates reflect the term active at month-end.
           </p>
           {data?.as_of && (
             <p style={{ margin: '0.35rem 0 0', fontSize: '0.8rem', color: 'var(--text-muted)' }}>
-              {data.account_count.toLocaleString()} accounts · {data.line_count.toLocaleString()} rows · {fmtMoney0(data.grand_total)} total ARR
+              {data.account_count.toLocaleString()} accounts · {fmtMoney0(data.grand_total)} total ARR
             </p>
           )}
         </div>
@@ -120,50 +135,47 @@ export default function AnalysesPPProject() {
       {!loading && !error && rows.length > 0 && (
         <>
           <p style={{ margin: '0 0 0.5rem', fontSize: '0.8rem', color: 'var(--text-muted)' }}>
-            Preview (first {preview.length} of {rows.length} rows)
+            Preview (first {preview.length} of {rows.length} accounts)
           </p>
           <div style={{ overflowX: 'auto', border: '1px solid var(--border)', borderRadius: 8 }}>
             <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.8rem' }}>
               <thead>
                 <tr style={{ background: 'var(--surface)', borderBottom: '1px solid var(--border)' }}>
-                  {[
-                    'Customer',
-                    'Total ARR',
-                    'Cohort',
-                    'Sub start',
-                    'Sub end',
-                    'Product SKU',
-                    'SKU ARR',
-                    'Qty',
-                  ].map((h) => (
+                  {PREVIEW_COLUMNS.map((col) => (
                     <th
-                      key={h}
+                      key={col.key}
                       style={{
-                        textAlign: h === 'Customer' || h === 'Product SKU' ? 'left' : 'right',
+                        textAlign: col.align,
                         padding: '0.45rem 0.6rem',
                         fontWeight: 500,
                         color: 'var(--text-muted)',
                         whiteSpace: 'nowrap',
                       }}
                     >
-                      {h}
+                      {col.label}
                     </th>
                   ))}
                 </tr>
               </thead>
               <tbody>
                 {preview.map((r, i) => (
-                  <tr key={`${r.customer_name}-${r.product_sku}-${i}`} style={{ borderBottom: '1px solid var(--border)' }}>
-                    <td style={{ padding: '0.45rem 0.6rem', color: 'var(--text)' }}>{r.customer_name}</td>
-                    <td style={{ padding: '0.45rem 0.6rem', textAlign: 'right' }}>{fmtMoney0(r.total_customer_arr)}</td>
-                    <td style={{ padding: '0.45rem 0.6rem', textAlign: 'right', color: 'var(--text-muted)' }}>{fmtCohortMonth(r.cohort_month)}</td>
-                    <td style={{ padding: '0.45rem 0.6rem', textAlign: 'right', color: 'var(--text-muted)' }}>{r.subscription_start || '—'}</td>
-                    <td style={{ padding: '0.45rem 0.6rem', textAlign: 'right', color: 'var(--text-muted)' }}>{r.subscription_end || '—'}</td>
-                    <td style={{ padding: '0.45rem 0.6rem', color: 'var(--text)' }}>{r.product_sku || '—'}</td>
-                    <td style={{ padding: '0.45rem 0.6rem', textAlign: 'right' }}>{r.sku_arr != null ? fmtMoney0(r.sku_arr) : '—'}</td>
-                    <td style={{ padding: '0.45rem 0.6rem', textAlign: 'right', color: 'var(--text-muted)' }}>
-                      {r.quantity != null ? r.quantity.toLocaleString() : '—'}
-                    </td>
+                  <tr key={`${r.customer_name}-${r.account_id ?? i}`} style={{ borderBottom: '1px solid var(--border)' }}>
+                    {PREVIEW_COLUMNS.map((col) => {
+                      const raw = r[col.key]
+                      const display = col.fmt ? col.fmt(raw) : String(raw ?? '—')
+                      return (
+                        <td
+                          key={col.key}
+                          style={{
+                            padding: '0.45rem 0.6rem',
+                            textAlign: col.align,
+                            color: col.key === 'customer_name' || col.key === 'account_id' ? 'var(--text)' : col.key.includes('cohort') || col.key.includes('subscription') || col.key.includes('seats') || col.key.includes('locations') ? 'var(--text-muted)' : 'var(--text)',
+                          }}
+                        >
+                          {display}
+                        </td>
+                      )
+                    })}
                   </tr>
                 ))}
               </tbody>

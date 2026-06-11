@@ -809,9 +809,12 @@ export type PPProjectExportRow = {
   cohort_month: string
   subscription_start: string
   subscription_end: string
-  product_sku: string
-  sku_arr: number | null
-  quantity: number | null
+  crm_arr: number
+  crm_seats: number | null
+  iq_mr_arr: number
+  iq_mr_locations: number | null
+  icampaign_arr: number
+  rvk_arr: number
 }
 
 export type PPProjectExportResponse = {

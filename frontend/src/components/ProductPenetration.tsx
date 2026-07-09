@@ -16,6 +16,7 @@ const PRODUCT_ACCENTS: Record<string, string> = {
   iCampaign: '#f5a623',
   IQMR: '#7c6af7',
   RVK: '#3ecfff',
+  SamurAI: '#e85d9c',
 }
 
 /** Depth 0–MAX: muted/dark → bright. Index by depth (1–MAX used when 0 is hidden). */
@@ -49,6 +50,7 @@ export type ProductPenetrationAccount = {
   hasICampaign: boolean
   hasIqMr: boolean
   hasRvk: boolean
+  hasSamurAI: boolean
   /** Optional for listing accounts with 0 products. */
   accountName?: string | null
   accountId?: string | null
@@ -59,6 +61,7 @@ export type ProductPenetrationAccount = {
   arrICampaign?: number
   arrIqMr?: number
   arrRvk?: number
+  arrSamurAI?: number
 }
 
 type Props = {
@@ -71,12 +74,13 @@ type Props = {
   panelsOnly?: boolean
 }
 
-const PRODUCT_KEYS = ['CRM', 'iCampaign', 'IQMR', 'RVK'] as const
+const PRODUCT_KEYS = ['CRM', 'iCampaign', 'IQMR', 'RVK', 'SamurAI'] as const
 const PRODUCT_LABELS: Record<string, string> = {
   CRM: 'CRM',
   iCampaign: 'iCampaign',
   IQMR: 'IQ & Marketing Reports',
   RVK: 'RVK Agents',
+  SamurAI: 'SamurAI suite',
 }
 const MAX_PRODUCT_DEPTH = PRODUCT_KEYS.length
 
@@ -106,6 +110,7 @@ function getHas(a: ProductPenetrationAccount, key: string): boolean {
     case 'iCampaign': return a.hasICampaign
     case 'IQMR': return a.hasIqMr
     case 'RVK': return a.hasRvk
+    case 'SamurAI': return a.hasSamurAI
     default: return false
   }
 }
@@ -117,6 +122,7 @@ function getArrForProduct(a: ProductPenetrationAccount, key: string): number {
     case 'iCampaign': return a.arrICampaign ?? 0
     case 'IQMR': return a.arrIqMr ?? 0
     case 'RVK': return a.arrRvk ?? 0
+    case 'SamurAI': return a.arrSamurAI ?? 0
     default: return 0
   }
 }
@@ -281,7 +287,7 @@ export function KeyTakeaways({
         {asOfLabel ? ` (${asOfLabel})` : ''}
       </div>
       <p style={{ ...panelDescStyle, marginTop: 0 }}>
-        CRM, iCampaign, IQ &amp; Marketing Reports, and RVK Agents — reconciled to the ARR bridge.
+        CRM, iCampaign, IQ &amp; Marketing Reports, RVK Agents, and SamurAI suite — reconciled to the ARR bridge.
       </p>
       <div style={{ display: 'flex', flexDirection: 'column', gap: '0.6rem', fontSize: '0.8rem', color: 'var(--text)', lineHeight: 1.4 }}>
         <div>
@@ -353,7 +359,7 @@ export default function ProductPenetration({ accounts, salesforceBaseUrl, curren
           Product depth distribution
         </div>
         <p style={panelDescStyle}>
-          Count of accounts by number of product families held (CRM, iCampaign, IQ &amp; MR, RVK Agents).
+          Count of accounts by number of product families held (CRM, iCampaign, IQ &amp; MR, RVK Agents, SamurAI suite).
         </p>
         <div style={{ height: 260, width: '100%', flexShrink: 0 }}>
           <ResponsiveContainer width="100%" height="100%">
@@ -616,7 +622,7 @@ export default function ProductPenetration({ accounts, salesforceBaseUrl, curren
           Product depth distribution
         </div>
         <p style={panelDescStyle}>
-          Count of accounts by number of product families held (CRM, iCampaign, IQ &amp; MR, RVK Agents).
+          Count of accounts by number of product families held (CRM, iCampaign, IQ &amp; MR, RVK Agents, SamurAI suite).
         </p>
         <div style={{ height: 260, width: '100%', flexShrink: 0 }}>
           <ResponsiveContainer width="100%" height="100%">
@@ -1088,7 +1094,7 @@ export default function ProductPenetration({ accounts, salesforceBaseUrl, curren
   )
 }
 
-/** Map the analytics per-account reconciled family ARR (by_group: crm | icampaign | iq_mr | rvk | other)
+/** Map the analytics per-account reconciled family ARR (by_group: crm | icampaign | iq_mr | rvk | samurai_suite | other)
  *  to the product-penetration booleans + per-family ARR. Mirrors the ARR bridges, so the same accounts
  *  and ARR appear here as in the bridges (Alleva included). `arr` is the account's total month-end ARR. */
 export function accountsFromByGroup(
@@ -1101,11 +1107,13 @@ export function accountsFromByGroup(
     const arrICampaign = val('icampaign')
     const arrIqMr = val('iq_mr')
     const arrRvk = val('rvk')
+    const arrSamurAI = val('samurai_suite')
     return {
       hasCrm: arrCrm > 0,
       hasICampaign: arrICampaign > 0,
       hasIqMr: arrIqMr > 0,
       hasRvk: arrRvk > 0,
+      hasSamurAI: arrSamurAI > 0,
       accountName: row.account_name ?? null,
       accountId: row.account_id ?? null,
       arr: typeof row.arr === 'number' ? row.arr : undefined,
@@ -1113,6 +1121,7 @@ export function accountsFromByGroup(
       arrICampaign: arrICampaign > 0 ? arrICampaign : undefined,
       arrIqMr: arrIqMr > 0 ? arrIqMr : undefined,
       arrRvk: arrRvk > 0 ? arrRvk : undefined,
+      arrSamurAI: arrSamurAI > 0 ? arrSamurAI : undefined,
     }
   })
 }

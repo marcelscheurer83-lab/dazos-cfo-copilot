@@ -28,7 +28,7 @@ export default function AnalyticsView() {
         // Per-account reconciled family ARR (same accounts/ARR as the bridges, Alleva included).
         const allAccounts = accountsFromByGroup(arrRes.accounts ?? [])
         const withAtLeastOneProduct = allAccounts.filter(
-          (a) => a.hasCrm || a.hasICampaign || a.hasIqMr || a.hasRvk
+          (a) => a.hasCrm || a.hasICampaign || a.hasIqMr || a.hasRvk || a.hasSamurAI
         )
         setPenetrationAccounts(withAtLeastOneProduct)
       })

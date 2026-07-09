@@ -584,9 +584,9 @@ export async function exportARRToGoogleSheet(): Promise<{ ok: boolean; error?: s
 
 /** Analytics: Active ARR by product line as of a month-end (default = last day of previous month).
  *  Uses the same reconciled split as the ARR bridges, so the totals tie to the Total ARR bridge.
- *  Product family keys: crm, icampaign, iq_mr, rvk, other. */
+ *  Product family keys: crm, icampaign, iq_mr, rvk, samurai_suite, other. */
 export type ActiveARRAnalyticsGroup = {
-  /** Family key (crm | icampaign | iq_mr | rvk | other). */
+  /** Family key (crm | icampaign | iq_mr | rvk | samurai_suite | other). */
   key: string
   label: string
   arr: number

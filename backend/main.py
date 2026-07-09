@@ -3780,14 +3780,25 @@ def _is_iq_mr_product(product_name: str | None) -> bool:
     return _is_iq_product(product_name) or _is_marketing_reports_product(product_name)
 
 
+_SAMURAI_SUITE_KEYS = frozenset({
+    "dojo by dazos",
+})
+
+
+def _is_samurai_suite_product(product_name: str | None) -> bool:
+    """SamurAI suite: Dojo by Dazos and related SKUs."""
+    return _arr_product_key(product_name) in _SAMURAI_SUITE_KEYS
+
+
 def _is_other_product(product_name: str | None) -> bool:
-    """'Other' family: any ARR-included SKU not in CRM / iCampaign / IQ&MR / RVK
-    (e.g. Billing Company CRM Platform). Lines are pre-filtered by _include_line_item_in_arr."""
+    """'Other' family: any ARR-included SKU not in CRM / iCampaign / IQ&MR / RVK / SamurAI suite.
+    Lines are pre-filtered by _include_line_item_in_arr."""
     return not (
         _is_crm_product(product_name)
         or _is_icampaign_product(product_name)
         or _is_iq_mr_product(product_name)
         or _is_rvk_agent_product(product_name)
+        or _is_samurai_suite_product(product_name)
     )
 
 
@@ -3816,6 +3827,7 @@ _PRODUCT_GROUP_PREDICATES: dict[str, Callable[[str | None], bool]] = {
     "marketing_reports": _is_marketing_reports_product,
     "iq_mr": _is_iq_mr_product,
     "rvk": _is_rvk_agent_product,
+    "samurai_suite": _is_samurai_suite_product,
     "other": _is_other_product,
 }
 
@@ -8026,6 +8038,7 @@ _PRODUCT_BRIDGE_DEFS: dict[str, str] = {
     "icampaign": "iCampaign",
     "iq_mr": "IQ & Marketing Reports",
     "rvk": "RVK Agents",
+    "samurai_suite": "SamurAI suite",
     "other": "Other",
 }
 
@@ -15199,9 +15212,9 @@ async def _build_pp_project_export_data(
         def _fam_arr(g: str) -> float:
             return round(float(alloc.get(g, {}).get(aname, {}).get(month_key, 0) or 0), 2)
 
-        # Bridge splits Total ARR across 5 families; "other" holds Billing CRM + rounding residue.
-        # Investor export shows 4 product columns — fold other into CRM so columns sum to Total ARR.
-        other_arr = _fam_arr("other")
+        # Bridge splits Total ARR across 6 families; "other" + "samurai_suite" hold residuals.
+        # Investor export shows 4 product columns — fold both into CRM so columns sum to Total ARR.
+        other_arr = _fam_arr("other") + _fam_arr("samurai_suite")
         crm_arr = round(_fam_arr("crm") + other_arr, 2)
         icampaign_arr = _fam_arr("icampaign")
         iq_mr_arr = _fam_arr("iq_mr")

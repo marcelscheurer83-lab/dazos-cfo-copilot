@@ -15,7 +15,6 @@ const nav: NavItem[] = [
   { to: '/arr', label: 'ARR' },
   { to: '/financials', label: 'Financials' },
   { to: '/analyses', label: 'Analyses' },
-  { to: '/board-slides', label: 'Board Slides' },
 ]
 
 const topLevelFontSize = '0.875rem'

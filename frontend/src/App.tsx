@@ -29,8 +29,6 @@ import YTDOverview from './views/YTDOverview'
 import Forecast2026 from './views/Forecast2026'
 import FPAChat from './views/FPAChat'
 import FinancialsDataSync from './views/FinancialsDataSync'
-import BoardSlides from './views/BoardSlides'
-
 // ── Global background-jobs context ───────────────────────────────────────────
 interface JobsContextValue {
   jobs: ActiveJob[]
@@ -169,7 +167,6 @@ export default function App() {
           <Route path="fpa-chat" element={<FPAChat />} />
           <Route path="data-sync" element={<FinancialsDataSync />} />
         </Route>
-        <Route path="board-slides" element={<BoardSlides />} />
       </Route>
       <Route path="*" element={<Navigate to="/dashboard" replace />} />
     </Routes>

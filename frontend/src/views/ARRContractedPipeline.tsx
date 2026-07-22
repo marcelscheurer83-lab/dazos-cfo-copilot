@@ -1,5 +1,11 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { getContractedPipeline, type ContractedPipelineRow } from '../api'
+import { getContractedPipeline, refreshAppDataset, getDatasetStatus, type ContractedPipelineRow, type DatasetStatus } from '../api'
+
+function formatDatasetUpdatedUtc(iso: string): string {
+  const d = new Date(iso)
+  if (Number.isNaN(d.getTime())) return iso
+  return d.toLocaleString('en-US', { month: 'short', day: 'numeric', year: 'numeric', hour: '2-digit', minute: '2-digit' })
+}
 
 function fmtMoney(n: number) {
   return new Intl.NumberFormat('en-US', {
@@ -27,6 +33,9 @@ export default function ARRContractedPipeline() {
   const [err, setErr] = useState<string | null>(null)
   const [sortKey, setSortKey] = useState<SortKey>('contract_start_date')
   const [sortDir, setSortDir] = useState<'asc' | 'desc'>('asc')
+  const [refreshLoading, setRefreshLoading] = useState(false)
+  const [refreshMessage, setRefreshMessage] = useState<string | null>(null)
+  const [datasetStatus, setDatasetStatus] = useState<DatasetStatus | null>(null)
 
   const load = useCallback(() => {
     setLoading(true)
@@ -42,6 +51,26 @@ export default function ARRContractedPipeline() {
       })
       .catch((e: unknown) => setErr(e instanceof Error ? e.message : 'Failed to load'))
       .finally(() => setLoading(false))
+    getDatasetStatus()
+      .then(setDatasetStatus)
+      .catch(() => setDatasetStatus(null))
+  }, [])
+
+  const handleRefreshAppData = useCallback(async () => {
+    setRefreshMessage(null)
+    setRefreshLoading(true)
+    try {
+      const res = await refreshAppDataset()
+      setRefreshLoading(false)
+      if (res.ok) {
+        setRefreshMessage('Refresh started — running in the background.')
+      } else {
+        setRefreshMessage(res.error ?? 'Refresh failed to start.')
+      }
+    } catch (e: unknown) {
+      setRefreshLoading(false)
+      setRefreshMessage(e instanceof Error ? e.message : 'Refresh failed')
+    }
   }, [])
 
   useEffect(() => { load() }, [load])
@@ -105,11 +134,42 @@ export default function ARRContractedPipeline() {
         <h1 style={{ margin: 0, fontSize: '1.5rem', fontWeight: 600, color: 'var(--text)' }}>
           Contracted ARR Pipeline
         </h1>
+        <button
+          type="button"
+          onClick={handleRefreshAppData}
+          disabled={refreshLoading}
+          style={{
+            padding: '0.5rem 1rem',
+            fontSize: '0.9rem',
+            fontWeight: 600,
+            cursor: refreshLoading ? 'wait' : 'pointer',
+            background: 'var(--accent)',
+            color: 'var(--accent-contrast, #fff)',
+            border: 'none',
+            borderRadius: 6,
+          }}
+        >
+          {refreshLoading ? 'Refreshing…' : 'Refresh app data'}
+        </button>
+        <span style={{ fontSize: '0.85rem', color: 'var(--text-muted)' }}>
+          {datasetStatus?.updated_at
+            ? `Last updated: ${formatDatasetUpdatedUtc(datasetStatus.updated_at)}`
+            : 'No refresh yet'}
+        </span>
         <span style={{ fontSize: '0.85rem', color: 'var(--text-muted)' }}>
           {sorted.length} future-start subscription{sorted.length !== 1 ? 's' : ''} ·{' '}
           delta to Contracted ARR: <strong style={{ color: 'var(--text)' }}>{fmtMoney(totalArr)}</strong>
         </span>
       </div>
+      {refreshMessage && (
+        <p style={{
+          fontSize: '0.9rem',
+          color: refreshMessage.includes('failed') || refreshMessage.includes('error') ? 'var(--negative)' : 'var(--text-muted)',
+          margin: '0 0 1rem',
+        }}>
+          {refreshMessage}
+        </p>
+      )}
 
       {rows.length === 0 ? (
         <p style={{ fontSize: '0.9rem', color: 'var(--text-muted)' }}>No future-start Closed Won subscriptions found.</p>

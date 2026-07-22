@@ -4,6 +4,7 @@ const tabs = [
   { to: '/arr/bridge', label: 'Bridge' },
   { to: '/arr/cohort-churn', label: 'Cohort Retention' },
   { to: '/arr/schedule', label: 'Schedule' },
+  { to: '/arr/contracted', label: 'Contracted ARR' },
 ]
 
 export default function ARRLayout() {

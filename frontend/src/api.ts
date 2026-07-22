@@ -801,6 +801,32 @@ export async function getNewScheduleAccounts(): Promise<NewScheduleAccountsRespo
   return r.json()
 }
 
+export type ContractedPipelineRow = {
+  account_id: string
+  account_name: string
+  type?: string | null
+  status?: string | null
+  /** ISO YYYY-MM-DD — contract start date on the opportunity (future, > today). */
+  contract_start_date?: string | null
+  /** ISO YYYY-MM-DD — contract end date on the opportunity. */
+  contract_end_date?: string | null
+  /** Expansion_ARR__c on the opportunity — same field used to compute the Live→Contracted delta. */
+  arr: number
+}
+
+export type ContractedPipelineResponse = {
+  rows: ContractedPipelineRow[]
+  /** Sum of all row ARR values — equals the Live→Contracted delta. */
+  total_arr: number
+  salesforce_base_url?: string
+}
+
+export async function getContractedPipeline(): Promise<ContractedPipelineResponse> {
+  const r = await apiFetch('/arr-schedule/contracted-pipeline', { cache: 'no-store' })
+  if (!r.ok) throw new Error('Failed to fetch contracted pipeline')
+  return r.json()
+}
+
 export type ExportCopilotARRScheduleResult = {
   ok: boolean
   spreadsheet_url?: string

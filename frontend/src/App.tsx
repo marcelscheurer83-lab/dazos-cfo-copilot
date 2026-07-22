@@ -7,6 +7,7 @@ import DashboardLayout from './views/DashboardLayout'
 import GoToMarketLayout from './views/GoToMarketLayout'
 import DashboardCurrentSummary from './views/DashboardCurrentSummary'
 import ARRNewSchedule from './views/ARRNewSchedule'
+import ARRContractedPipeline from './views/ARRContractedPipeline'
 import ARRCohortChurn from './views/ARRCohortChurn'
 import ARRBridge from './views/ARRBridge'
 import ForecastView from './views/ForecastView'
@@ -142,6 +143,7 @@ export default function App() {
           <Route path="bridge" element={<ARRBridge />} />
           <Route path="cohort-churn" element={<ARRCohortChurn />} />
           <Route path="schedule" element={<ARRNewSchedule />} />
+          <Route path="contracted" element={<ARRContractedPipeline />} />
         </Route>
         {/* Legacy deep-links kept working */}
         <Route path="analytics" element={<Navigate to="/analyses/product-penetration" replace />} />

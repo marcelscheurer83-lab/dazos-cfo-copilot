@@ -6230,6 +6230,68 @@ async def get_new_schedule_accounts(db: AsyncSession = Depends(get_db)):
     return {"rows": rows, "month_columns": month_keys, "salesforce_base_url": sf_url}
 
 
+@app.get("/api/arr-schedule/contracted-pipeline")
+async def get_contracted_pipeline(db: AsyncSession = Depends(get_db)):
+    """
+    Returns individual Closed Won opportunities whose contract_start_date is strictly
+    after today (EST).  These are the future-start subscriptions whose ARR (Expansion_ARR__c)
+    makes up the delta between Live ARR and Contracted ARR on the Schedule.
+    """
+    today_est = datetime.now(EST).date()
+
+    q_cw = select(Opportunity).where(
+        or_(
+            Opportunity.stage_name.in_(CLOSED_STAGES),
+            func.lower(func.trim(Opportunity.stage_name)) == "closed won",
+        )
+    )
+    r = await db.execute(q_cw)
+    future_opps = [
+        o for o in r.scalars().all()
+        if _is_closed_won_stage(o.stage_name)
+        and o.contract_start_date is not None
+        and o.contract_start_date > today_est
+    ]
+
+    account_ids_list = list({(o.account_id or "").strip() for o in future_opps if o.account_id})
+    account_type_map: dict[str, str | None] = {}
+    account_status_map: dict[str, str | None] = {}
+    if account_ids_list:
+        q_acc = select(Account.sf_id, Account.type, Account.status).where(Account.sf_id.in_(account_ids_list))
+        r_acc = await db.execute(q_acc)
+        for sf_id, typ, st in r_acc.all():
+            account_type_map[sf_id] = typ
+            account_status_map[sf_id] = st
+
+    rows: list[dict] = []
+    for o in future_opps:
+        aid = (o.account_id or "").strip()
+        val = getattr(o, "expansion_arr", None)
+        if val is None:
+            continue
+        arr_val = float(val)
+        if arr_val == 0.0:
+            continue
+        rows.append(
+            {
+                "account_id": aid,
+                "account_name": (o.account_name or "").strip() or "—",
+                "type": account_type_map.get(aid),
+                "status": (account_status_map.get(aid) or "").strip() or None,
+                "contract_start_date": o.contract_start_date.isoformat() if o.contract_start_date else None,
+                "contract_end_date": o.contract_end_date.isoformat() if o.contract_end_date else None,
+                "arr": arr_val,
+            }
+        )
+
+    rows.sort(key=lambda x: (x.get("contract_start_date") or "", x["account_name"].lower()))
+    total_arr = round(sum(r["arr"] for r in rows), 2)
+
+    base = os.getenv("SALESFORCE_BASE_URL", "").strip().rstrip("/")
+    sf_url = base if base and ("salesforce.com" in base or "lightning.force.com" in base) else None
+    return {"rows": rows, "total_arr": total_arr, "salesforce_base_url": sf_url}
+
+
 async def _build_arr_history_data(db: AsyncSession) -> dict:
     """
     Core data-builder shared by /api/arr-history and /api/arr-cohort-churn.

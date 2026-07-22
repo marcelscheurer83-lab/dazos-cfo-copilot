@@ -1,6 +1,6 @@
 import { Component, createContext, type ReactNode, useCallback, useContext, useEffect, useRef, useState } from 'react'
 import { Routes, Route, Navigate } from 'react-router-dom'
-import { getActiveJobs, type ActiveJob } from './api'
+import { getActiveJobs, isAuthenticated, type ActiveJob } from './api'
 import Layout from './Layout'
 import Login from './Login'
 import DashboardLayout from './views/DashboardLayout'
@@ -98,9 +98,7 @@ class ErrorBoundary extends Component<{ children: ReactNode }, { error: Error | 
 }
 
 export default function App() {
-  const [authenticated, setAuthenticated] = useState(
-    () => sessionStorage.getItem('app_password') !== null
-  )
+  const [authenticated, setAuthenticated] = useState(() => isAuthenticated())
 
   if (!authenticated) {
     return <Login onSuccess={() => setAuthenticated(true)} />

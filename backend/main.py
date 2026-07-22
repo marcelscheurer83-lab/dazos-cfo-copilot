@@ -16,6 +16,8 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 from typing import Any, Callable, List, Optional
 
+import jwt as _pyjwt
+from passlib.context import CryptContext as _CryptContext
 from dotenv import load_dotenv, dotenv_values
 from fastapi import FastAPI, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
@@ -71,6 +73,7 @@ from models import (
     ChurnObservations,
     WeeklyBriefing,
     ConversationMessage,
+    AppUser,
 )
 from schemas import (
     KPISummary,
@@ -166,7 +169,64 @@ APP_PASSWORD = (_app_password_raw or "").strip().strip('"').strip("'") or None
 
 ANTHROPIC_API_KEY = (os.getenv("ANTHROPIC_API_KEY") or "").strip() or None
 
+# JWT auth for individual user accounts
+_jwt_secret_raw = _env_dict.get("JWT_SECRET") or os.getenv("JWT_SECRET")
+JWT_SECRET: str = (_jwt_secret_raw or "").strip() or (APP_PASSWORD or "change-me-set-JWT_SECRET")
+JWT_ALGORITHM = "HS256"
+JWT_EXPIRE_HOURS = 12 * 30  # 6-month tokens — long-lived for an internal tool
+
+# Initial user seeded on first startup (set both to create the account automatically)
+INITIAL_USER_EMAIL = (_env_dict.get("INITIAL_USER_EMAIL") or os.getenv("INITIAL_USER_EMAIL") or "").strip().lower() or None
+INITIAL_USER_PASSWORD = (_env_dict.get("INITIAL_USER_PASSWORD") or os.getenv("INITIAL_USER_PASSWORD") or "").strip() or None
+
 EST = ZoneInfo("America/New_York")
+
+
+# ── User auth helpers ─────────────────────────────────────────────────────────
+_pwd_context = _CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+
+def _hash_password(plain: str) -> str:
+    return _pwd_context.hash(plain)
+
+
+def _verify_password(plain: str, hashed: str) -> bool:
+    return _pwd_context.verify(plain, hashed)
+
+
+def _create_jwt(email: str) -> str:
+    payload = {
+        "sub": email,
+        "iat": datetime.now(timezone.utc),
+        "exp": datetime.now(timezone.utc) + timedelta(hours=JWT_EXPIRE_HOURS),
+    }
+    return _pyjwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+
+def _decode_jwt(token: str) -> str | None:
+    """Returns the email from a valid token, or None."""
+    try:
+        data = _pyjwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        return data.get("sub")
+    except _pyjwt.PyJWTError:
+        return None
+
+
+async def _seed_initial_user() -> None:
+    """Create INITIAL_USER_EMAIL on first startup if the app_users table is empty."""
+    if not INITIAL_USER_EMAIL or not INITIAL_USER_PASSWORD:
+        return
+    async with AsyncSessionLocal() as db:
+        existing = (await db.execute(select(AppUser).where(AppUser.email == INITIAL_USER_EMAIL))).scalar_one_or_none()
+        if existing:
+            return
+        user = AppUser(email=INITIAL_USER_EMAIL, hashed_password=_hash_password(INITIAL_USER_PASSWORD))
+        db.add(user)
+        await db.commit()
+        logging.info("Seeded initial user: %s", INITIAL_USER_EMAIL)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 def _app_dataset_updated_at_as_utc(dt: datetime) -> datetime:
@@ -344,6 +404,7 @@ async def _migrate_db() -> None:
 async def lifespan(app: FastAPI):
     await seed()
     await _migrate_db()
+    await _seed_initial_user()
     await _scrub_app_dataset_quickbooks_legacy_on_startup()
     await asyncio.to_thread(_init_api_timing_log_file_on_startup)
     await _remove_ascension_ascend_overrides()
@@ -382,16 +443,20 @@ def _cors_headers_for_request(request: Request) -> dict:
 
 
 class RequireAppPasswordMiddleware(BaseHTTPMiddleware):
-    """When APP_PASSWORD is set, require X-App-Password header on all /api/ requests."""
+    """Auth middleware: accepts either a Bearer JWT (user login) or X-App-Password (legacy/API clients).
+    When APP_PASSWORD is not set, all /api/ requests pass through unauthenticated."""
 
     async def dispatch(self, request: Request, call_next):
         if not request.url.path.startswith("/api/"):
             return await call_next(request)
-        # Let OPTIONS (CORS preflight) through so the browser gets 200 and can send the real request with the password header
+        # Let OPTIONS (CORS preflight) through so the browser gets 200 and can send the real request with the auth header
         if request.method == "OPTIONS":
             return await call_next(request)
         # Health check: no auth so frontend can detect "backend reachable" before login
         if request.method == "GET" and request.url.path == "/api/health":
+            return await call_next(request)
+        # Login endpoint is always public
+        if request.url.path == "/api/auth/login":
             return await call_next(request)
         # Read-only status check: list EOD snapshot dates (no sensitive data)
         if request.method == "GET" and request.url.path == "/api/salesforce/eod-snapshots":
@@ -411,23 +476,31 @@ class RequireAppPasswordMiddleware(BaseHTTPMiddleware):
         # Allow DELETE on manual-overwrites (record type overrides) so you can remove them without the password
         if request.method == "DELETE" and request.url.path.startswith("/api/manual-overwrites/"):
             return await call_next(request)
-        password = APP_PASSWORD
-        if not password:
+
+        if not APP_PASSWORD:
             return await call_next(request)
-        password = password.strip()
-        # Proxies often normalize header names to lowercase
-        supplied = request.headers.get("X-App-Password") or request.headers.get("x-app-password")
-        if supplied is not None:
-            supplied = supplied.strip()
-        if supplied != password:
-            resp = JSONResponse(
-                status_code=401,
-                content={"detail": "Missing or invalid app password"},
-            )
-            for k, v in _cors_headers_for_request(request).items():
-                resp.headers[k] = v
-            return resp
-        return await call_next(request)
+
+        # ── Bearer JWT (user accounts) ────────────────────────────────────────
+        auth_header = request.headers.get("Authorization") or request.headers.get("authorization") or ""
+        if auth_header.lower().startswith("bearer "):
+            token = auth_header[7:].strip()
+            email = _decode_jwt(token)
+            if email:
+                return await call_next(request)
+            # Invalid/expired JWT — fall through to password check below (so legacy clients still work)
+
+        # ── Legacy X-App-Password ─────────────────────────────────────────────
+        supplied = (request.headers.get("X-App-Password") or request.headers.get("x-app-password") or "").strip()
+        if supplied and supplied == APP_PASSWORD.strip():
+            return await call_next(request)
+
+        resp = JSONResponse(
+            status_code=401,
+            content={"detail": "Authentication required. Sign in with your email and password."},
+        )
+        for k, v in _cors_headers_for_request(request).items():
+            resp.headers[k] = v
+        return resp
 
 
 def _api_timing_log_file_path() -> Optional[Path]:
@@ -10733,11 +10806,52 @@ async def health():
     }
 
 
+class _LoginRequest(BaseModel):
+    email: str
+    password: str
+
+
+@app.post("/api/auth/login")
+async def auth_login(body: _LoginRequest, db: AsyncSession = Depends(get_db)):
+    """Email + password login. Returns a signed JWT valid for 6 months."""
+    email = (body.email or "").strip().lower()
+    password = (body.password or "").strip()
+    if not email or not password:
+        raise HTTPException(status_code=400, detail="Email and password are required.")
+    user = (await db.execute(select(AppUser).where(AppUser.email == email))).scalar_one_or_none()
+    if not user or not user.is_active or not _verify_password(password, user.hashed_password):
+        raise HTTPException(status_code=401, detail="Invalid email or password.")
+    # Update last_login_at
+    user.last_login_at = datetime.now(timezone.utc)
+    await db.commit()
+    token = _create_jwt(email)
+    return {"token": token, "email": email}
+
+
+@app.post("/api/auth/users")
+async def auth_create_user(body: _LoginRequest, request: Request, db: AsyncSession = Depends(get_db)):
+    """Admin: create a new user. Requires X-App-Password header (not JWT)."""
+    supplied = (request.headers.get("X-App-Password") or request.headers.get("x-app-password") or "").strip()
+    if not APP_PASSWORD or supplied != APP_PASSWORD.strip():
+        raise HTTPException(status_code=403, detail="Admin access requires X-App-Password header.")
+    email = (body.email or "").strip().lower()
+    password = (body.password or "").strip()
+    if not email or not password:
+        raise HTTPException(status_code=400, detail="Email and password are required.")
+    existing = (await db.execute(select(AppUser).where(AppUser.email == email))).scalar_one_or_none()
+    if existing:
+        raise HTTPException(status_code=409, detail=f"User {email} already exists.")
+    user = AppUser(email=email, hashed_password=_hash_password(password))
+    db.add(user)
+    await db.commit()
+    return {"ok": True, "email": email}
+
+
 @app.get("/api/auth/check")
 async def auth_check():
     """
-    No logic—just confirms the request passed the app password middleware.
-    Use this for login verification instead of a data endpoint so 500s from DB/Salesforce don't show as "Invalid password."
+    No logic — just confirms the request passed auth middleware (JWT or legacy password).
+    Used by the login screen to verify credentials before storing them.
     """
     return {"ok": True}
 

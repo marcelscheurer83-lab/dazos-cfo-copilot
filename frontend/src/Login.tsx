@@ -1,5 +1,5 @@
 import { useState, FormEvent } from 'react'
-import { checkAppPassword, checkBackendHealthDetailed } from './api'
+import { loginWithEmail, checkBackendHealthDetailed } from './api'
 
 type Props = { onSuccess: () => void }
 
@@ -9,6 +9,7 @@ const SERVER_UNREACHABLE_INTRO = IS_DEV
   : 'Backend not reachable. In Railway, set the VITE_API_URL environment variable on the frontend service to the backend service URL (e.g. https://your-backend.railway.app).'
 
 export default function Login({ onSuccess }: Props) {
+  const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
@@ -21,21 +22,38 @@ export default function Login({ onSuccess }: Props) {
       const health = await checkBackendHealthDetailed()
       if (!health.ok) {
         setError(`${SERVER_UNREACHABLE_INTRO} — ${health.reason}`)
-        setLoading(false)
         return
       }
-      const ok = await checkAppPassword(password.trim())
-      if (ok) {
-        sessionStorage.setItem('app_password', password.trim())
+      const result = await loginWithEmail(email.trim(), password)
+      if (result.ok) {
         onSuccess()
       } else {
-        setError('Invalid password.')
+        setError(result.error)
       }
     } catch {
       setError(SERVER_UNREACHABLE_INTRO)
     } finally {
       setLoading(false)
     }
+  }
+
+  const inputStyle: React.CSSProperties = {
+    width: '100%',
+    padding: '0.6rem 0.75rem',
+    background: 'var(--bg)',
+    border: '1px solid var(--border)',
+    borderRadius: 6,
+    color: 'var(--text)',
+    fontSize: '1rem',
+    boxSizing: 'border-box',
+  }
+
+  const labelStyle: React.CSSProperties = {
+    display: 'block',
+    marginBottom: '0.35rem',
+    fontSize: '0.8rem',
+    color: 'var(--text-muted)',
+    fontWeight: 500,
   }
 
   return (
@@ -58,53 +76,56 @@ export default function Login({ onSuccess }: Props) {
           borderRadius: 8,
         }}
       >
-        <div style={{ marginBottom: '1.5rem' }}>
-          <div style={{ fontSize: '1.25rem', fontWeight: 700 }}>Dazos</div>
+        <div style={{ marginBottom: '1.75rem' }}>
+          <div style={{ fontSize: '1.25rem', fontWeight: 700, color: 'var(--text)' }}>Dazos</div>
           <div style={{ fontSize: '0.875rem', color: 'var(--text-muted)' }}>CFO Cockpit</div>
         </div>
-        <form onSubmit={handleSubmit}>
-          <label style={{ display: 'block', marginBottom: '0.5rem', fontSize: '0.875rem', color: 'var(--text-muted)' }}>
-            App password
-          </label>
-          <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)', marginBottom: '0.5rem' }}>
-            Set APP_PASSWORD in backend/.env; enter it here to sign in.
+        <form onSubmit={handleSubmit} style={{ display: 'flex', flexDirection: 'column', gap: '0.9rem' }}>
+          <div>
+            <label style={labelStyle}>Email</label>
+            <input
+              type="email"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              autoFocus
+              disabled={loading}
+              autoComplete="email"
+              placeholder="you@dazos.com"
+              style={inputStyle}
+            />
           </div>
-          <input
-            type="password"
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
-            autoFocus
-            disabled={loading}
-            autoComplete="current-password"
-            style={{
-              width: '100%',
-              padding: '0.6rem 0.75rem',
-              marginBottom: '1rem',
-              background: 'var(--bg)',
-              border: '1px solid var(--border)',
-              borderRadius: 6,
-              color: 'var(--text)',
-              fontSize: '1rem',
-            }}
-          />
+          <div>
+            <label style={labelStyle}>Password</label>
+            <input
+              type="password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              disabled={loading}
+              autoComplete="current-password"
+              style={inputStyle}
+            />
+          </div>
           {error && (
-            <div style={{ marginBottom: '1rem', fontSize: '0.875rem', color: 'var(--negative)' }}>{error}</div>
+            <div style={{ fontSize: '0.8rem', color: 'var(--negative)', lineHeight: 1.4 }}>{error}</div>
           )}
           <button
             type="submit"
-            disabled={loading}
+            disabled={loading || !email.trim() || !password}
             style={{
+              marginTop: '0.25rem',
               width: '100%',
-              padding: '0.6rem 1rem',
+              padding: '0.65rem 1rem',
               background: 'var(--accent)',
               border: 'none',
               borderRadius: 6,
               color: 'white',
               fontWeight: 600,
-              cursor: loading ? 'not-allowed' : 'pointer',
+              fontSize: '0.95rem',
+              cursor: loading || !email.trim() || !password ? 'not-allowed' : 'pointer',
+              opacity: loading || !email.trim() || !password ? 0.7 : 1,
             }}
           >
-            {loading ? 'Checking…' : 'Sign in'}
+            {loading ? 'Signing in…' : 'Sign in'}
           </button>
         </form>
       </div>

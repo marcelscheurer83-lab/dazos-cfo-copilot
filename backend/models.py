@@ -447,6 +447,17 @@ class WeeklyBriefing(Base):
     created_at = Column(DateTime, server_default=func.now())
 
 
+class AppUser(Base):
+    """Individual user accounts for email + password login."""
+    __tablename__ = "app_users"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    email = Column(String(255), nullable=False, unique=True, index=True)
+    hashed_password = Column(String(255), nullable=False)
+    is_active = Column(Integer, default=1)   # 0 = deactivated
+    created_at = Column(DateTime, server_default=func.now())
+    last_login_at = Column(DateTime, nullable=True)
+
+
 class ConversationMessage(Base):
     """Persistent agent conversation memory. Stores every user/assistant exchange
     so agents can recall past questions, decisions, and context across sessions."""

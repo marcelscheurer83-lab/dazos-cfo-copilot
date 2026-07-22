@@ -20,3 +20,6 @@ anthropic>=0.92.0
 openai>=1.12.0
 # Serve frontend static files (production single-service Railway deploy)
 aiofiles>=23.0.0
+# User account auth: JWT tokens + bcrypt password hashing
+PyJWT>=2.8.0
+passlib[bcrypt]>=1.7.4

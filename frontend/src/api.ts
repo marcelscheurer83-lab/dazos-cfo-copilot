@@ -27,6 +27,47 @@ function getStoredPassword(): string | null {
   return sessionStorage.getItem('app_password')
 }
 
+// ── JWT user-account auth ─────────────────────────────────────────────────────
+function getStoredToken(): string | null {
+  return sessionStorage.getItem('auth_token')
+}
+
+export function setStoredToken(token: string): void {
+  sessionStorage.setItem('auth_token', token)
+}
+
+export function clearStoredAuth(): void {
+  sessionStorage.removeItem('auth_token')
+  sessionStorage.removeItem('app_password')
+}
+
+export function isAuthenticated(): boolean {
+  return !!(getStoredToken() || getStoredPassword())
+}
+
+/** POST /api/auth/login → {token, email}. Stores the JWT and returns the email. */
+export async function loginWithEmail(email: string, password: string): Promise<{ ok: true; email: string } | { ok: false; error: string }> {
+  const url = `${API}/auth/login`
+  try {
+    const r = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: email.trim().toLowerCase(), password }),
+    })
+    if (r.status === 401 || r.status === 400) {
+      const body = await r.json().catch(() => ({}))
+      return { ok: false, error: (body as any).detail || 'Invalid email or password.' }
+    }
+    if (!r.ok) return { ok: false, error: `Server error (${r.status})` }
+    const data = await r.json() as { token: string; email: string }
+    setStoredToken(data.token)
+    return { ok: true, email: data.email }
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) }
+  }
+}
+// ─────────────────────────────────────────────────────────────────────────────
+
 /**
  * Admin ARR breakdown only: in `npm run dev` on localhost, call FastAPI directly on :8008.
  * Some setups see the Vite proxy strip POST bodies or query strings, so active-arr?breakdown_q=
@@ -54,30 +95,46 @@ function arrBreakdownApiUrl(pathWithLeadingSlash: string): string {
   return p.startsWith('/') ? `${API}${p}` : `${API}/${p}`
 }
 
+function _buildAuthHeaders(extraHeaders?: Record<string, string>): Record<string, string> {
+  const headers: Record<string, string> = { ...(extraHeaders ?? {}) }
+  const token = getStoredToken()
+  if (token) {
+    headers['Authorization'] = `Bearer ${token}`
+  } else {
+    const password = getStoredPassword()
+    if (password) headers[AUTH_HEADER] = password
+  }
+  return headers
+}
+
 async function arrBreakdownFetch(path: string, options?: RequestInit): Promise<Response> {
   const url = arrBreakdownApiUrl(path)
-  const password = getStoredPassword()
-  const headers: Record<string, string> = { ...(options?.headers as Record<string, string>) }
-  if (password) headers[AUTH_HEADER] = password
+  const headers = _buildAuthHeaders(options?.headers as Record<string, string>)
   const r = await fetch(url, { ...options, headers })
   if (r.status === 401) {
-    sessionStorage.removeItem('app_password')
+    clearStoredAuth()
     window.location.reload()
     throw new Error('Unauthorized')
   }
   return r
 }
 
-/** Fetch with app password header. On 401, clears storage and reloads (except when checking login with passwordOverride). */
+/** Fetch with auth header (Bearer JWT preferred, falls back to legacy X-App-Password).
+ *  On 401, clears storage and reloads (except when checking login with passwordOverride). */
 export async function apiFetch(
   path: string,
   options?: RequestInit,
   passwordOverride?: string | null
 ): Promise<Response> {
   const url = path.startsWith('/') ? `${API}${path}` : `${API}/${path}`
-  const password = passwordOverride ?? getStoredPassword()
-  const headers: Record<string, string> = { ...(options?.headers as Record<string, string>) }
-  if (password) headers[AUTH_HEADER] = password
+  let headers: Record<string, string>
+  if (passwordOverride !== undefined) {
+    // Legacy password-override path (used by old checkAppPassword)
+    headers = { ...(options?.headers as Record<string, string>) }
+    if (passwordOverride) headers[AUTH_HEADER] = passwordOverride
+  } else {
+    headers = _buildAuthHeaders(options?.headers as Record<string, string>)
+  }
   const t0 =
     import.meta.env.DEV && typeof localStorage !== 'undefined' && localStorage.getItem('DEBUG_API_TIMING') === '1'
       ? performance.now()
@@ -88,7 +145,7 @@ export async function apiFetch(
     console.debug(`[api timing] ${path} ${ms}ms`)
   }
   if (r.status === 401 && passwordOverride === undefined) {
-    sessionStorage.removeItem('app_password')
+    clearStoredAuth()
     window.location.reload()
     throw new Error('Unauthorized')
   }

@@ -1,24 +1,13 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import {
-  getContractedPipeline,
-  type ContractedPipelineRow,
-} from '../api'
+import { getContractedPipeline, type ContractedPipelineRow } from '../api'
 
 function fmtMoney(n: number) {
   return new Intl.NumberFormat('en-US', {
     style: 'currency',
     currency: 'USD',
-    minimumFractionDigits: 0,
-    maximumFractionDigits: 0,
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
   }).format(n)
-}
-
-function fmtDate(iso: string | null | undefined): string {
-  if (!iso) return '—'
-  const [y, m, d] = iso.split('-')
-  if (!y || !m || !d) return iso
-  const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
-  return `${months[parseInt(m, 10) - 1]} ${parseInt(d, 10)}, ${y}`
 }
 
 function accountHref(base: string | undefined, accountId: string): string | null {
@@ -51,7 +40,7 @@ export default function ARRContractedPipeline() {
           b && (b.includes('salesforce.com') || b.includes('lightning.force.com')) ? b : undefined
         )
       })
-      .catch((e) => setErr(e.message ?? 'Failed to load'))
+      .catch((e: unknown) => setErr(e instanceof Error ? e.message : 'Failed to load'))
       .finally(() => setLoading(false))
   }, [])
 
@@ -73,154 +62,267 @@ export default function ARRContractedPipeline() {
     return copy
   }, [rows, sortKey, sortDir])
 
-  function toggleSort(key: SortKey) {
+  function setSort(key: SortKey, defaultDir: 'asc' | 'desc') {
     if (sortKey === key) {
       setSortDir((d) => (d === 'asc' ? 'desc' : 'asc'))
     } else {
       setSortKey(key)
-      setSortDir(key === 'arr' ? 'desc' : 'asc')
+      setSortDir(defaultDir)
     }
   }
 
-  const SortIcon = ({ col }: { col: SortKey }) => {
-    if (sortKey !== col) return <span style={{ opacity: 0.3, marginLeft: 4 }}>⇅</span>
-    return <span style={{ marginLeft: 4 }}>{sortDir === 'asc' ? '↑' : '↓'}</span>
-  }
-
-  const thStyle: React.CSSProperties = {
-    padding: '0.5rem 0.75rem',
-    textAlign: 'left',
-    fontSize: '0.72rem',
-    fontWeight: 600,
-    textTransform: 'uppercase',
-    letterSpacing: '0.04em',
-    color: 'var(--text-muted)',
-    whiteSpace: 'nowrap',
-    borderBottom: '1px solid var(--border)',
-    cursor: 'pointer',
-    userSelect: 'none',
+  const stickyHeaderCell: React.CSSProperties = {
     position: 'sticky',
     top: 0,
-    background: 'var(--surface)',
-    zIndex: 1,
+    zIndex: 3,
+    background: 'var(--ns-sticky-bg, var(--surface))',
+    boxShadow: '0 1px 0 var(--border)',
   }
 
-  const tdStyle: React.CSSProperties = {
-    padding: '0.45rem 0.75rem',
-    fontSize: '0.82rem',
-    color: 'var(--text)',
-    borderBottom: '1px solid var(--border)',
-    whiteSpace: 'nowrap',
-  }
-
-  const tfootTd: React.CSSProperties = {
-    ...tdStyle,
-    fontWeight: 700,
-    borderTop: '2px solid var(--border)',
-    borderBottom: 'none',
-    background: 'var(--surface)',
+  const stickyTotalCell: React.CSSProperties = {
     position: 'sticky',
-    bottom: 0,
+    top: '2.5rem',
+    zIndex: 2,
+    background: 'var(--ns-sticky-bg, var(--surface))',
+    boxShadow: '0 1px 0 var(--border)',
   }
 
   if (loading) {
     return (
-      <div style={{ padding: '2rem', color: 'var(--text-muted)', fontSize: '0.875rem' }}>
-        Loading contracted pipeline…
-      </div>
+      <p style={{ fontSize: '0.9rem', color: 'var(--text-muted)' }}>Loading…</p>
     )
   }
 
   if (err) {
     return (
-      <div style={{ padding: '2rem', color: 'var(--danger, #e55)', fontSize: '0.875rem' }}>
-        {err}
-      </div>
+      <p style={{ fontSize: '0.9rem', color: 'var(--negative)' }}>{err}</p>
     )
   }
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0 }}>
-      {/* Header */}
-      <div style={{ display: 'flex', alignItems: 'baseline', gap: '1rem', marginBottom: '1rem', flexShrink: 0 }}>
-        <h2 style={{ margin: 0, fontSize: '1rem', fontWeight: 600, color: 'var(--text)' }}>
+    <>
+      <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '1rem', marginBottom: '1.25rem' }}>
+        <h1 style={{ margin: 0, fontSize: '1.5rem', fontWeight: 600, color: 'var(--text)' }}>
           Contracted ARR Pipeline
-        </h2>
-        <span style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>
-          {sorted.length} subscription{sorted.length !== 1 ? 's' : ''} · future-start Closed Won ·{' '}
-          <strong style={{ color: 'var(--text)' }}>{fmtMoney(totalArr)}</strong> total contracted delta
+        </h1>
+        <span style={{ fontSize: '0.85rem', color: 'var(--text-muted)' }}>
+          {sorted.length} future-start subscription{sorted.length !== 1 ? 's' : ''} ·{' '}
+          delta to Contracted ARR: <strong style={{ color: 'var(--text)' }}>{fmtMoney(totalArr)}</strong>
         </span>
       </div>
 
       {rows.length === 0 ? (
-        <div style={{ color: 'var(--text-muted)', fontSize: '0.875rem' }}>
-          No future-start Closed Won subscriptions found.
-        </div>
+        <p style={{ fontSize: '0.9rem', color: 'var(--text-muted)' }}>No future-start Closed Won subscriptions found.</p>
       ) : (
-        <div style={{ flex: 1, overflow: 'auto', minHeight: 0 }}>
-          <table style={{ width: '100%', borderCollapse: 'collapse', tableLayout: 'auto' }}>
+        <div
+          style={
+            {
+              minWidth: 0,
+              overflow: 'auto',
+              ['--ns-sticky-bg' as string]: '#10141c',
+            } as React.CSSProperties
+          }
+        >
+          <table
+            style={{
+              width: '100%',
+              borderCollapse: 'separate',
+              borderSpacing: 0,
+            }}
+          >
             <thead>
               <tr>
-                <th style={thStyle} onClick={() => toggleSort('account_name')}>
-                  Account <SortIcon col="account_name" />
+                {/* Account */}
+                <th
+                  style={{
+                    ...stickyHeaderCell,
+                    textAlign: 'left',
+                    padding: '0.5rem 0.75rem',
+                    color: 'var(--text-muted)',
+                    fontWeight: 500,
+                    whiteSpace: 'nowrap',
+                  }}
+                >
+                  <span
+                    role="button"
+                    tabIndex={0}
+                    onClick={() => setSort('account_name', 'asc')}
+                    onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') setSort('account_name', 'asc') }}
+                    style={{ cursor: 'pointer', userSelect: 'none' }}
+                    title={sortKey === 'account_name' ? (sortDir === 'asc' ? 'Sorted A→Z — click for Z→A' : 'Sorted Z→A — click for A→Z') : 'Sort by account name A→Z'}
+                  >
+                    Account
+                    {sortKey === 'account_name' && <span style={{ marginLeft: 4 }}>{sortDir === 'asc' ? '↑' : '↓'}</span>}
+                  </span>
                 </th>
-                <th style={{ ...thStyle, cursor: 'default' }}>SFDC Account ID</th>
-                <th style={{ ...thStyle, cursor: 'default' }}>Type</th>
-                <th style={{ ...thStyle, cursor: 'default' }}>Status</th>
-                <th style={thStyle} onClick={() => toggleSort('contract_start_date')}>
-                  Start Date <SortIcon col="contract_start_date" />
+                {/* SFDC ID */}
+                <th
+                  style={{
+                    ...stickyHeaderCell,
+                    textAlign: 'left',
+                    padding: '0.5rem 0.75rem',
+                    color: 'var(--text-muted)',
+                    fontWeight: 500,
+                    whiteSpace: 'nowrap',
+                  }}
+                >
+                  18 Digit SFDC Acct ID
                 </th>
-                <th style={{ ...thStyle, cursor: 'default' }}>End Date</th>
-                <th style={{ ...thStyle, textAlign: 'right' }} onClick={() => toggleSort('arr')}>
-                  ARR <SortIcon col="arr" />
+                {/* Type */}
+                <th
+                  style={{
+                    ...stickyHeaderCell,
+                    textAlign: 'left',
+                    padding: '0.5rem 0.75rem',
+                    color: 'var(--text-muted)',
+                    fontWeight: 500,
+                    whiteSpace: 'nowrap',
+                  }}
+                >
+                  Type
+                </th>
+                {/* Status */}
+                <th
+                  style={{
+                    ...stickyHeaderCell,
+                    textAlign: 'left',
+                    padding: '0.5rem 0.75rem',
+                    color: 'var(--text-muted)',
+                    fontWeight: 500,
+                    whiteSpace: 'nowrap',
+                  }}
+                >
+                  Status
+                </th>
+                {/* Start date */}
+                <th
+                  style={{
+                    ...stickyHeaderCell,
+                    textAlign: 'left',
+                    padding: '0.5rem 0.75rem',
+                    color: 'var(--text-muted)',
+                    fontWeight: 500,
+                    whiteSpace: 'nowrap',
+                  }}
+                >
+                  <span
+                    role="button"
+                    tabIndex={0}
+                    onClick={() => setSort('contract_start_date', 'asc')}
+                    onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') setSort('contract_start_date', 'asc') }}
+                    style={{ cursor: 'pointer', userSelect: 'none' }}
+                    title={sortKey === 'contract_start_date' ? (sortDir === 'asc' ? 'Sorted earliest first — click to reverse' : 'Sorted latest first — click to reverse') : 'Sort by subscription start date (earliest first)'}
+                  >
+                    Subscription start date
+                    {sortKey === 'contract_start_date' && <span style={{ marginLeft: 4 }}>{sortDir === 'asc' ? '↑' : '↓'}</span>}
+                  </span>
+                </th>
+                {/* End date */}
+                <th
+                  style={{
+                    ...stickyHeaderCell,
+                    textAlign: 'left',
+                    padding: '0.5rem 0.75rem',
+                    color: 'var(--text-muted)',
+                    fontWeight: 500,
+                    whiteSpace: 'nowrap',
+                  }}
+                >
+                  Subscription end date
+                </th>
+                {/* ARR */}
+                <th
+                  style={{
+                    ...stickyHeaderCell,
+                    textAlign: 'right',
+                    padding: '0.5rem 0.75rem',
+                    color: 'var(--text-muted)',
+                    fontWeight: 500,
+                    whiteSpace: 'nowrap',
+                  }}
+                >
+                  <span
+                    role="button"
+                    tabIndex={0}
+                    onClick={() => setSort('arr', 'desc')}
+                    onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') setSort('arr', 'desc') }}
+                    style={{ cursor: 'pointer', userSelect: 'none' }}
+                    title={sortKey === 'arr' ? (sortDir === 'desc' ? 'Sorted largest first — click for smallest first' : 'Sorted smallest first — click for largest first') : 'Sort by ARR (largest first)'}
+                  >
+                    ARR
+                    {sortKey === 'arr' && <span style={{ marginLeft: 4 }}>{sortDir === 'asc' ? '↑' : '↓'}</span>}
+                  </span>
                 </th>
               </tr>
             </thead>
             <tbody>
-              {sorted.map((row, i) => {
+              {/* Sticky total row */}
+              <tr style={{ fontWeight: 600 }}>
+                <td style={{ ...stickyTotalCell, padding: '0.5rem 0.75rem', color: 'var(--text-muted)' }}>Total</td>
+                <td style={{ ...stickyTotalCell, padding: '0.5rem 0.75rem' }} />
+                <td style={{ ...stickyTotalCell, padding: '0.5rem 0.75rem' }} />
+                <td style={{ ...stickyTotalCell, padding: '0.5rem 0.75rem' }} />
+                <td style={{ ...stickyTotalCell, padding: '0.5rem 0.75rem' }} />
+                <td style={{ ...stickyTotalCell, padding: '0.5rem 0.75rem' }} />
+                <td
+                  style={{
+                    ...stickyTotalCell,
+                    textAlign: 'right',
+                    padding: '0.5rem 0.75rem',
+                    fontWeight: 600,
+                    color: 'var(--text)',
+                    whiteSpace: 'nowrap',
+                  }}
+                >
+                  {fmtMoney(totalArr)}
+                </td>
+              </tr>
+              {sorted.map((row, idx) => {
                 const href = accountHref(salesforceBaseUrl, row.account_id)
                 return (
-                  <tr
-                    key={`${row.account_id}-${i}`}
-                    style={{ background: i % 2 === 0 ? 'transparent' : 'var(--surface-alt, rgba(255,255,255,0.02))' }}
-                  >
-                    <td style={tdStyle}>
+                  <tr key={`${row.account_id}-${idx}`}>
+                    <td style={{ padding: '0.5rem 0.75rem', color: 'var(--text)' }}>
                       {href ? (
-                        <a
-                          href={href}
-                          target="_blank"
-                          rel="noreferrer"
-                          style={{ color: 'var(--accent)', textDecoration: 'none' }}
-                        >
+                        <a href={href} target="_blank" rel="noopener noreferrer" title="Open account in Salesforce">
                           {row.account_name}
                         </a>
                       ) : (
                         row.account_name
                       )}
                     </td>
-                    <td style={{ ...tdStyle, fontFamily: 'monospace', fontSize: '0.75rem', color: 'var(--text-muted)' }}>
+                    <td style={{ padding: '0.5rem 0.75rem', color: 'var(--text-muted)' }} title={row.account_id}>
                       {row.account_id || '—'}
                     </td>
-                    <td style={{ ...tdStyle, color: 'var(--text-muted)' }}>{row.type || '—'}</td>
-                    <td style={{ ...tdStyle, color: 'var(--text-muted)' }}>{row.status || '—'}</td>
-                    <td style={tdStyle}>{fmtDate(row.contract_start_date)}</td>
-                    <td style={{ ...tdStyle, color: 'var(--text-muted)' }}>{fmtDate(row.contract_end_date)}</td>
-                    <td style={{ ...tdStyle, textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>
+                    <td style={{ padding: '0.5rem 0.75rem', color: 'var(--text-muted)' }}>
+                      {row.type ?? '—'}
+                    </td>
+                    <td style={{ padding: '0.5rem 0.75rem', color: 'var(--text-muted)', whiteSpace: 'nowrap' }}>
+                      {row.status?.trim() ? row.status : '—'}
+                    </td>
+                    <td style={{ padding: '0.5rem 0.75rem', color: 'var(--text)', whiteSpace: 'nowrap' }}>
+                      {row.contract_start_date ?? '—'}
+                    </td>
+                    <td style={{ padding: '0.5rem 0.75rem', color: 'var(--text)', whiteSpace: 'nowrap' }}>
+                      {row.contract_end_date ?? '—'}
+                    </td>
+                    <td
+                      style={{
+                        textAlign: 'right',
+                        padding: '0.5rem 0.75rem',
+                        fontWeight: 400,
+                        color: 'var(--text)',
+                        whiteSpace: 'nowrap',
+                      }}
+                    >
                       {fmtMoney(row.arr)}
                     </td>
                   </tr>
                 )
               })}
             </tbody>
-            <tfoot>
-              <tr>
-                <td style={tfootTd} colSpan={6}>Total</td>
-                <td style={{ ...tfootTd, textAlign: 'right' }}>{fmtMoney(totalArr)}</td>
-              </tr>
-            </tfoot>
           </table>
         </div>
       )}
-    </div>
+    </>
   )
 }

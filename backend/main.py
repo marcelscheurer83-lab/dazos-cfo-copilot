@@ -16071,11 +16071,11 @@ async def get_closed_overview(
 
 
 def _renewal_chart_month_keys() -> list[str]:
-    """Six renewal months (YYYY-MM), oldest first: 3 before current, current, 2 after (server local date)."""
+    """Nine renewal months (YYYY-MM), oldest first: 3 before current, current, 5 after (server local date)."""
     today = date.today()
     anchor = date(today.year, today.month, 1)
     out: list[str] = []
-    for off in range(-3, 3):
+    for off in range(-3, 6):
         d = _add_calendar_months(anchor, off)
         out.append(f"{d.year}-{d.month:02d}")
     return out
@@ -16084,7 +16084,7 @@ def _renewal_chart_month_keys() -> list[str]:
 def _build_renewals_chart_series(renewal_opps: list) -> list[RenewalsChartMonth]:
     """
     Stacked ARR chart (per month): excludes mid-term cancellation = Yes.
-    Months shown: three before the current calendar month, the current month, then two ahead (six bars, ``date.today()``).
+    Months shown: three before the current calendar month, the current month, then five ahead (nine bars, ``date.today()``).
 
     - **Churned/contracted** = sum of ``delta`` over opps where ``delta < 0``; API exposes the
       **positive** magnitude (``-`` that sum) for stacking and for Renewed math.
@@ -16246,7 +16246,7 @@ async def get_renewals_overview(
     **Mid-term cancellation** = ``"Yes"`` when ``Midterm_Cancellation__c`` is true (synced as ``midterm_cancellation``); otherwise null.
     Optional query ``midterm=yes`` / ``midterm=no`` filters rows (both = no filter).
 
-    **renewals_chart** (3 months before through 2 months after current month, excluding mid-term cancellation) powers the stacked charts: ARR stacks
+    **renewals_chart** (3 months before through 5 months after current month, excluding mid-term cancellation) powers the stacked charts: ARR stacks
     (churn = positive magnitude of sum of negative deltas; Renewed = UFR total − churn − open; Open = UFR on open opps — open on top) and opportunity counts (Lost / Won / Open — open on top),     plus renewal rates
     (ARR-style on closed UFR only; and won / (won + lost) among closed opps).
     """

@@ -912,7 +912,7 @@ export default function Renewals() {
         <div style={{ marginBottom: '1.5rem', maxWidth: '100%', display: 'flex', gap: '2rem', flexWrap: 'wrap' }}>
           <div style={{ flex: '1 1 320px', minWidth: 0 }}>
             <div style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text)', marginBottom: '0.5rem' }}>
-              Renewals by renewal month (ARR) — 3 months back, current month, 2 months ahead
+              Renewals by renewal month (ARR) — 3 months back, current month, 5 months ahead
             </div>
             <div style={{ background: 'var(--bg)', padding: '0.75rem 1rem', borderRadius: 6 }}>
               <div style={{ display: 'flex', gap: 0, fontSize: '0.75rem', alignItems: 'flex-start' }}>
@@ -1122,7 +1122,7 @@ export default function Renewals() {
 
           <div style={{ flex: '1 1 320px', minWidth: 0 }}>
             <div style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text)', marginBottom: '0.5rem' }}>
-              Renewals by renewal month (# opportunities) — 3 months back, current month, 2 months ahead
+              Renewals by renewal month (# opportunities) — 3 months back, current month, 5 months ahead
             </div>
             <div style={{ background: 'var(--bg)', padding: '0.75rem 1rem', borderRadius: 6 }}>
               <div style={{ display: 'flex', gap: 0, fontSize: '0.75rem', alignItems: 'flex-start' }}>

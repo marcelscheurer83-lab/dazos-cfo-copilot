@@ -141,6 +141,8 @@ class Account(Base):
     payment_status = Column(String(64), nullable=True)        # Current, Past Due, etc. (Payment_Status__c)
     outstanding_balance = Column(Float, nullable=True)        # Outstanding unpaid balance
     overdue_invoice_count = Column(Integer, nullable=True)    # Count of overdue invoices
+    chargebee_id = Column(String(255), nullable=True)         # Chargebee customer ID (from SF Dazos_Chargebee_ID__c or configured field)
+    billing_address = Column(String(512), nullable=True)      # Billing address from Chargebee (populated during sync)
     synced_at = Column(DateTime, server_default=func.now())
 
 

@@ -361,6 +361,8 @@ async def _migrate_db() -> None:
         ("accounts", "payment_status",            "VARCHAR(64)"),
         ("accounts", "outstanding_balance",       "FLOAT"),
         ("accounts", "overdue_invoice_count",     "INTEGER"),
+        ("accounts", "chargebee_id",              "VARCHAR(255)"),
+        ("accounts", "billing_address",           "VARCHAR(512)"),
         ("cash_flow_lines",   "is_subtotal",   "INTEGER"),
         ("pnl_lines",         "is_plan_only",  "INTEGER"),
         ("dept_detail_lines", "is_plan_only",  "INTEGER"),
@@ -4258,10 +4260,12 @@ async def _compute_arr_from_line_items(db: AsyncSession, opportunity_sf_ids: set
 DEFAULT_SEGMENT = "SMB/ MM"
 
 # Account Status = Account_Status__c; Segment = Segment__c (add Sub_Segment__c or other segment field here if your org has it).
+_SF_ACCOUNT_CHARGEBEE_ID_FIELD = os.getenv("SF_ACCOUNT_CHARGEBEE_ID_FIELD", "Dazos_Chargebee_ID__c").strip()
+
 DEFAULT_ACCOUNT_SOQL = (
     "SELECT Id, Name, Type, Account_Status__c, Industry, AnnualRevenue, NumberOfEmployees, "
     "BillingCountry, BillingCity, BillingState, Phone, Website, Segment__c, Customer_Success_Manager__c, Customer_Success_Manager__r.Name, Account_Executive__c, "
-    "Partner_Affiliate_Revenue_Share__c, Owner.Name, CreatedDate"
+    f"Partner_Affiliate_Revenue_Share__c, Owner.Name, CreatedDate, {_SF_ACCOUNT_CHARGEBEE_ID_FIELD}"
     + _account_soql_health_fields()
     + " FROM Account ORDER BY Name"
 )
@@ -4269,7 +4273,7 @@ DEFAULT_ACCOUNT_SOQL = (
 DEFAULT_ACCOUNT_SOQL_NO_HEALTH = (
     "SELECT Id, Name, Type, Account_Status__c, Industry, AnnualRevenue, NumberOfEmployees, "
     "BillingCountry, BillingCity, BillingState, Phone, Website, Segment__c, Customer_Success_Manager__c, Customer_Success_Manager__r.Name, Account_Executive__c, "
-    "Partner_Affiliate_Revenue_Share__c, Owner.Name, CreatedDate "
+    f"Partner_Affiliate_Revenue_Share__c, Owner.Name, CreatedDate, {_SF_ACCOUNT_CHARGEBEE_ID_FIELD} "
     "FROM Account ORDER BY Name"
 )
 
@@ -4541,8 +4545,44 @@ async def _run_salesforce_sync(db: AsyncSession) -> dict:
             payment_status=rec.get(_SF_ACC_PAYMENT_STATUS_FIELD) if use_health_fields and _SF_ACC_PAYMENT_STATUS_FIELD else None,
             outstanding_balance=_rec_float(_SF_ACC_OUTSTANDING_BAL_FIELD) if use_health_fields and _SF_ACC_OUTSTANDING_BAL_FIELD else None,
             overdue_invoice_count=_rec_int(_SF_ACC_OVERDUE_INV_FIELD) if use_health_fields and _SF_ACC_OVERDUE_INV_FIELD else None,
+            chargebee_id=(rec.get(_SF_ACCOUNT_CHARGEBEE_ID_FIELD) or "").strip() or None,
         )
         db.add(acc)
+
+    # ── Chargebee billing address enrichment ──────────────────────────────────
+    # Fetch all Chargebee customers once and back-fill billing_address on Account rows.
+    # Runs after accounts are added (before commit) so it can update the same session objects.
+    try:
+        from connectors.chargebee import ChargebeeConnector as _CBConnector
+        _cb = _CBConnector()
+        if _cb.is_configured():
+            def _fmt_billing(addr: dict) -> str | None:
+                parts = [
+                    addr.get("line1") or "",
+                    addr.get("line2") or "",
+                    addr.get("city") or "",
+                    addr.get("state") or addr.get("state_code") or "",
+                    addr.get("zip") or "",
+                    addr.get("country") or "",
+                ]
+                parts = [p.strip() for p in parts if (p or "").strip()]
+                return ", ".join(parts) if parts else None
+
+            cb_customers = await asyncio.to_thread(_cb.fetch_all_customers)
+            cb_addr_by_id: dict[str, str | None] = {}
+            for cust in cb_customers:
+                cid = (cust.get("id") or "").strip()
+                if cid:
+                    cb_addr_by_id[cid] = _fmt_billing(cust.get("billing_address") or {})
+
+            # Update the Account objects already in the session
+            result_accs = await db.execute(select(Account))
+            for acc_obj in result_accs.scalars().all():
+                if acc_obj.chargebee_id and acc_obj.chargebee_id in cb_addr_by_id:
+                    acc_obj.billing_address = cb_addr_by_id[acc_obj.chargebee_id]
+    except Exception as _cb_err:
+        logging.warning("Chargebee billing address enrichment failed (non-fatal): %s", _cb_err)
+    # ─────────────────────────────────────────────────────────────────────────
 
     opp_records = None
     use_renewal_date_field = bool(_SALESFORCE_RENEWAL_DATE_FIELD)
@@ -6199,12 +6239,14 @@ async def get_new_schedule_accounts(db: AsyncSession = Depends(get_db)):
     account_ids_list = list(by_account.keys())
     account_type_map: dict[str, str | None] = {}
     account_status_raw: dict[str, str | None] = {}
+    account_billing_map: dict[str, str | None] = {}
     if account_ids_list:
-        q_acc = select(Account.sf_id, Account.type, Account.status).where(Account.sf_id.in_(account_ids_list))
+        q_acc = select(Account.sf_id, Account.type, Account.status, Account.billing_address).where(Account.sf_id.in_(account_ids_list))
         r_acc = await db.execute(q_acc)
-        for sf_id, typ, st in r_acc.all():
+        for sf_id, typ, st, billing in r_acc.all():
             account_type_map[sf_id] = typ
             account_status_raw[sf_id] = st
+            account_billing_map[sf_id] = billing
 
     today_est = datetime.now(EST).date()
     month_keys = _new_schedule_month_keys()
@@ -6255,6 +6297,7 @@ async def get_new_schedule_accounts(db: AsyncSession = Depends(get_db)):
                 "subscription_end_date": sub_end,
                 "active_term_start": active_term[0] if active_term else None,
                 "active_term_end": active_term[1] if active_term else None,
+                "billing_address": account_billing_map.get(aid),
                 "live_arr": live_arr,
                 "contracted_arr": contracted_arr,
                 "arr_by_month": arr_by_month,
@@ -14901,7 +14944,7 @@ async def export_new_schedule_to_google_sheet(db: AsyncSession = Depends(get_db)
         "Live ARR",
         "Contracted ARR",
     ]
-    header = static_headers + [_short_month_label(m) for m in month_keys] + ["Active term (mo)"]
+    header = static_headers + [_short_month_label(m) for m in month_keys] + ["Active term (mo)", "Billing address"]
 
     grand_live_arr = sum(float(r.get("live_arr") or 0) for r in out_rows)
     grand_contracted_arr = sum(float(r.get("contracted_arr") or 0) for r in out_rows)
@@ -14916,7 +14959,7 @@ async def export_new_schedule_to_google_sheet(db: AsyncSession = Depends(get_db)
          _fmt_money_export(grand_live_arr),
          _fmt_money_export(grand_contracted_arr)]
         + [_fmt_money_export(totals_by_month.get(m, 0)) for m in month_keys]
-        + [""]
+        + ["", ""]
     )
 
     values = [header, total_row]
@@ -14934,7 +14977,7 @@ async def export_new_schedule_to_google_sheet(db: AsyncSession = Depends(get_db)
                 _fmt_money_export(float(r.get("contracted_arr") or 0)),
             ]
             + [_fmt_money_export(float(bm.get(m) or 0)) for m in month_keys]
-            + [_active_term_months(r)]
+            + [_active_term_months(r), (r.get("billing_address") or "")]
         )
 
     # ---- sheet write ----

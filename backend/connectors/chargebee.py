@@ -190,6 +190,25 @@ class ChargebeeConnector:
             params["offset"] = offset
         return self._get("/customers", params)
 
+    def get_customer(self, customer_id: str) -> dict[str, Any]:
+        """Retrieve a single customer by Chargebee customer ID. Returns the customer dict."""
+        resp = self._get(f"/customers/{customer_id}", {})
+        return resp.get("customer", resp)
+
+    def fetch_all_customers(self) -> list[dict[str, Any]]:
+        """Fetch all customers with pagination. Returns list of customer dicts."""
+        out: list[dict[str, Any]] = []
+        offset: str | None = None
+        while True:
+            resp = self.list_customers(limit=100, offset=offset)
+            items = resp.get("list") or []
+            for item in items:
+                out.append(item.get("customer", item))
+            offset = resp.get("next_offset")
+            if not offset or len(items) < 100:
+                break
+        return out
+
     def list_transactions(
         self,
         limit: int = 100,

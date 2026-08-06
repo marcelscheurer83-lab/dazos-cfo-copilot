@@ -766,6 +766,19 @@ export default function ARRNewSchedule() {
                 >
                   Active term (mo)
                 </th>
+                <th
+                  style={{
+                    ...stickyHeaderCell,
+                    textAlign: 'left',
+                    padding: '0.5rem 0.75rem',
+                    color: 'var(--text-muted)',
+                    fontWeight: 500,
+                    whiteSpace: 'nowrap',
+                  }}
+                  title="Billing address from Chargebee (populated during Refresh app data sync)."
+                >
+                  Billing address
+                </th>
               </tr>
             </thead>
             <tbody>
@@ -815,6 +828,7 @@ export default function ARRNewSchedule() {
                     {fmtMoney(totalArrByMonth[mk] ?? 0)}
                   </td>
                 ))}
+                <td style={{ ...stickyTotalCell, padding: '0.5rem 0.75rem' }} />
                 <td style={{ ...stickyTotalCell, padding: '0.5rem 0.75rem' }} />
               </tr>
               {sortedDisplayRows.map((row, idx) => {
@@ -899,12 +913,14 @@ export default function ARRNewSchedule() {
                         ? (() => {
                             const [sy, sm, sd] = row.active_term_start.split('-').map(Number)
                             const [ey, em, ed] = row.active_term_end.split('-').map(Number)
-                            // end + 1 day gives the exclusive end; month diff = term months
                             const endPlus1 = new Date(ey, em - 1, ed + 1)
                             const months = (endPlus1.getFullYear() - sy) * 12 + (endPlus1.getMonth() + 1 - sm)
                             return `${months} mo`
                           })()
                         : 'n/a'}
+                    </td>
+                    <td style={{ padding: '0.5rem 0.75rem', color: row.billing_address ? 'var(--text)' : 'var(--text-muted)' }}>
+                      {row.billing_address || '—'}
                     </td>
                   </tr>
                 )

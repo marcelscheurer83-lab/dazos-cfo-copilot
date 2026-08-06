@@ -911,7 +911,7 @@ export default function ARRNewSchedule() {
                     >
                       {row.active_term_start && row.active_term_end
                         ? (() => {
-                            const [sy, sm, sd] = row.active_term_start.split('-').map(Number)
+                            const [sy, sm] = row.active_term_start.split('-').map(Number)
                             const [ey, em, ed] = row.active_term_end.split('-').map(Number)
                             const endPlus1 = new Date(ey, em - 1, ed + 1)
                             const months = (endPlus1.getFullYear() - sy) * 12 + (endPlus1.getMonth() + 1 - sm)

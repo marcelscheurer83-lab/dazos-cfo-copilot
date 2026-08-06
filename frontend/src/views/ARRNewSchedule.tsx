@@ -920,7 +920,7 @@ export default function ARRNewSchedule() {
                         : 'n/a'}
                     </td>
                     <td style={{ padding: '0.5rem 0.75rem', color: row.billing_address ? 'var(--text)' : 'var(--text-muted)' }}>
-                      {row.billing_address || '—'}
+                      {row.billing_address || 'n/a'}
                     </td>
                   </tr>
                 )

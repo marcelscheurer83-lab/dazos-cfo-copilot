@@ -14980,7 +14980,7 @@ async def export_new_schedule_to_google_sheet(db: AsyncSession = Depends(get_db)
                 _fmt_money_export(float(r.get("contracted_arr") or 0)),
             ]
             + [_fmt_money_export(float(bm.get(m) or 0)) for m in month_keys]
-            + [_active_term_months(r), (r.get("billing_address") or "")]
+            + [_active_term_months(r), (r.get("billing_address") or "n/a")]
         )
 
     # ---- sheet write ----

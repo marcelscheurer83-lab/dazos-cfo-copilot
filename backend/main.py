@@ -4260,12 +4260,15 @@ async def _compute_arr_from_line_items(db: AsyncSession, opportunity_sf_ids: set
 DEFAULT_SEGMENT = "SMB/ MM"
 
 # Account Status = Account_Status__c; Segment = Segment__c (add Sub_Segment__c or other segment field here if your org has it).
-_SF_ACCOUNT_CHARGEBEE_ID_FIELD = os.getenv("SF_ACCOUNT_CHARGEBEE_ID_FIELD", "Dazos_Chargebee_ID__c").strip()
+# Optional SF field for Chargebee customer ID. Set SF_ACCOUNT_CHARGEBEE_ID_FIELD in .env to the
+# actual API field name on the Account object (e.g. Chargebee_Customer_ID__c). Left blank = not queried.
+_SF_ACCOUNT_CHARGEBEE_ID_FIELD = os.getenv("SF_ACCOUNT_CHARGEBEE_ID_FIELD", "").strip()
+_cb_id_soql_fragment = f", {_SF_ACCOUNT_CHARGEBEE_ID_FIELD}" if _SF_ACCOUNT_CHARGEBEE_ID_FIELD else ""
 
 DEFAULT_ACCOUNT_SOQL = (
     "SELECT Id, Name, Type, Account_Status__c, Industry, AnnualRevenue, NumberOfEmployees, "
     "BillingCountry, BillingCity, BillingState, Phone, Website, Segment__c, Customer_Success_Manager__c, Customer_Success_Manager__r.Name, Account_Executive__c, "
-    f"Partner_Affiliate_Revenue_Share__c, Owner.Name, CreatedDate, {_SF_ACCOUNT_CHARGEBEE_ID_FIELD}"
+    f"Partner_Affiliate_Revenue_Share__c, Owner.Name, CreatedDate{_cb_id_soql_fragment}"
     + _account_soql_health_fields()
     + " FROM Account ORDER BY Name"
 )
@@ -4273,7 +4276,7 @@ DEFAULT_ACCOUNT_SOQL = (
 DEFAULT_ACCOUNT_SOQL_NO_HEALTH = (
     "SELECT Id, Name, Type, Account_Status__c, Industry, AnnualRevenue, NumberOfEmployees, "
     "BillingCountry, BillingCity, BillingState, Phone, Website, Segment__c, Customer_Success_Manager__c, Customer_Success_Manager__r.Name, Account_Executive__c, "
-    f"Partner_Affiliate_Revenue_Share__c, Owner.Name, CreatedDate, {_SF_ACCOUNT_CHARGEBEE_ID_FIELD} "
+    f"Partner_Affiliate_Revenue_Share__c, Owner.Name, CreatedDate{_cb_id_soql_fragment} "
     "FROM Account ORDER BY Name"
 )
 

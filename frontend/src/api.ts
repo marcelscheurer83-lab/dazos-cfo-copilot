@@ -750,6 +750,10 @@ export type NewScheduleAccountRow = {
   subscription_start_date?: string | null
   /** See NEW SCHEDULE backend: CW NB+Renewal max contract end, overridden by Closed Lost Renewal + midterm cancel close date. */
   subscription_end_date?: string | null
+  /** Earliest contract_start_date among active (today in-window) CW NB/Renewal/Expansion opps. Null if no active subscription. */
+  active_term_start?: string | null
+  /** Latest contract_end_date among active (today in-window) CW NB/Renewal/Expansion opps. Null if no active subscription. */
+  active_term_end?: string | null
   /** Sum of ARR__c on CW NB/Renewal/Expansion opps active today; 0 if CL Renewal + midterm cancel and today > that opp’s contract end. */
   live_arr: number
   /** Live ARR + sum of ARR__c on all Closed Won opps whose contract start is after today. */

@@ -753,6 +753,19 @@ export default function ARRNewSchedule() {
                     {monthKeyToLabel(mk)}
                   </th>
                 ))}
+                <th
+                  style={{
+                    ...stickyHeaderCell,
+                    textAlign: 'left',
+                    padding: '0.5rem 0.75rem',
+                    color: 'var(--text-muted)',
+                    fontWeight: 500,
+                    whiteSpace: 'nowrap',
+                  }}
+                  title="Contract window of the currently active subscription (start → end). N/A if no active subscription today."
+                >
+                  Active term
+                </th>
               </tr>
             </thead>
             <tbody>
@@ -802,6 +815,7 @@ export default function ARRNewSchedule() {
                     {fmtMoney(totalArrByMonth[mk] ?? 0)}
                   </td>
                 ))}
+                <td style={{ ...stickyTotalCell, padding: '0.5rem 0.75rem' }} />
               </tr>
               {sortedDisplayRows.map((row, idx) => {
                 const href = accountHref(salesforceBaseUrl, row.account_id)
@@ -871,6 +885,18 @@ export default function ARRNewSchedule() {
                         {fmtMoney(row.arr_by_month?.[mk] ?? 0)}
                       </td>
                     ))}
+                    <td
+                      style={{
+                        padding: '0.5rem 0.75rem',
+                        color: row.active_term_start ? 'var(--text)' : 'var(--text-muted)',
+                        whiteSpace: 'nowrap',
+                      }}
+                      title={row.active_term_start ? `Active subscription: ${row.active_term_start} → ${row.active_term_end}` : 'No active subscription today'}
+                    >
+                      {row.active_term_start
+                        ? `${row.active_term_start} – ${row.active_term_end}`
+                        : 'n/a'}
+                    </td>
                   </tr>
                 )
               })}

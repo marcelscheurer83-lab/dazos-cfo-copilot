@@ -6084,6 +6084,38 @@ async def get_new_schedule_accounts(db: AsyncSession = Depends(get_db)):
                 total += float(o.opportunity_arr)
         return round(total, 2)
 
+    def _active_subscription_term(
+        opps: list[Opportunity], as_of: date
+    ) -> tuple[str, str] | None:
+        """
+        Returns (start_iso, end_iso) spanning all CW NB/Renewal/Expansion opps that are
+        active as of ``as_of`` (i.e. the same opps counted in _live_arr_sum_arr_c_as_of).
+        Returns None if no active opps exist.
+        """
+        starts: list[date] = []
+        ends: list[date] = []
+        for o in opps:
+            if not _is_closed_won_stage(o.stage_name):
+                continue
+            rt = _effective_record_type(o)
+            if not (
+                _is_new_business_record_type(rt)
+                or _is_renewal_record_type(rt)
+                or _is_expansion_record_type(rt)
+            ):
+                continue
+            cs = o.contract_start_date
+            ce = o.contract_end_date
+            if cs is None or ce is None:
+                continue
+            if not (cs <= as_of <= ce):
+                continue
+            starts.append(cs)
+            ends.append(ce)
+        if not starts:
+            return None
+        return min(starts).isoformat(), max(ends).isoformat()
+
     def _live_arr_zero_after_midterm_lost_renewal_end(opps: list[Opportunity], as_of: date) -> bool:
         """
         True when **any** Closed Lost **Renewal** with ``midterm_cancellation`` = 1 (Midterm_Cancellation__c) has a
@@ -6210,6 +6242,9 @@ async def get_new_schedule_accounts(db: AsyncSession = Depends(get_db)):
             if _live_arr_zero_after_midterm_lost_renewal_end(account_opps, as_of_m):
                 v = 0.0
             arr_by_month[mk] = v
+        active_term = _active_subscription_term(account_opps, today_est)
+        if _live_arr_zero_after_midterm_lost_renewal_end(account_opps, today_est):
+            active_term = None
         rows.append(
             {
                 "account_id": aid,
@@ -6218,6 +6253,8 @@ async def get_new_schedule_accounts(db: AsyncSession = Depends(get_db)):
                 "status": status,
                 "subscription_start_date": sub_start,
                 "subscription_end_date": sub_end,
+                "active_term_start": active_term[0] if active_term else None,
+                "active_term_end": active_term[1] if active_term else None,
                 "live_arr": live_arr,
                 "contracted_arr": contracted_arr,
                 "arr_by_month": arr_by_month,

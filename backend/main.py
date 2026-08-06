@@ -14899,9 +14899,8 @@ async def export_new_schedule_to_google_sheet(db: AsyncSession = Depends(get_db)
         "Subscription end",
         "Live ARR",
         "Contracted ARR",
-        "Active term (mo)",
     ]
-    header = static_headers + [_short_month_label(m) for m in month_keys]
+    header = static_headers + [_short_month_label(m) for m in month_keys] + ["Active term (mo)"]
 
     grand_live_arr = sum(float(r.get("live_arr") or 0) for r in out_rows)
     grand_contracted_arr = sum(float(r.get("contracted_arr") or 0) for r in out_rows)
@@ -14914,9 +14913,9 @@ async def export_new_schedule_to_google_sheet(db: AsyncSession = Depends(get_db)
     total_row = (
         ["Total", "", "", "", "", "",
          _fmt_money_export(grand_live_arr),
-         _fmt_money_export(grand_contracted_arr),
-         ""]
+         _fmt_money_export(grand_contracted_arr)]
         + [_fmt_money_export(totals_by_month.get(m, 0)) for m in month_keys]
+        + [""]
     )
 
     values = [header, total_row]
@@ -14932,9 +14931,9 @@ async def export_new_schedule_to_google_sheet(db: AsyncSession = Depends(get_db)
                 r.get("subscription_end_date") or "",
                 _fmt_money_export(float(r.get("live_arr") or 0)),
                 _fmt_money_export(float(r.get("contracted_arr") or 0)),
-                _active_term_months(r),
             ]
             + [_fmt_money_export(float(bm.get(m) or 0)) for m in month_keys]
+            + [_active_term_months(r)]
         )
 
     # ---- sheet write ----

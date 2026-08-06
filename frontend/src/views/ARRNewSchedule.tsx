@@ -756,7 +756,7 @@ export default function ARRNewSchedule() {
                 <th
                   style={{
                     ...stickyHeaderCell,
-                    textAlign: 'left',
+                    textAlign: 'right',
                     padding: '0.5rem 0.75rem',
                     color: 'var(--text-muted)',
                     fontWeight: 500,
@@ -764,7 +764,7 @@ export default function ARRNewSchedule() {
                   }}
                   title="Duration in months of the currently active subscription (start → end, inclusive). N/A if no active subscription today."
                 >
-                  Active term
+                  Active term (mo)
                 </th>
               </tr>
             </thead>
@@ -891,6 +891,7 @@ export default function ARRNewSchedule() {
                         textAlign: 'right',
                         color: row.active_term_start ? 'var(--text)' : 'var(--text-muted)',
                         whiteSpace: 'nowrap',
+                        fontVariantNumeric: 'tabular-nums',
                       }}
                       title={row.active_term_start ? `Active subscription: ${row.active_term_start} → ${row.active_term_end}` : 'No active subscription today'}
                     >

@@ -762,7 +762,7 @@ export default function ARRNewSchedule() {
                     fontWeight: 500,
                     whiteSpace: 'nowrap',
                   }}
-                  title="Contract window of the currently active subscription (start → end). N/A if no active subscription today."
+                  title="Duration in months of the currently active subscription (start → end, inclusive). N/A if no active subscription today."
                 >
                   Active term
                 </th>
@@ -888,13 +888,19 @@ export default function ARRNewSchedule() {
                     <td
                       style={{
                         padding: '0.5rem 0.75rem',
+                        textAlign: 'right',
                         color: row.active_term_start ? 'var(--text)' : 'var(--text-muted)',
                         whiteSpace: 'nowrap',
                       }}
                       title={row.active_term_start ? `Active subscription: ${row.active_term_start} → ${row.active_term_end}` : 'No active subscription today'}
                     >
-                      {row.active_term_start
-                        ? `${row.active_term_start} – ${row.active_term_end}`
+                      {row.active_term_start && row.active_term_end
+                        ? (() => {
+                            const [sy, sm] = row.active_term_start.split('-').map(Number)
+                            const [ey, em] = row.active_term_end.split('-').map(Number)
+                            const months = (ey - sy) * 12 + (em - sm) + 1
+                            return `${months} mo`
+                          })()
                         : 'n/a'}
                     </td>
                   </tr>

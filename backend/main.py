@@ -14868,8 +14868,8 @@ async def export_new_schedule_to_google_sheet(db: AsyncSession = Depends(get_db)
     """
     Export the NEW SCHEDULE table to the "ARR_Cockpit export" tab in the financial model
     (GOOGLE_SHEET_ID). Columns: Account, 18 Digit SFDC Acct ID, Status, Type,
-    Subscription start, Subscription end, Live ARR, Contracted ARR, then one column per
-    month (Dec '25 … Dec '26). Header row, then Total row, then one row per account.
+    Subscription start, Subscription end, Live ARR, Contracted ARR, Active term (mo),
+    then one column per month (Dec '25 … Dec '26). Header row, then Total row, then one row per account.
     """
     from connectors.google_sheets import GoogleSheetsConnector
 
@@ -14877,6 +14877,18 @@ async def export_new_schedule_to_google_sheet(db: AsyncSession = Depends(get_db)
     result = await get_new_schedule_accounts(db)
     out_rows = result.get("rows", []) if isinstance(result, dict) else []
     month_keys = _new_schedule_month_keys()
+
+    def _active_term_months(row: dict) -> str:
+        s = row.get("active_term_start") or ""
+        e = row.get("active_term_end") or ""
+        if not s or not e:
+            return "n/a"
+        try:
+            sy, sm = int(s[:4]), int(s[5:7])
+            ey, em = int(e[:4]), int(e[5:7])
+            return str((ey - sy) * 12 + (em - sm) + 1)
+        except Exception:
+            return "n/a"
 
     static_headers = [
         "Account",
@@ -14887,6 +14899,7 @@ async def export_new_schedule_to_google_sheet(db: AsyncSession = Depends(get_db)
         "Subscription end",
         "Live ARR",
         "Contracted ARR",
+        "Active term (mo)",
     ]
     header = static_headers + [_short_month_label(m) for m in month_keys]
 
@@ -14901,7 +14914,8 @@ async def export_new_schedule_to_google_sheet(db: AsyncSession = Depends(get_db)
     total_row = (
         ["Total", "", "", "", "", "",
          _fmt_money_export(grand_live_arr),
-         _fmt_money_export(grand_contracted_arr)]
+         _fmt_money_export(grand_contracted_arr),
+         ""]
         + [_fmt_money_export(totals_by_month.get(m, 0)) for m in month_keys]
     )
 
@@ -14918,6 +14932,7 @@ async def export_new_schedule_to_google_sheet(db: AsyncSession = Depends(get_db)
                 r.get("subscription_end_date") or "",
                 _fmt_money_export(float(r.get("live_arr") or 0)),
                 _fmt_money_export(float(r.get("contracted_arr") or 0)),
+                _active_term_months(r),
             ]
             + [_fmt_money_export(float(bm.get(m) or 0)) for m in month_keys]
         )

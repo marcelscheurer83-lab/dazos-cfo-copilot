@@ -14884,9 +14884,10 @@ async def export_new_schedule_to_google_sheet(db: AsyncSession = Depends(get_db)
         if not s or not e:
             return "n/a"
         try:
-            sy, sm = int(s[:4]), int(s[5:7])
-            ey, em = int(e[:4]), int(e[5:7])
-            return str((ey - sy) * 12 + (em - sm) + 1)
+            from datetime import timedelta as _td
+            start = date(int(s[:4]), int(s[5:7]), int(s[8:10]))
+            end_plus1 = date(int(e[:4]), int(e[5:7]), int(e[8:10])) + _td(days=1)
+            return str((end_plus1.year - start.year) * 12 + (end_plus1.month - start.month))
         except Exception:
             return "n/a"
 

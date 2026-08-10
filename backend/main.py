@@ -3857,12 +3857,17 @@ def _is_iq_mr_product(product_name: str | None) -> bool:
 
 _SAMURAI_SUITE_KEYS = frozenset({
     "dojo by dazos",
+    "samurai katana user",
+    "samurai pro",
+    "samurai sensei user",
+    "samurai dojo user",
 })
 
 
 def _is_samurai_suite_product(product_name: str | None) -> bool:
-    """SamurAI suite: Dojo by Dazos and related SKUs."""
-    return _arr_product_key(product_name) in _SAMURAI_SUITE_KEYS
+    """SamurAI suite: any 'SamurAI *' SKU, 'Dojo by Dazos', and other explicit keys."""
+    key = _arr_product_key(product_name)
+    return "samurai" in key or key in _SAMURAI_SUITE_KEYS
 
 
 def _is_other_product(product_name: str | None) -> bool:

@@ -16,6 +16,129 @@ function fmtMoney(n: number) {
   }).format(n)
 }
 
+function formatMonthKey(ym: string): string {
+  const [y, m] = ym.split('-')
+  const date = new Date(Number(y), Number(m) - 1, 1)
+  return date.toLocaleString('en-US', { month: 'short', year: '2-digit' })
+}
+
+const PLOT_HEIGHT = 220
+const BAR_COLOR = '#4f8ef7'
+
+interface MonthBucket { month: string; arr: number }
+
+function ContractedARRChart({ buckets }: { buckets: MonthBucket[] }) {
+  const maxArr = useMemo(() => {
+    const m = buckets.reduce((a, b) => Math.max(a, b.arr), 0)
+    return Math.max(10_000, Math.ceil((m * 1.2) / 10_000) * 10_000)
+  }, [buckets])
+
+  const yTicks = useMemo(() => {
+    return [0, 0.25, 0.5, 0.75, 1].map((f) => Math.round(f * maxArr))
+  }, [maxArr])
+
+  const fmtTick = (v: number) => (v === 0 ? '$0' : `$${Math.round(v / 1000)}K`)
+
+  if (buckets.length === 0) return null
+
+  return (
+    <div style={{ marginBottom: '1.75rem', maxWidth: '100%' }}>
+      <div style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text)', marginBottom: '0.5rem' }}>
+        Contracted ARR by start month
+      </div>
+      <div style={{ background: 'var(--bg)', padding: '0.75rem 1rem', borderRadius: 6 }}>
+        <div style={{ display: 'flex', gap: 0, fontSize: '0.75rem', alignItems: 'flex-start' }}>
+          {/* Y-axis labels */}
+          <div style={{ width: 44, flexShrink: 0, paddingRight: 8, display: 'flex', flexDirection: 'column', color: 'var(--text-muted)' }}>
+            <div style={{ height: PLOT_HEIGHT, position: 'relative', fontSize: '0.7rem' }}>
+              {yTicks.slice().reverse().map((tick, i) => (
+                <span
+                  key={tick}
+                  style={{
+                    position: 'absolute',
+                    right: 8,
+                    top: (i / Math.max(yTicks.length - 1, 1)) * PLOT_HEIGHT,
+                    transform: 'translateY(-50%)',
+                    lineHeight: 1,
+                    textAlign: 'right',
+                  }}
+                >
+                  {fmtTick(tick)}
+                </span>
+              ))}
+            </div>
+          </div>
+          {/* Plot area */}
+          <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', paddingLeft: 4 }}>
+            <div style={{ height: PLOT_HEIGHT, position: 'relative', flexShrink: 0 }}>
+              {/* Grid lines */}
+              <div style={{ position: 'absolute', left: 0, right: 0, top: 0, bottom: 0, pointerEvents: 'none' }}>
+                {yTicks.map((_, i) => (
+                  <div
+                    key={i}
+                    style={{
+                      position: 'absolute',
+                      left: 0,
+                      right: 0,
+                      bottom: (i / Math.max(yTicks.length - 1, 1)) * PLOT_HEIGHT,
+                      height: 1,
+                      background: 'var(--border)',
+                      opacity: 0.7,
+                    }}
+                  />
+                ))}
+              </div>
+              {/* Bars */}
+              <div style={{ height: '100%', display: 'flex', alignItems: 'flex-end', gap: '0.25rem', position: 'relative', zIndex: 1 }}>
+                {buckets.map((b) => {
+                  const barHeight = (b.arr / maxArr) * PLOT_HEIGHT
+                  return (
+                    <div
+                      key={b.month}
+                      style={{
+                        flex: 1,
+                        display: 'flex',
+                        flexDirection: 'column',
+                        alignItems: 'center',
+                        minWidth: 0,
+                        justifyContent: 'flex-end',
+                        height: '100%',
+                      }}
+                    >
+                      <div style={{ flex: 1, minHeight: 0 }} />
+                      <div style={{ marginBottom: '0.2rem', fontWeight: 700, fontSize: '0.78rem', color: 'var(--text)', minHeight: '1.1em', textAlign: 'center' }}>
+                        {`$${Math.round(b.arr / 1000)}K`}
+                      </div>
+                      <div
+                        style={{
+                          width: '100%',
+                          maxWidth: 40,
+                          height: barHeight,
+                          minHeight: barHeight > 0 ? 2 : 0,
+                          background: BAR_COLOR,
+                          borderRadius: '2px 2px 0 0',
+                        }}
+                      />
+                    </div>
+                  )
+                })}
+              </div>
+            </div>
+            {/* X-axis month labels */}
+            <div style={{ display: 'flex', gap: '0.25rem', marginTop: '0.35rem' }}>
+              {buckets.map((b) => (
+                <div key={b.month} style={{ flex: 1, minWidth: 0, color: 'var(--text-muted)', fontSize: '0.7rem', textAlign: 'center' }}>
+                  {formatMonthKey(b.month)}
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 function accountHref(base: string | undefined, accountId: string): string | null {
   if (!base || !accountId) return null
   return base.includes('lightning.force.com')
@@ -74,6 +197,18 @@ export default function ARRContractedPipeline() {
   }, [])
 
   useEffect(() => { load() }, [load])
+
+  const monthlyBuckets = useMemo<MonthBucket[]>(() => {
+    const map = new Map<string, number>()
+    for (const r of rows) {
+      const ym = (r.contract_start_date ?? '').substring(0, 7)
+      if (!ym) continue
+      map.set(ym, (map.get(ym) ?? 0) + r.arr)
+    }
+    return Array.from(map.entries())
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([month, arr]) => ({ month, arr }))
+  }, [rows])
 
   const sorted = useMemo(() => {
     const copy = [...rows]
@@ -170,6 +305,8 @@ export default function ARRContractedPipeline() {
           {refreshMessage}
         </p>
       )}
+
+      <ContractedARRChart buckets={monthlyBuckets} />
 
       {rows.length === 0 ? (
         <p style={{ fontSize: '0.9rem', color: 'var(--text-muted)' }}>No future-start Closed Won subscriptions found.</p>

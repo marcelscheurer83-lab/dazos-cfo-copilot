@@ -23,8 +23,8 @@ function formatMonthKey(ym: string): string {
 }
 
 const PLOT_HEIGHT = 220
-const C_NB = '#3b82f6'        // blue  — New Business (matches ARR Bridge)
-const C_EXPANSION = '#22c55e' // green — Renewal / Expansion / Other
+const C_NB = '#3b82f6'
+const C_EXPANSION = '#22c55e'
 
 function isNewBusiness(recordTypeName: string | null | undefined): boolean {
   const s = (recordTypeName ?? '').toLowerCase()
@@ -32,8 +32,20 @@ function isNewBusiness(recordTypeName: string | null | undefined): boolean {
 }
 
 interface MonthBucket { month: string; nb: number; expansion: number }
+type ChartSegment = 'nb' | 'expansion'
+interface ChartFilter { month: string; segment: ChartSegment }
 
-function ContractedARRChart({ buckets }: { buckets: MonthBucket[] }) {
+// ── Chart ────────────────────────────────────────────────────────────────────
+
+function ContractedARRChart({
+  buckets,
+  filter,
+  onSegmentClick,
+}: {
+  buckets: MonthBucket[]
+  filter: ChartFilter | null
+  onSegmentClick: (month: string, segment: ChartSegment) => void
+}) {
   const maxArr = useMemo(() => {
     const m = buckets.reduce((a, b) => Math.max(a, b.nb + b.expansion), 0)
     return Math.max(10_000, Math.ceil((m * 1.2) / 10_000) * 10_000)
@@ -47,6 +59,8 @@ function ContractedARRChart({ buckets }: { buckets: MonthBucket[] }) {
 
   if (buckets.length === 0) return null
 
+  const hasFilter = filter !== null
+
   return (
     <div style={{ marginBottom: '1.75rem', maxWidth: 560 }}>
       <div style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text)', marginBottom: '0.5rem' }}>
@@ -54,7 +68,7 @@ function ContractedARRChart({ buckets }: { buckets: MonthBucket[] }) {
       </div>
       <div style={{ background: 'var(--bg)', padding: '0.75rem 1rem', borderRadius: 6 }}>
         {/* Legend */}
-        <div style={{ display: 'flex', gap: '1rem', marginBottom: '0.5rem', fontSize: '0.72rem', color: 'var(--text-muted)' }}>
+        <div style={{ display: 'flex', gap: '1rem', marginBottom: '0.5rem', fontSize: '0.72rem', color: 'var(--text-muted)', alignItems: 'center' }}>
           <span style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
             <span style={{ width: 10, height: 10, borderRadius: 2, background: C_NB, display: 'inline-block' }} />
             New Business
@@ -63,9 +77,14 @@ function ContractedARRChart({ buckets }: { buckets: MonthBucket[] }) {
             <span style={{ width: 10, height: 10, borderRadius: 2, background: C_EXPANSION, display: 'inline-block' }} />
             Renewal / Expansion
           </span>
+          {hasFilter && (
+            <span style={{ marginLeft: 'auto', fontSize: '0.7rem', color: 'var(--accent)', fontWeight: 600 }}>
+              Filtered · click segment again to clear
+            </span>
+          )}
         </div>
         <div style={{ display: 'flex', gap: 0, fontSize: '0.75rem', alignItems: 'flex-start' }}>
-          {/* Y-axis labels */}
+          {/* Y-axis */}
           <div style={{ width: 44, flexShrink: 0, paddingRight: 8, display: 'flex', flexDirection: 'column', color: 'var(--text-muted)' }}>
             <div style={{ height: PLOT_HEIGHT, position: 'relative', fontSize: '0.7rem' }}>
               {yTicks.slice().reverse().map((tick, i) => (
@@ -105,13 +124,20 @@ function ContractedARRChart({ buckets }: { buckets: MonthBucket[] }) {
                   />
                 ))}
               </div>
-              {/* Stacked bars */}
+              {/* Bars */}
               <div style={{ height: '100%', display: 'flex', alignItems: 'flex-end', gap: '0.25rem', position: 'relative', zIndex: 1 }}>
                 {buckets.map((b) => {
                   const total = b.nb + b.expansion
                   const totalH = (total / maxArr) * PLOT_HEIGHT
                   const nbH = total > 0 ? (b.nb / total) * totalH : 0
                   const expH = total > 0 ? (b.expansion / total) * totalH : 0
+
+                  const nbSelected = hasFilter && filter!.month === b.month && filter!.segment === 'nb'
+                  const expSelected = hasFilter && filter!.month === b.month && filter!.segment === 'expansion'
+
+                  const nbDim = hasFilter && !nbSelected
+                  const expDim = hasFilter && !expSelected
+
                   return (
                     <div
                       key={b.month}
@@ -129,13 +155,43 @@ function ContractedARRChart({ buckets }: { buckets: MonthBucket[] }) {
                       <div style={{ marginBottom: '0.2rem', fontWeight: 700, fontSize: '0.78rem', color: 'var(--text)', minHeight: '1.1em', textAlign: 'center' }}>
                         {total > 0 ? `$${Math.round(total / 1000)}K` : ''}
                       </div>
-                      {/* Stacked bar: expansion on bottom, NB on top */}
+                      {/* Stacked bar: NB on top, Expansion on bottom */}
                       <div style={{ width: '100%', maxWidth: 40, display: 'flex', flexDirection: 'column', borderRadius: '2px 2px 0 0', overflow: 'hidden' }}>
                         {nbH > 0 && (
-                          <div style={{ height: nbH, background: C_NB, minHeight: nbH > 0 ? 1 : 0 }} title={`New Business: $${Math.round(b.nb / 1000)}K`} />
+                          <div
+                            role="button"
+                            tabIndex={0}
+                            onClick={() => onSegmentClick(b.month, 'nb')}
+                            onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') onSegmentClick(b.month, 'nb') }}
+                            style={{
+                              height: nbH,
+                              background: C_NB,
+                              opacity: nbDim ? 0.25 : 1,
+                              outline: nbSelected ? '2px solid #fff' : 'none',
+                              outlineOffset: -1,
+                              cursor: 'pointer',
+                              transition: 'opacity 0.15s',
+                            }}
+                            title={`New Business ${formatMonthKey(b.month)}: $${Math.round(b.nb / 1000)}K — click to filter table`}
+                          />
                         )}
                         {expH > 0 && (
-                          <div style={{ height: expH, background: C_EXPANSION, minHeight: expH > 0 ? 1 : 0 }} title={`Renewal/Expansion: $${Math.round(b.expansion / 1000)}K`} />
+                          <div
+                            role="button"
+                            tabIndex={0}
+                            onClick={() => onSegmentClick(b.month, 'expansion')}
+                            onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') onSegmentClick(b.month, 'expansion') }}
+                            style={{
+                              height: expH,
+                              background: C_EXPANSION,
+                              opacity: expDim ? 0.25 : 1,
+                              outline: expSelected ? '2px solid #fff' : 'none',
+                              outlineOffset: -1,
+                              cursor: 'pointer',
+                              transition: 'opacity 0.15s',
+                            }}
+                            title={`Renewal/Expansion ${formatMonthKey(b.month)}: $${Math.round(b.expansion / 1000)}K — click to filter table`}
+                          />
                         )}
                       </div>
                     </div>
@@ -143,7 +199,7 @@ function ContractedARRChart({ buckets }: { buckets: MonthBucket[] }) {
                 })}
               </div>
             </div>
-            {/* X-axis month labels */}
+            {/* X-axis labels */}
             <div style={{ display: 'flex', gap: '0.25rem', marginTop: '0.35rem' }}>
               {buckets.map((b) => (
                 <div key={b.month} style={{ flex: 1, minWidth: 0, color: 'var(--text-muted)', fontSize: '0.7rem', textAlign: 'center' }}>
@@ -158,6 +214,8 @@ function ContractedARRChart({ buckets }: { buckets: MonthBucket[] }) {
   )
 }
 
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
 function accountHref(base: string | undefined, accountId: string): string | null {
   if (!base || !accountId) return null
   return base.includes('lightning.force.com')
@@ -166,6 +224,8 @@ function accountHref(base: string | undefined, accountId: string): string | null
 }
 
 type SortKey = 'contract_start_date' | 'account_name' | 'arr'
+
+// ── Main view ─────────────────────────────────────────────────────────────────
 
 export default function ARRContractedPipeline() {
   const [rows, setRows] = useState<ContractedPipelineRow[]>([])
@@ -178,6 +238,7 @@ export default function ARRContractedPipeline() {
   const [refreshLoading, setRefreshLoading] = useState(false)
   const [refreshMessage, setRefreshMessage] = useState<string | null>(null)
   const [datasetStatus, setDatasetStatus] = useState<DatasetStatus | null>(null)
+  const [chartFilter, setChartFilter] = useState<ChartFilter | null>(null)
 
   const load = useCallback(() => {
     setLoading(true)
@@ -235,8 +296,26 @@ export default function ARRContractedPipeline() {
       .map(([month, { nb, expansion }]) => ({ month, nb, expansion }))
   }, [rows])
 
+  const handleSegmentClick = useCallback((month: string, segment: ChartSegment) => {
+    setChartFilter((prev) =>
+      prev?.month === month && prev?.segment === segment ? null : { month, segment }
+    )
+  }, [])
+
+  // Rows that match the active chart filter (or all rows if no filter)
+  const filtered = useMemo(() => {
+    if (!chartFilter) return rows
+    return rows.filter((r) => {
+      const ym = (r.contract_start_date ?? '').substring(0, 7)
+      if (ym !== chartFilter.month) return false
+      return chartFilter.segment === 'nb' ? isNewBusiness(r.record_type_name) : !isNewBusiness(r.record_type_name)
+    })
+  }, [rows, chartFilter])
+
+  const filteredTotal = useMemo(() => filtered.reduce((s, r) => s + r.arr, 0), [filtered])
+
   const sorted = useMemo(() => {
-    const copy = [...rows]
+    const copy = [...filtered]
     copy.sort((a, b) => {
       let cmp = 0
       if (sortKey === 'contract_start_date') {
@@ -249,7 +328,7 @@ export default function ARRContractedPipeline() {
       return sortDir === 'asc' ? cmp : -cmp
     })
     return copy
-  }, [rows, sortKey, sortDir])
+  }, [filtered, sortKey, sortDir])
 
   function setSort(key: SortKey, defaultDir: 'asc' | 'desc') {
     if (sortKey === key) {
@@ -277,15 +356,11 @@ export default function ARRContractedPipeline() {
   }
 
   if (loading) {
-    return (
-      <p style={{ fontSize: '0.9rem', color: 'var(--text-muted)' }}>Loading…</p>
-    )
+    return <p style={{ fontSize: '0.9rem', color: 'var(--text-muted)' }}>Loading…</p>
   }
 
   if (err) {
-    return (
-      <p style={{ fontSize: '0.9rem', color: 'var(--negative)' }}>{err}</p>
-    )
+    return <p style={{ fontSize: '0.9rem', color: 'var(--negative)' }}>{err}</p>
   }
 
   return (
@@ -317,10 +392,11 @@ export default function ARRContractedPipeline() {
             : 'No refresh yet'}
         </span>
         <span style={{ fontSize: '0.85rem', color: 'var(--text-muted)' }}>
-          {sorted.length} future-start subscription{sorted.length !== 1 ? 's' : ''} ·{' '}
+          {rows.length} future-start subscription{rows.length !== 1 ? 's' : ''} ·{' '}
           delta to Contracted ARR: <strong style={{ color: 'var(--text)' }}>{fmtMoney(totalArr)}</strong>
         </span>
       </div>
+
       {refreshMessage && (
         <p style={{
           fontSize: '0.9rem',
@@ -331,7 +407,44 @@ export default function ARRContractedPipeline() {
         </p>
       )}
 
-      <ContractedARRChart buckets={monthlyBuckets} />
+      <ContractedARRChart
+        buckets={monthlyBuckets}
+        filter={chartFilter}
+        onSegmentClick={handleSegmentClick}
+      />
+
+      {/* Filter badge */}
+      {chartFilter && (
+        <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginBottom: '0.75rem', fontSize: '0.82rem' }}>
+          <span
+            style={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: 6,
+              background: chartFilter.segment === 'nb' ? C_NB : C_EXPANSION,
+              color: '#fff',
+              borderRadius: 4,
+              padding: '0.2rem 0.6rem',
+              fontWeight: 600,
+            }}
+          >
+            {chartFilter.segment === 'nb' ? 'New Business' : 'Renewal / Expansion'} · {formatMonthKey(chartFilter.month)}
+            <span
+              role="button"
+              tabIndex={0}
+              aria-label="Clear filter"
+              onClick={() => setChartFilter(null)}
+              onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') setChartFilter(null) }}
+              style={{ cursor: 'pointer', marginLeft: 2, opacity: 0.8, fontWeight: 400, fontSize: '1rem', lineHeight: 1 }}
+            >
+              ×
+            </span>
+          </span>
+          <span style={{ color: 'var(--text-muted)' }}>
+            {sorted.length} row{sorted.length !== 1 ? 's' : ''} · {fmtMoney(filteredTotal)}
+          </span>
+        </div>
+      )}
 
       {rows.length === 0 ? (
         <p style={{ fontSize: '0.9rem', color: 'var(--text-muted)' }}>No future-start Closed Won subscriptions found.</p>
@@ -345,134 +458,49 @@ export default function ARRContractedPipeline() {
             } as React.CSSProperties
           }
         >
-          <table
-            style={{
-              width: '100%',
-              borderCollapse: 'separate',
-              borderSpacing: 0,
-            }}
-          >
+          <table style={{ width: '100%', borderCollapse: 'separate', borderSpacing: 0 }}>
             <thead>
               <tr>
-                {/* Account */}
-                <th
-                  style={{
-                    ...stickyHeaderCell,
-                    textAlign: 'left',
-                    padding: '0.5rem 0.75rem',
-                    color: 'var(--text-muted)',
-                    fontWeight: 500,
-                    whiteSpace: 'nowrap',
-                  }}
-                >
+                <th style={{ ...stickyHeaderCell, textAlign: 'left', padding: '0.5rem 0.75rem', color: 'var(--text-muted)', fontWeight: 500, whiteSpace: 'nowrap' }}>
                   <span
-                    role="button"
-                    tabIndex={0}
+                    role="button" tabIndex={0}
                     onClick={() => setSort('account_name', 'asc')}
                     onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') setSort('account_name', 'asc') }}
                     style={{ cursor: 'pointer', userSelect: 'none' }}
-                    title={sortKey === 'account_name' ? (sortDir === 'asc' ? 'Sorted A→Z — click for Z→A' : 'Sorted Z→A — click for A→Z') : 'Sort by account name A→Z'}
                   >
-                    Account
-                    {sortKey === 'account_name' && <span style={{ marginLeft: 4 }}>{sortDir === 'asc' ? '↑' : '↓'}</span>}
+                    Account{sortKey === 'account_name' && <span style={{ marginLeft: 4 }}>{sortDir === 'asc' ? '↑' : '↓'}</span>}
                   </span>
                 </th>
-                {/* SFDC ID */}
-                <th
-                  style={{
-                    ...stickyHeaderCell,
-                    textAlign: 'left',
-                    padding: '0.5rem 0.75rem',
-                    color: 'var(--text-muted)',
-                    fontWeight: 500,
-                    whiteSpace: 'nowrap',
-                  }}
-                >
+                <th style={{ ...stickyHeaderCell, textAlign: 'left', padding: '0.5rem 0.75rem', color: 'var(--text-muted)', fontWeight: 500, whiteSpace: 'nowrap' }}>
                   18 Digit SFDC Acct ID
                 </th>
-                {/* Type */}
-                <th
-                  style={{
-                    ...stickyHeaderCell,
-                    textAlign: 'left',
-                    padding: '0.5rem 0.75rem',
-                    color: 'var(--text-muted)',
-                    fontWeight: 500,
-                    whiteSpace: 'nowrap',
-                  }}
-                >
+                <th style={{ ...stickyHeaderCell, textAlign: 'left', padding: '0.5rem 0.75rem', color: 'var(--text-muted)', fontWeight: 500, whiteSpace: 'nowrap' }}>
                   Type
                 </th>
-                {/* Status */}
-                <th
-                  style={{
-                    ...stickyHeaderCell,
-                    textAlign: 'left',
-                    padding: '0.5rem 0.75rem',
-                    color: 'var(--text-muted)',
-                    fontWeight: 500,
-                    whiteSpace: 'nowrap',
-                  }}
-                >
+                <th style={{ ...stickyHeaderCell, textAlign: 'left', padding: '0.5rem 0.75rem', color: 'var(--text-muted)', fontWeight: 500, whiteSpace: 'nowrap' }}>
                   Status
                 </th>
-                {/* Start date */}
-                <th
-                  style={{
-                    ...stickyHeaderCell,
-                    textAlign: 'left',
-                    padding: '0.5rem 0.75rem',
-                    color: 'var(--text-muted)',
-                    fontWeight: 500,
-                    whiteSpace: 'nowrap',
-                  }}
-                >
+                <th style={{ ...stickyHeaderCell, textAlign: 'left', padding: '0.5rem 0.75rem', color: 'var(--text-muted)', fontWeight: 500, whiteSpace: 'nowrap' }}>
                   <span
-                    role="button"
-                    tabIndex={0}
+                    role="button" tabIndex={0}
                     onClick={() => setSort('contract_start_date', 'asc')}
                     onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') setSort('contract_start_date', 'asc') }}
                     style={{ cursor: 'pointer', userSelect: 'none' }}
-                    title={sortKey === 'contract_start_date' ? (sortDir === 'asc' ? 'Sorted earliest first — click to reverse' : 'Sorted latest first — click to reverse') : 'Sort by subscription start date (earliest first)'}
                   >
-                    Subscription start date
-                    {sortKey === 'contract_start_date' && <span style={{ marginLeft: 4 }}>{sortDir === 'asc' ? '↑' : '↓'}</span>}
+                    Subscription start date{sortKey === 'contract_start_date' && <span style={{ marginLeft: 4 }}>{sortDir === 'asc' ? '↑' : '↓'}</span>}
                   </span>
                 </th>
-                {/* End date */}
-                <th
-                  style={{
-                    ...stickyHeaderCell,
-                    textAlign: 'left',
-                    padding: '0.5rem 0.75rem',
-                    color: 'var(--text-muted)',
-                    fontWeight: 500,
-                    whiteSpace: 'nowrap',
-                  }}
-                >
+                <th style={{ ...stickyHeaderCell, textAlign: 'left', padding: '0.5rem 0.75rem', color: 'var(--text-muted)', fontWeight: 500, whiteSpace: 'nowrap' }}>
                   Subscription end date
                 </th>
-                {/* ARR */}
-                <th
-                  style={{
-                    ...stickyHeaderCell,
-                    textAlign: 'right',
-                    padding: '0.5rem 0.75rem',
-                    color: 'var(--text-muted)',
-                    fontWeight: 500,
-                    whiteSpace: 'nowrap',
-                  }}
-                >
+                <th style={{ ...stickyHeaderCell, textAlign: 'right', padding: '0.5rem 0.75rem', color: 'var(--text-muted)', fontWeight: 500, whiteSpace: 'nowrap' }}>
                   <span
-                    role="button"
-                    tabIndex={0}
+                    role="button" tabIndex={0}
                     onClick={() => setSort('arr', 'desc')}
                     onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') setSort('arr', 'desc') }}
                     style={{ cursor: 'pointer', userSelect: 'none' }}
-                    title={sortKey === 'arr' ? (sortDir === 'desc' ? 'Sorted largest first — click for smallest first' : 'Sorted smallest first — click for largest first') : 'Sort by ARR (largest first)'}
                   >
-                    ARR
-                    {sortKey === 'arr' && <span style={{ marginLeft: 4 }}>{sortDir === 'asc' ? '↑' : '↓'}</span>}
+                    ARR{sortKey === 'arr' && <span style={{ marginLeft: 4 }}>{sortDir === 'asc' ? '↑' : '↓'}</span>}
                   </span>
                 </th>
               </tr>
@@ -480,23 +508,16 @@ export default function ARRContractedPipeline() {
             <tbody>
               {/* Sticky total row */}
               <tr style={{ fontWeight: 600 }}>
-                <td style={{ ...stickyTotalCell, padding: '0.5rem 0.75rem', color: 'var(--text-muted)' }}>Total</td>
+                <td style={{ ...stickyTotalCell, padding: '0.5rem 0.75rem', color: 'var(--text-muted)' }}>
+                  {chartFilter ? 'Filtered total' : 'Total'}
+                </td>
                 <td style={{ ...stickyTotalCell, padding: '0.5rem 0.75rem' }} />
                 <td style={{ ...stickyTotalCell, padding: '0.5rem 0.75rem' }} />
                 <td style={{ ...stickyTotalCell, padding: '0.5rem 0.75rem' }} />
                 <td style={{ ...stickyTotalCell, padding: '0.5rem 0.75rem' }} />
                 <td style={{ ...stickyTotalCell, padding: '0.5rem 0.75rem' }} />
-                <td
-                  style={{
-                    ...stickyTotalCell,
-                    textAlign: 'right',
-                    padding: '0.5rem 0.75rem',
-                    fontWeight: 600,
-                    color: 'var(--text)',
-                    whiteSpace: 'nowrap',
-                  }}
-                >
-                  {fmtMoney(totalArr)}
+                <td style={{ ...stickyTotalCell, textAlign: 'right', padding: '0.5rem 0.75rem', fontWeight: 600, color: 'var(--text)', whiteSpace: 'nowrap' }}>
+                  {fmtMoney(chartFilter ? filteredTotal : totalArr)}
                 </td>
               </tr>
               {sorted.map((row, idx) => {
@@ -508,9 +529,7 @@ export default function ARRContractedPipeline() {
                         <a href={href} target="_blank" rel="noopener noreferrer" title="Open account in Salesforce">
                           {row.account_name}
                         </a>
-                      ) : (
-                        row.account_name
-                      )}
+                      ) : row.account_name}
                     </td>
                     <td style={{ padding: '0.5rem 0.75rem', color: 'var(--text-muted)' }} title={row.account_id}>
                       {row.account_id || '—'}
@@ -527,15 +546,7 @@ export default function ARRContractedPipeline() {
                     <td style={{ padding: '0.5rem 0.75rem', color: 'var(--text)', whiteSpace: 'nowrap' }}>
                       {row.contract_end_date ?? '—'}
                     </td>
-                    <td
-                      style={{
-                        textAlign: 'right',
-                        padding: '0.5rem 0.75rem',
-                        fontWeight: 400,
-                        color: 'var(--text)',
-                        whiteSpace: 'nowrap',
-                      }}
-                    >
+                    <td style={{ textAlign: 'right', padding: '0.5rem 0.75rem', color: 'var(--text)', whiteSpace: 'nowrap' }}>
                       {fmtMoney(row.arr)}
                     </td>
                   </tr>

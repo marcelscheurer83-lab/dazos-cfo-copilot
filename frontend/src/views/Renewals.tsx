@@ -390,7 +390,8 @@ export default function Renewals() {
     for (const r of chartRows) {
       m = Math.max(m, r.arr_open + r.arr_renewed + r.arr_churned)
     }
-    return Math.max(50_000, Math.ceil(m / 50_000) * 50_000)
+    // Add 20% headroom before rounding so the tallest bar never crowds its label
+    return Math.max(50_000, Math.ceil((m * 1.2) / 50_000) * 50_000)
   }, [chartRows])
 
   const countChartMax = useMemo(() => {

@@ -818,6 +818,8 @@ export type ContractedPipelineRow = {
   contract_end_date?: string | null
   /** Expansion_ARR__c on the opportunity — same field used to compute the Live→Contracted delta. */
   arr: number
+  /** RecordType.Name from Salesforce, e.g. 'New Business', 'Renewal', 'Expansion'. */
+  record_type_name?: string | null
 }
 
 export type ContractedPipelineResponse = {

@@ -23,13 +23,19 @@ function formatMonthKey(ym: string): string {
 }
 
 const PLOT_HEIGHT = 220
-const BAR_COLOR = '#4f8ef7'
+const C_NB = '#3b82f6'        // blue  — New Business (matches ARR Bridge)
+const C_EXPANSION = '#22c55e' // green — Renewal / Expansion / Other
 
-interface MonthBucket { month: string; arr: number }
+function isNewBusiness(recordTypeName: string | null | undefined): boolean {
+  const s = (recordTypeName ?? '').toLowerCase()
+  return s.includes('new') || s === 'nb'
+}
+
+interface MonthBucket { month: string; nb: number; expansion: number }
 
 function ContractedARRChart({ buckets }: { buckets: MonthBucket[] }) {
   const maxArr = useMemo(() => {
-    const m = buckets.reduce((a, b) => Math.max(a, b.arr), 0)
+    const m = buckets.reduce((a, b) => Math.max(a, b.nb + b.expansion), 0)
     return Math.max(10_000, Math.ceil((m * 1.2) / 10_000) * 10_000)
   }, [buckets])
 
@@ -42,11 +48,22 @@ function ContractedARRChart({ buckets }: { buckets: MonthBucket[] }) {
   if (buckets.length === 0) return null
 
   return (
-    <div style={{ marginBottom: '1.75rem', maxWidth: '100%' }}>
+    <div style={{ marginBottom: '1.75rem', maxWidth: 560 }}>
       <div style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text)', marginBottom: '0.5rem' }}>
         Contracted ARR by start month
       </div>
       <div style={{ background: 'var(--bg)', padding: '0.75rem 1rem', borderRadius: 6 }}>
+        {/* Legend */}
+        <div style={{ display: 'flex', gap: '1rem', marginBottom: '0.5rem', fontSize: '0.72rem', color: 'var(--text-muted)' }}>
+          <span style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+            <span style={{ width: 10, height: 10, borderRadius: 2, background: C_NB, display: 'inline-block' }} />
+            New Business
+          </span>
+          <span style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+            <span style={{ width: 10, height: 10, borderRadius: 2, background: C_EXPANSION, display: 'inline-block' }} />
+            Renewal / Expansion
+          </span>
+        </div>
         <div style={{ display: 'flex', gap: 0, fontSize: '0.75rem', alignItems: 'flex-start' }}>
           {/* Y-axis labels */}
           <div style={{ width: 44, flexShrink: 0, paddingRight: 8, display: 'flex', flexDirection: 'column', color: 'var(--text-muted)' }}>
@@ -88,10 +105,13 @@ function ContractedARRChart({ buckets }: { buckets: MonthBucket[] }) {
                   />
                 ))}
               </div>
-              {/* Bars */}
+              {/* Stacked bars */}
               <div style={{ height: '100%', display: 'flex', alignItems: 'flex-end', gap: '0.25rem', position: 'relative', zIndex: 1 }}>
                 {buckets.map((b) => {
-                  const barHeight = (b.arr / maxArr) * PLOT_HEIGHT
+                  const total = b.nb + b.expansion
+                  const totalH = (total / maxArr) * PLOT_HEIGHT
+                  const nbH = total > 0 ? (b.nb / total) * totalH : 0
+                  const expH = total > 0 ? (b.expansion / total) * totalH : 0
                   return (
                     <div
                       key={b.month}
@@ -107,18 +127,17 @@ function ContractedARRChart({ buckets }: { buckets: MonthBucket[] }) {
                     >
                       <div style={{ flex: 1, minHeight: 0 }} />
                       <div style={{ marginBottom: '0.2rem', fontWeight: 700, fontSize: '0.78rem', color: 'var(--text)', minHeight: '1.1em', textAlign: 'center' }}>
-                        {`$${Math.round(b.arr / 1000)}K`}
+                        {total > 0 ? `$${Math.round(total / 1000)}K` : ''}
                       </div>
-                      <div
-                        style={{
-                          width: '100%',
-                          maxWidth: 40,
-                          height: barHeight,
-                          minHeight: barHeight > 0 ? 2 : 0,
-                          background: BAR_COLOR,
-                          borderRadius: '2px 2px 0 0',
-                        }}
-                      />
+                      {/* Stacked bar: expansion on bottom, NB on top */}
+                      <div style={{ width: '100%', maxWidth: 40, display: 'flex', flexDirection: 'column', borderRadius: '2px 2px 0 0', overflow: 'hidden' }}>
+                        {nbH > 0 && (
+                          <div style={{ height: nbH, background: C_NB, minHeight: nbH > 0 ? 1 : 0 }} title={`New Business: $${Math.round(b.nb / 1000)}K`} />
+                        )}
+                        {expH > 0 && (
+                          <div style={{ height: expH, background: C_EXPANSION, minHeight: expH > 0 ? 1 : 0 }} title={`Renewal/Expansion: $${Math.round(b.expansion / 1000)}K`} />
+                        )}
+                      </div>
                     </div>
                   )
                 })}
@@ -199,15 +218,21 @@ export default function ARRContractedPipeline() {
   useEffect(() => { load() }, [load])
 
   const monthlyBuckets = useMemo<MonthBucket[]>(() => {
-    const map = new Map<string, number>()
+    const map = new Map<string, { nb: number; expansion: number }>()
     for (const r of rows) {
       const ym = (r.contract_start_date ?? '').substring(0, 7)
       if (!ym) continue
-      map.set(ym, (map.get(ym) ?? 0) + r.arr)
+      const entry = map.get(ym) ?? { nb: 0, expansion: 0 }
+      if (isNewBusiness(r.record_type_name)) {
+        entry.nb += r.arr
+      } else {
+        entry.expansion += r.arr
+      }
+      map.set(ym, entry)
     }
     return Array.from(map.entries())
       .sort(([a], [b]) => a.localeCompare(b))
-      .map(([month, arr]) => ({ month, arr }))
+      .map(([month, { nb, expansion }]) => ({ month, nb, expansion }))
   }, [rows])
 
   const sorted = useMemo(() => {

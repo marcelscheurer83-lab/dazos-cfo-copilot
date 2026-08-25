@@ -6369,6 +6369,7 @@ async def get_contracted_pipeline(db: AsyncSession = Depends(get_db)):
                 "contract_start_date": o.contract_start_date.isoformat() if o.contract_start_date else None,
                 "contract_end_date": o.contract_end_date.isoformat() if o.contract_end_date else None,
                 "arr": arr_val,
+                "record_type_name": (o.record_type_name or "").strip() or None,
             }
         )
 

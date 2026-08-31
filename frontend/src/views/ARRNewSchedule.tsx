@@ -766,19 +766,6 @@ export default function ARRNewSchedule() {
                 >
                   Active term (mo)
                 </th>
-                <th
-                  style={{
-                    ...stickyHeaderCell,
-                    textAlign: 'left',
-                    padding: '0.5rem 0.75rem',
-                    color: 'var(--text-muted)',
-                    fontWeight: 500,
-                    whiteSpace: 'nowrap',
-                  }}
-                  title="Billing address from Chargebee (populated during Refresh app data sync)."
-                >
-                  Billing address
-                </th>
               </tr>
             </thead>
             <tbody>
@@ -918,9 +905,6 @@ export default function ARRNewSchedule() {
                             return `${months} mo`
                           })()
                         : 'n/a'}
-                    </td>
-                    <td style={{ padding: '0.5rem 0.75rem', color: row.billing_address ? 'var(--text)' : 'var(--text-muted)' }}>
-                      {row.billing_address || 'n/a'}
                     </td>
                   </tr>
                 )

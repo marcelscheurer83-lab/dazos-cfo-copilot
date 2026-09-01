@@ -143,6 +143,7 @@ class Account(Base):
     overdue_invoice_count = Column(Integer, nullable=True)    # Count of overdue invoices
     chargebee_id = Column(String(255), nullable=True)         # Chargebee customer ID (from SF Dazos_Chargebee_ID__c or configured field)
     billing_address = Column(String(512), nullable=True)      # Billing address from Chargebee (populated during sync)
+    invoice_period = Column(String(64), nullable=True)        # Invoice_Period__c from Salesforce (Monthly, Quarterly, etc.)
     synced_at = Column(DateTime, server_default=func.now())
 
 

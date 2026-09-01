@@ -756,6 +756,8 @@ export type NewScheduleAccountRow = {
   active_term_end?: string | null
   /** Billing address from Chargebee (populated during SF sync). Null if no Chargebee ID or not yet synced. */
   billing_address?: string | null
+  /** Invoice_Period__c from Salesforce (Monthly, Quarterly, Semi Annually, Annually, Alleva). */
+  invoice_period?: string | null
   /** Sum of ARR__c on CW NB/Renewal/Expansion opps active today; 0 if CL Renewal + midterm cancel and today > that opp’s contract end. */
   live_arr: number
   /** Live ARR + sum of ARR__c on all Closed Won opps whose contract start is after today. */

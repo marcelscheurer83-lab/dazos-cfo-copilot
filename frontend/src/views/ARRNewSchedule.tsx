@@ -766,6 +766,19 @@ export default function ARRNewSchedule() {
                 >
                   Active term (mo)
                 </th>
+                <th
+                  style={{
+                    ...stickyHeaderCell,
+                    textAlign: 'left',
+                    padding: '0.5rem 0.75rem',
+                    color: 'var(--text-muted)',
+                    fontWeight: 500,
+                    whiteSpace: 'nowrap',
+                  }}
+                  title="Invoice period from Salesforce (Invoice_Period__c): Monthly, Quarterly, Semi Annually, Annually, or Alleva."
+                >
+                  Invoice period
+                </th>
               </tr>
             </thead>
             <tbody>
@@ -905,6 +918,16 @@ export default function ARRNewSchedule() {
                             return `${months} mo`
                           })()
                         : 'n/a'}
+                    </td>
+                    <td
+                      style={{
+                        padding: '0.5rem 0.75rem',
+                        color: row.invoice_period ? 'var(--text)' : 'var(--text-muted)',
+                        whiteSpace: 'nowrap',
+                      }}
+                      title="Invoice period from Salesforce"
+                    >
+                      {row.invoice_period || '—'}
                     </td>
                   </tr>
                 )
